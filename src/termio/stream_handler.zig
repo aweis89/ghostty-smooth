@@ -530,6 +530,7 @@ pub const StreamHandler = struct {
                     return;
                 };
                 self.renderer_state.applySmooth(cmd);
+                self.renderer_state.publishHit();
                 try self.queueRender();
             },
             .kitty => |*kitty_cmd| {
@@ -656,7 +657,10 @@ pub const StreamHandler = struct {
             .alt_screen_legacy,
             .alt_screen,
             .alt_screen_save_cursor_clear_enter,
-            => self.renderer_state.applySmooth(.{ .clear = null }),
+            => {
+                self.renderer_state.applySmooth(.{ .clear = null });
+                self.renderer_state.publishHit();
+            },
             else => {},
         }
 
