@@ -529,12 +529,14 @@ pub const StreamHandler = struct {
                     self.messageWriter(.{ .write_stable = renderer.State.Smooth.query_reply });
                     return;
                 }
-                const cmd = renderer.State.Smooth.parse(
+                var cmd = renderer.State.Smooth.parse(
                     unknown.content[prefix.len..],
                 ) catch {
                     log.warn("invalid smooth APC: {s}", .{unknown.content});
                     return;
                 };
+                // The glide must add to its position now, not at the last frame.
+                if (cmd == .advance) cmd.advance.at = .now(global.io(), .awake);
                 self.renderer_state.applySmooth(cmd);
                 self.renderer_state.publishHit();
                 try self.queueRender();

@@ -314,13 +314,18 @@ pub const Smooth = struct {
     /// zero, and that spring's velocity in rows per second (see `advance`).
     glide: f32 = 0,
     glide_vel: f32 = 0,
+    /// When `glide` and `glide_vel` were last brought up to date. An
+    /// advance must land on the glide as it is now, not as it was at the
+    /// last frame update, or the motion jumps.
+    glide_at: std.Io.Timestamp = .zero,
 
     pub const Command = union(enum) {
         set: Smooth,
         /// Clear one region, or all of them when null.
         clear: ?u32,
-        /// The region's content moved up by `rows`.
-        advance: struct { id: u32, rows: u32 },
+        /// The region's content moved up by `rows`, at `at` (set by the
+        /// caller on receipt; parsing leaves it zero).
+        advance: struct { id: u32, rows: u32, at: std.Io.Timestamp = .zero },
     };
 
     /// Parse the payload after `smooth;`.
@@ -389,9 +394,11 @@ pub const Smooth = struct {
         const pending = self.pending_rows - @as(i32, @intCast(ack));
         const glide = self.glide;
         const glide_vel = self.glide_vel;
+        const glide_at = self.glide_at;
         self.* = next;
         self.glide = glide;
         self.glide_vel = glide_vel;
+        self.glide_at = glide_at;
         if (same) {
             self.acc = acc;
             self.pending_rows = pending;
@@ -417,9 +424,18 @@ pub const Smooth = struct {
         return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999) - self.glide;
     }
 
-    /// Content moved up `rows`: draw it that much lower, up to `max_glide`.
-    pub fn advance(self: *Smooth, rows: u32) void {
+    /// Content moved up `rows` at `now`: draw it that much lower, up to
+    /// `max_glide`, added to the glide as it stands at `now`.
+    pub fn advance(self: *Smooth, rows: u32, now: std.Io.Timestamp) void {
+        _ = self.catchUp(now);
         self.glide = @min(self.glide + @as(f32, @floatFromInt(rows)), max_glide);
+    }
+
+    /// Bring the glide spring up to `now`. Returns whether it is moving.
+    pub fn catchUp(self: *Smooth, now: std.Io.Timestamp) bool {
+        const ns: f32 = @floatFromInt(@max(self.glide_at.durationTo(now).nanoseconds, 0));
+        self.glide_at = now;
+        return self.stepGlide(ns / std.time.ns_per_s);
     }
 
     /// Step the glide spring by `dt` seconds (closed form, exact at any
@@ -477,19 +493,19 @@ pub fn applySmooth(self: *State, cmd: Smooth.Command) void {
         },
         .advance => |a| for (&self.smooth) |*slot| {
             if (slot.*) |*s| {
-                if (s.id == a.id) s.advance(a.rows);
+                if (s.id == a.id) s.advance(a.rows, a.at);
             }
         },
     }
 }
 
-/// Step every region's glide by `dt` seconds. Returns whether any is still
+/// Bring every region's glide up to `now`. Returns whether any is still
 /// moving, so the renderer keeps waking for frames. Caller must hold the mutex.
-pub fn stepGlides(self: *State, dt: f32) bool {
+pub fn stepGlides(self: *State, now: std.Io.Timestamp) bool {
     var moving = false;
     for (&self.smooth) |*slot| {
         if (slot.*) |*s| {
-            if (s.stepGlide(dt)) moving = true;
+            if (s.catchUp(now)) moving = true;
         }
     }
     return moving;
@@ -546,10 +562,23 @@ test "smooth: advance glides in and survives re-declaration" {
     // Capped, then decays to rest.
     state.applySmooth(try Smooth.parse("advance;7;10"));
     try testing.expectApproxEqAbs(Smooth.max_glide, state.smoothAt(0, 0).?.glide, 0.0001);
-    var frames: usize = 0;
-    while (state.stepGlides(1.0 / 120.0)) frames += 1;
+    var frames: i96 = 0;
+    while (state.stepGlides(.fromNanoseconds((frames + 1) * 8_333_333))) frames += 1;
     try testing.expectEqual(@as(f32, 0), state.smoothAt(0, 0).?.glide);
     try testing.expect(frames > 10 and frames < 240);
+
+    // An advance adds to the glide as it is when the advance arrives.
+    const s = state.smoothAt(0, 0).?;
+    const t0 = s.glide_at;
+    var cmd = try Smooth.parse("advance;7;1");
+    cmd.advance.at = t0;
+    state.applySmooth(cmd);
+    cmd.advance.at = t0.addDuration(.fromMilliseconds(100));
+    state.applySmooth(cmd);
+    var fresh: Smooth = .{ .id = 0, .top = 0, .bottom = 1, .left = 0, .right = 1, .pos = 0, .max = 0 };
+    fresh.advance(1, .zero);
+    _ = fresh.catchUp(.fromNanoseconds(100 * std.time.ns_per_ms));
+    try testing.expectApproxEqAbs(fresh.glide + 1, s.glide, 0.0001);
     // Unknown ids are ignored; bad payloads rejected.
     state.applySmooth(try Smooth.parse("advance;9;1"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7"));

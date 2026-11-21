@@ -1474,10 +1474,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
                     // Bring the glide springs up to now, then snapshot them.
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
-                    if (self.glide_clock) |clock| {
-                        const ns: f32 = @floatFromInt(clock.durationTo(now).nanoseconds);
-                        _ = state.stepGlides(ns / std.time.ns_per_s);
-                    }
+                    _ = state.stepGlides(now);
                     self.glide_clock = now;
                     self.glide_active = false;
                     var n: u32 = 0;
