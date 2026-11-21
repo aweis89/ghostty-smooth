@@ -193,6 +193,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_offset_px: f32 = 0,
         scroll_offset_applied: f32 = 0,
 
+        /// Smooth region glides (`State.Smooth.advance`), snapshotted per
+        /// uniform slot at the last frame update: the offset without the
+        /// glide, and the glide spring's position and velocity at
+        /// `glide_clock`. Draws evaluate the spring at their own time, so
+        /// the motion follows vsync rather than update wakes.
+        glide_base_px: [8]f32 = @splat(0),
+        glide_x0: [8]f32 = @splat(0),
+        glide_v0: [8]f32 = @splat(0),
+        glide_clock: ?std.Io.Timestamp = null,
+        glide_active: bool = false,
+
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
 
@@ -1138,10 +1149,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
+        /// Evaluate the smooth region glide springs at the current time
+        /// into the offset uniforms. Closed form from the snapshot taken
+        /// at the last update, so it is exact however draws are spaced.
+        fn applyGlide(self: *Self) void {
+            if (!self.glide_active) return;
+            const clock = self.glide_clock orelse return;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const t: f32 = @as(f32, @floatFromInt(clock.durationTo(now).nanoseconds)) /
+                std.time.ns_per_s;
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const omega = @sqrt(renderer.State.Smooth.glide_stiffness);
+            const decay = @exp(-omega * t);
+            var moving = false;
+            for (0..self.uniforms.smooth_count) |i| {
+                const x0 = self.glide_x0[i];
+                const v0 = self.glide_v0[i];
+                var x = (x0 + (v0 + omega * x0) * t) * decay;
+                if (x > 0.001) moving = true else x = 0;
+                self.uniforms.smooth_offsets[i] = self.glide_base_px[i] - x * cell_h;
+            }
+            if (!moving) self.glide_active = false;
+        }
+
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
-            // gated by configuration and focus.
+            // gated by configuration and focus. So does a smooth region
+            // glide, which is evaluated at draw time (`applyGlide`).
             const shader_delay: ?u64 = shader: {
+                if (self.glide_active) break :shader draw_interval_ms;
                 if (!self.has_custom_shaders) break :shader null;
                 break :shader switch (self.config.custom_shader_animation) {
                     .false => null,
@@ -1436,11 +1472,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 {
                     const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    // Bring the glide springs up to now, then snapshot them.
+                    const now: std.Io.Timestamp = .now(global.io(), .awake);
+                    if (self.glide_clock) |clock| {
+                        const ns: f32 = @floatFromInt(clock.durationTo(now).nanoseconds);
+                        _ = state.stepGlides(ns / std.time.ns_per_s);
+                    }
+                    self.glide_clock = now;
+                    self.glide_active = false;
                     var n: u32 = 0;
                     for (state.smooth) |slot| {
                         const s = slot orelse continue;
                         if (n == self.uniforms.smooth_rects.len) break;
                         self.uniforms.smooth_rects[n] = .{ s.top, s.bottom, s.left, s.right };
+                        self.glide_base_px[n] = (s.offsetRows() + s.glide) * cell_h;
+                        self.glide_x0[n] = s.glide;
+                        self.glide_v0[n] = s.glide_vel;
+                        if (s.glide != 0 or s.glide_vel != 0) self.glide_active = true;
                         self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h;
                         self.uniforms.smooth_offsets_x[n] = if (s.offsetCols()) |c| c * cell_w else -1;
                         n += 1;
@@ -1902,6 +1950,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
+
+            // Smooth region glides move with every draw.
+            self.applyGlide();
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});

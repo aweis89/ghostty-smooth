@@ -262,7 +262,16 @@ test "preedit range shifts left at right edge" {
 ///                                                         shift (see `shift`)
 ///   ESC _ smooth;top;bottom;pos;max ESC \                 legacy: id 0, full width
 ///   ESC _ smooth;off[;ID] ESC \                           clear all or one
-///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;3
+///   ESC _ smooth;advance;ID;N ESC \                       content just moved up
+///                                                         N rows; glide it in
+///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;4
+///
+/// `advance` (protocol 4) is for an app that scrolls a region itself, such
+/// as by writing new lines above a pinned editor: sent in the same
+/// synchronized update as the rows, it makes Ghostty draw the region N rows
+/// lower and spring it back into place on its own frame clock. The glide
+/// survives re-declarations, including ones that move the region's edges.
+/// The region's `bottom` stays an overscan row the glide moves rows behind.
 ///
 /// Rows and columns are 0-based and inclusive.
 pub const Smooth = struct {
@@ -270,7 +279,12 @@ pub const Smooth = struct {
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;3\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;4\x1b\\";
+
+    /// Rows of glide kept at most; a bigger backlog jumps the excess.
+    pub const max_glide: f32 = 3;
+    /// Spring stiffness for the glide (critically damped, so no overshoot).
+    pub const glide_stiffness: f32 = 220;
 
     id: u32,
     top: u16,
@@ -296,10 +310,17 @@ pub const Smooth = struct {
     /// shifts left into it. The y shift adds to the scroll remainder.
     shift: ?[2]u16 = null,
 
+    /// Rows the content is drawn below where it is, springing back to
+    /// zero, and that spring's velocity in rows per second (see `advance`).
+    glide: f32 = 0,
+    glide_vel: f32 = 0,
+
     pub const Command = union(enum) {
         set: Smooth,
         /// Clear one region, or all of them when null.
         clear: ?u32,
+        /// The region's content moved up by `rows`.
+        advance: struct { id: u32, rows: u32 },
     };
 
     /// Parse the payload after `smooth;`.
@@ -311,6 +332,16 @@ pub const Smooth = struct {
             _ = it.next();
             const id = it.next() orelse return .{ .clear = null };
             return .{ .clear = std.fmt.parseInt(u32, id, 10) catch return error.Invalid };
+        }
+        if (std.mem.eql(u8, it.peek() orelse "", "advance")) {
+            _ = it.next();
+            const id = it.next() orelse return error.Invalid;
+            const rows = it.next() orelse return error.Invalid;
+            if (it.next() != null) return error.Invalid;
+            return .{ .advance = .{
+                .id = std.fmt.parseInt(u32, id, 10) catch return error.Invalid,
+                .rows = std.fmt.parseInt(u32, rows, 10) catch return error.Invalid,
+            } };
         }
         while (it.next()) |field| {
             if (n == v.len) return error.Invalid;
@@ -356,7 +387,11 @@ pub const Smooth = struct {
 
         const acc = self.acc - @as(f32, @floatFromInt(ack));
         const pending = self.pending_rows - @as(i32, @intCast(ack));
+        const glide = self.glide;
+        const glide_vel = self.glide_vel;
         self.* = next;
+        self.glide = glide;
+        self.glide_vel = glide_vel;
         if (same) {
             self.acc = acc;
             self.pending_rows = pending;
@@ -379,7 +414,31 @@ pub const Smooth = struct {
     /// only one overscan row exists.
     pub fn offsetRows(self: Smooth) f32 {
         const app: f32 = if (self.shift) |sh| @as(f32, @floatFromInt(sh[1])) / 1000 else 0;
-        return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999);
+        return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999) - self.glide;
+    }
+
+    /// Content moved up `rows`: draw it that much lower, up to `max_glide`.
+    pub fn advance(self: *Smooth, rows: u32) void {
+        self.glide = @min(self.glide + @as(f32, @floatFromInt(rows)), max_glide);
+    }
+
+    /// Step the glide spring by `dt` seconds (closed form, exact at any
+    /// frame rate). Returns whether it is still moving.
+    pub fn stepGlide(self: *Smooth, dt: f32) bool {
+        if (self.glide == 0 and self.glide_vel == 0) return false;
+        const omega = @sqrt(glide_stiffness);
+        const x = self.glide;
+        const c = self.glide_vel + omega * x;
+        const decay = @exp(-omega * dt);
+        self.glide = (x + c * dt) * decay;
+        self.glide_vel = (self.glide_vel - omega * c * dt) * decay;
+        if (self.glide <= 0.001 and @abs(self.glide_vel) < 0.01) {
+            self.glide = 0;
+            self.glide_vel = 0;
+            return false;
+        }
+        self.glide = @max(self.glide, 0);
+        return true;
     }
 
     /// The horizontal offset to render, in columns, or null when the
@@ -416,7 +475,24 @@ pub fn applySmooth(self: *State, cmd: Smooth.Command) void {
                 log.warn("smooth scroll region table full, ignoring id={}", .{next.id});
             }
         },
+        .advance => |a| for (&self.smooth) |*slot| {
+            if (slot.*) |*s| {
+                if (s.id == a.id) s.advance(a.rows);
+            }
+        },
     }
+}
+
+/// Step every region's glide by `dt` seconds. Returns whether any is still
+/// moving, so the renderer keeps waking for frames. Caller must hold the mutex.
+pub fn stepGlides(self: *State, dt: f32) bool {
+    var moving = false;
+    for (&self.smooth) |*slot| {
+        if (slot.*) |*s| {
+            if (s.stepGlide(dt)) moving = true;
+        }
+    }
+    return moving;
 }
 
 /// The smooth scroll region containing viewport cell (x, y), if any.
@@ -456,6 +532,28 @@ test "smooth: parse an app-set shift" {
     var sum = s;
     sum.acc = 0.5;
     try testing.expectApproxEqAbs(@as(f32, 0.999), sum.offsetRows(), 0.0001);
+}
+
+test "smooth: advance glides in and survives re-declaration" {
+    const testing = std.testing;
+    var state: State = .{ .mutex = undefined, .terminal = undefined };
+    state.applySmooth(try Smooth.parse("7;0;20;0;79;0;0;0;0"));
+    state.applySmooth(try Smooth.parse("advance;7;1"));
+    try testing.expectApproxEqAbs(@as(f32, -1), state.smoothAt(0, 0).?.offsetRows(), 0.0001);
+    // A resized live panel moves the edge; the glide carries on.
+    state.applySmooth(try Smooth.parse("7;0;18;0;79;0;0;0;0"));
+    try testing.expectApproxEqAbs(@as(f32, 1), state.smoothAt(0, 0).?.glide, 0.0001);
+    // Capped, then decays to rest.
+    state.applySmooth(try Smooth.parse("advance;7;10"));
+    try testing.expectApproxEqAbs(Smooth.max_glide, state.smoothAt(0, 0).?.glide, 0.0001);
+    var frames: usize = 0;
+    while (state.stepGlides(1.0 / 120.0)) frames += 1;
+    try testing.expectEqual(@as(f32, 0), state.smoothAt(0, 0).?.glide);
+    try testing.expect(frames > 10 and frames < 240);
+    // Unknown ids are ignored; bad payloads rejected.
+    state.applySmooth(try Smooth.parse("advance;9;1"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;2"));
 }
 
 test "smooth: parse v2, legacy, and clear" {
