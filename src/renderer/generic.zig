@@ -1183,7 +1183,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Built from `k` rows up, the region can be drawn at most a
                 // row higher than that: past it, rebuild with a smaller `k`.
                 if (self.glide_map) |m| {
-                    if (m.slot == i and x < @as(f32, @floatFromInt(m.k)) - 1) self.glide_map_stale = true;
+                    // Past what its cells hold, the region's bottom rows would
+                    // go blank: hold the glide there until they are rebuilt.
+                    const floor = @as(f32, @floatFromInt(m.k)) - 1;
+                    if (m.slot == i and x < floor) {
+                        self.glide_map_stale = true;
+                        x = floor;
+                    }
                 }
                 self.uniforms.smooth_offsets[i] = self.glide_base_px[i] - x * cell_h;
             }
@@ -1513,7 +1519,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         var k: u16 = 0;
                         if (s.top == 0 and s.overscan) {
                             top_region = true;
-                            if (self.glide_map == null and s.glide > 0) {
+                            // Rows are rebuilt whole, so only a full-width
+                            // region; and not over the cursor, which is drawn
+                            // at its own row, not the one rebuilt into it.
+                            const screen = state.terminal.screens.active;
+                            const full = s.left == 0 and s.right + 1 >= state.terminal.cols;
+                            const cursor_in = screen.pages.viewport == .active and screen.cursor.y <= s.bottom;
+                            if (self.glide_map == null and s.glide > 0 and full and !cursor_in) {
                                 k = @intFromFloat(@min(@ceil(s.glide), renderer.State.Smooth.max_glide));
                                 self.glide_map = .{ .slot = n, .bottom = s.bottom, .k = k };
                             }
@@ -2865,7 +2877,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const map: ?@TypeOf(self.glide_map_built.?) =
                 if (self.glide_map) |m| .{ .bottom = m.bottom, .k = m.k } else null;
             const map_changed = !std.meta.eql(map, self.glide_map_built);
-            const remapped_rows: usize = if (map) |m| m.bottom + 1 else if (self.glide_map_built) |m| m.bottom + 1 else 0;
+            // Rows the old mapping filled are rebuilt too: a region that
+            // shrank mid-glide leaves its former rows holding shifted cells.
+            const new_rows: usize = if (map) |m| m.bottom + 1 else 0;
+            const old_rows: usize = if (self.glide_map_built) |m| m.bottom + 1 else 0;
+            const remapped_rows = @max(new_rows, old_rows);
             self.glide_map_built = map;
             const captured_above = state.overscan.above;
 

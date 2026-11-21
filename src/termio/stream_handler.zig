@@ -1547,17 +1547,18 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
-            // A new shell prompt: whatever app declared smooth regions has
-            // exited, cleanly or not.
+            // A new shell prompt (OSC 133 A or N): whatever app declared
+            // smooth regions has exited, cleanly or not. Not P, which shells
+            // also send for continuation and right prompts.
             .fresh_line_new_prompt,
             .new_command,
-            .prompt_start,
             => try self.clearSmooth(),
 
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
+            .prompt_start,
             => {},
         }
 
