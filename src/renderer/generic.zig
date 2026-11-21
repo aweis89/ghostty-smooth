@@ -1477,6 +1477,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     _ = state.stepGlides(now);
                     self.glide_clock = now;
                     self.glide_active = false;
+                    self.uniforms.smooth_no_overscan = 0;
                     var n: u32 = 0;
                     for (state.smooth) |slot| {
                         const s = slot orelse continue;
@@ -1488,6 +1489,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (s.glide != 0 or s.glide_vel != 0) self.glide_active = true;
                         self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h;
                         self.uniforms.smooth_offsets_x[n] = if (s.offsetCols()) |c| c * cell_w else -1;
+                        if (!s.overscan) self.uniforms.smooth_no_overscan |= @as(u32, 1) << @intCast(n);
                         n += 1;
                     }
                     self.uniforms.smooth_count = n;

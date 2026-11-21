@@ -262,6 +262,9 @@ test "preedit range shifts left at right edge" {
 ///                                                         shift (see `shift`)
 ///   ESC _ smooth;top;bottom;pos;max ESC \                 legacy: id 0, full width
 ///   ESC _ smooth;off[;ID] ESC \                           clear all or one
+///   ESC _ smooth;ID;top;bottom;left;right;pos;max;flags ESC \
+///                                                         ...with flags; bit 0:
+///                                                         no overscan row
 ///   ESC _ smooth;advance;ID;N ESC \                       content just moved up
 ///                                                         N rows; glide it in
 ///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;4
@@ -271,7 +274,11 @@ test "preedit range shifts left at right edge" {
 /// synchronized update as the rows, it makes Ghostty draw the region N rows
 /// lower and spring it back into place on its own frame clock. The glide
 /// survives re-declarations, including ones that move the region's edges.
-/// The region's `bottom` stays an overscan row the glide moves rows behind.
+/// The region's `bottom` stays an overscan row the glide moves rows behind,
+/// unless declared with the no-overscan flag: then `bottom` is drawn like any
+/// other row, and rows glided below it are clipped at its lower edge. That
+/// suits a region with something else right under it, such as rows an app
+/// just added above a status line.
 ///
 /// Rows and columns are 0-based and inclusive.
 pub const Smooth = struct {
@@ -319,6 +326,9 @@ pub const Smooth = struct {
     /// last frame update, or the motion jumps.
     glide_at: std.Io.Timestamp = .zero,
 
+    /// Whether `bottom` is a hidden overscan row (the default).
+    overscan: bool = true,
+
     pub const Command = union(enum) {
         set: Smooth,
         /// Clear one region, or all of them when null.
@@ -355,9 +365,10 @@ pub const Smooth = struct {
         }
         const r: [7]u32 = switch (n) {
             4 => .{ 0, v[0], v[1], 0, std.math.maxInt(u16), v[2], v[3] },
-            7, 9 => v[0..7].*,
+            7, 8, 9 => v[0..7].*,
             else => return error.Invalid,
         };
+        if (n == 8 and v[7] > 1) return error.Invalid;
         const max16 = std.math.maxInt(u16);
         if (r[1] >= r[2] or r[2] > max16 or r[3] > r[4] or r[4] > max16)
             return error.Invalid;
@@ -373,6 +384,7 @@ pub const Smooth = struct {
             .pos = r[5],
             .max = r[6],
             .shift = if (n == 9) .{ @intCast(v[7]), @intCast(v[8]) } else null,
+            .overscan = !(n == 8 and v[7] & 1 == 1),
         } };
     }
 
@@ -542,7 +554,8 @@ test "smooth: parse an app-set shift" {
     // Out of range or a region with no visible column besides the overscan one.
     try testing.expectError(error.Invalid, Smooth.parse("4;0;30;0;99;10;500;1000;0"));
     try testing.expectError(error.Invalid, Smooth.parse("4;0;30;5;5;10;500;0;0"));
-    try testing.expectError(error.Invalid, Smooth.parse("4;0;30;0;99;10;500;1"));
+    // Eight fields is the flags form (no-overscan test below); a bad flag fails.
+    try testing.expectError(error.Invalid, Smooth.parse("4;0;30;0;99;10;500;7"));
 
     // The y shift adds to the scroll remainder but stays under one row.
     var sum = s;
@@ -583,6 +596,18 @@ test "smooth: advance glides in and survives re-declaration" {
     state.applySmooth(try Smooth.parse("advance;9;1"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;2"));
+}
+
+test "smooth: no-overscan flag" {
+    const testing = std.testing;
+    const plain = (try Smooth.parse("8;5;9;0;79;0;0")).set;
+    try testing.expect(plain.overscan);
+    const flagged = (try Smooth.parse("8;5;9;0;79;0;0;1")).set;
+    try testing.expect(!flagged.overscan);
+    try testing.expectEqual(@as(u16, 9), flagged.bottom);
+    const zero = (try Smooth.parse("8;5;9;0;79;0;0;0")).set;
+    try testing.expect(zero.overscan);
+    try testing.expectError(error.Invalid, Smooth.parse("8;5;9;0;79;0;0;2"));
 }
 
 test "smooth: parse v2, legacy, and clear" {

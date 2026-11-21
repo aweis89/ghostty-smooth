@@ -28,7 +28,13 @@ struct Uniforms {
   float smooth_offsets[8];
   float smooth_offsets_x[8];
   uint smooth_count;
+  uint smooth_no_overscan;
 };
+
+// Whether region i keeps its bottom row visible (no overscan row).
+static bool smooth_no_overscan(constant Uniforms& u, int i) {
+  return (u.smooth_no_overscan >> uint(i)) & 1u;
+}
 
 // The smooth scroll region containing a grid cell (overscan included),
 // or -1. Rects are (top, overscan bottom, left, right), inclusive; a region
@@ -478,7 +484,8 @@ fragment float4 cell_bg_fragment(
   // The overscan row's own screen space stays empty.
   int region = smooth_region_at(uniforms, grid_pos);
   if (region >= 0) {
-    if (grid_pos.y == int(uniforms.smooth_rects[region].y)) return bg;
+    if (!smooth_no_overscan(uniforms, region) &&
+        grid_pos.y == int(uniforms.smooth_rects[region].y)) return bg;
     float ox = uniforms.smooth_offsets_x[region];
     if (ox >= 0.0 && grid_pos.x == int(uniforms.smooth_rects[region].w)) return bg;
     float y = in.position.y - uniforms.grid_padding.x + uniforms.smooth_offsets[region];
@@ -630,6 +637,8 @@ vertex CellTextVertexOut cell_text_vertex(
       cell_pos.x -= ox;
       right = r.w;
     }
+    // Without an overscan row the bottom row is visible: clip below it.
+    if (smooth_no_overscan(uniforms, region)) r.y += 1;
     out.clip = float4(
       uniforms.grid_padding.x + r.xy * uniforms.cell_size.y,
       uniforms.grid_padding.w + float2(r.z, right) * uniforms.cell_size.x

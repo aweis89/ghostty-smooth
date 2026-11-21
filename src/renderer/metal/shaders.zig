@@ -267,6 +267,10 @@ pub const Uniforms = extern struct {
 
     smooth_count: u32 align(4) = 0,
 
+    /// Bit i set: region i has no overscan row. Its bottom row is drawn
+    /// like any other and content shifted below it is clipped at its edge.
+    smooth_no_overscan: u32 align(4) = 0,
+
     pub const max_smooth_regions = 8;
 
     const PaddingExtend = packed struct(u8) {
