@@ -263,11 +263,11 @@ test "preedit range shifts left at right edge" {
 ///   ESC _ smooth;top;bottom;pos;max ESC \                 legacy: id 0, full width
 ///   ESC _ smooth;off[;ID] ESC \                           clear all or one
 ///   ESC _ smooth;ID;top;bottom;left;right;pos;max;flags ESC \
-///                                                         ...with flags; bit 0:
-///                                                         no overscan row
+///                                                         ...with flags (protocol 5);
+///                                                         bit 0: no overscan row
 ///   ESC _ smooth;advance;ID;N ESC \                       content just moved up
 ///                                                         N rows; glide it in
-///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;4
+///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;5
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
 /// as by writing new lines above a pinned editor: sent in the same
@@ -286,7 +286,7 @@ pub const Smooth = struct {
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;4\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;5\x1b\\";
 
     /// Rows of glide kept at most; a bigger backlog jumps the excess.
     pub const max_glide: f32 = 3;
