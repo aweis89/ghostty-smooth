@@ -1166,7 +1166,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const x0 = self.glide_x0[i];
                 const v0 = self.glide_v0[i];
                 var x = (x0 + (v0 + omega * x0) * t) * decay;
-                if (x > 0.001) moving = true else x = 0;
+                // Glides either way (negative: drawn higher), never past rest.
+                if (@abs(x) > 0.001 and (x > 0) == (x0 > 0)) moving = true else x = 0;
                 self.uniforms.smooth_offsets[i] = self.glide_base_px[i] - x * cell_h;
             }
             if (!moving) self.glide_active = false;

@@ -968,10 +968,23 @@ pub const StreamHandler = struct {
         self.terminal.configureCharset(slot, set);
     }
 
+    /// Drop every smooth scroll region. An app that dies without clearing
+    /// its regions (SIGKILL) would otherwise leave rows of the shell shifted
+    /// or hidden, so a full reset or the shell's next prompt clears them.
+    fn clearSmooth(self: *StreamHandler) !void {
+        for (self.renderer_state.smooth) |slot| {
+            if (slot != null) break;
+        } else return;
+        self.renderer_state.applySmooth(.{ .clear = null });
+        self.renderer_state.publishHit();
+        try self.queueRender();
+    }
+
     pub fn fullReset(
         self: *StreamHandler,
     ) !void {
         self.terminal.fullReset();
+        try self.clearSmooth();
         try self.setMouseShape(.text);
 
         // Full reset clears Kitty clipboard session grants.
@@ -1534,13 +1547,17 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            // A new shell prompt: whatever app declared smooth regions has
+            // exited, cleanly or not.
+            .fresh_line_new_prompt,
+            .new_command,
+            .prompt_start,
+            => try self.clearSmooth(),
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
-            .new_command,
-            .prompt_start,
             => {},
         }
 

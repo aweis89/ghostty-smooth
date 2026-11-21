@@ -266,7 +266,9 @@ test "preedit range shifts left at right edge" {
 ///                                                         ...with flags (protocol 5);
 ///                                                         bit 0: no overscan row
 ///   ESC _ smooth;advance;ID;N ESC \                       content just moved up
-///                                                         N rows; glide it in
+///                                                         N rows; glide it in.
+///                                                         Negative N (protocol
+///                                                         6): moved down
 ///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;5
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
@@ -280,13 +282,18 @@ test "preedit range shifts left at right edge" {
 /// suits a region with something else right under it, such as rows an app
 /// just added above a status line.
 ///
+/// A negative advance is the same motion downwards: content that just moved
+/// down is drawn higher and springs down into place, clipped at the region's
+/// top edge, with blank space opening at its bottom. That suits rows an app
+/// just removed, with the rows above dropping into their place.
+///
 /// Rows and columns are 0-based and inclusive.
 pub const Smooth = struct {
     pub const max_regions = 8;
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;5\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;6\x1b\\";
 
     /// Rows of glide kept at most; a bigger backlog jumps the excess.
     pub const max_glide: f32 = 3;
@@ -317,8 +324,9 @@ pub const Smooth = struct {
     /// shifts left into it. The y shift adds to the scroll remainder.
     shift: ?[2]u16 = null,
 
-    /// Rows the content is drawn below where it is, springing back to
-    /// zero, and that spring's velocity in rows per second (see `advance`).
+    /// Rows the content is drawn below where it is (negative: above),
+    /// springing back to zero, and that spring's velocity in rows per
+    /// second (see `advance`).
     glide: f32 = 0,
     glide_vel: f32 = 0,
     /// When `glide` and `glide_vel` were last brought up to date. An
@@ -335,7 +343,7 @@ pub const Smooth = struct {
         clear: ?u32,
         /// The region's content moved up by `rows`, at `at` (set by the
         /// caller on receipt; parsing leaves it zero).
-        advance: struct { id: u32, rows: u32, at: std.Io.Timestamp = .zero },
+        advance: struct { id: u32, rows: i32, at: std.Io.Timestamp = .zero },
     };
 
     /// Parse the payload after `smooth;`.
@@ -355,7 +363,7 @@ pub const Smooth = struct {
             if (it.next() != null) return error.Invalid;
             return .{ .advance = .{
                 .id = std.fmt.parseInt(u32, id, 10) catch return error.Invalid,
-                .rows = std.fmt.parseInt(u32, rows, 10) catch return error.Invalid,
+                .rows = std.fmt.parseInt(i32, rows, 10) catch return error.Invalid,
             } };
         }
         while (it.next()) |field| {
@@ -436,11 +444,13 @@ pub const Smooth = struct {
         return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999) - self.glide;
     }
 
-    /// Content moved up `rows` at `now`: draw it that much lower, up to
-    /// `max_glide`, added to the glide as it stands at `now`.
-    pub fn advance(self: *Smooth, rows: u32, now: std.Io.Timestamp) void {
+    /// Content moved up `rows` at `now` (negative: down): draw it that much
+    /// lower (higher), up to `max_glide` either way, added to the glide as it
+    /// stands at `now`.
+    pub fn advance(self: *Smooth, rows: i32, now: std.Io.Timestamp) void {
         _ = self.catchUp(now);
-        self.glide = @min(self.glide + @as(f32, @floatFromInt(rows)), max_glide);
+        const next = self.glide + @as(f32, @floatFromInt(rows));
+        self.glide = std.math.clamp(next, -max_glide, max_glide);
     }
 
     /// Bring the glide spring up to `now`. Returns whether it is moving.
@@ -460,12 +470,14 @@ pub const Smooth = struct {
         const decay = @exp(-omega * dt);
         self.glide = (x + c * dt) * decay;
         self.glide_vel = (self.glide_vel - omega * c * dt) * decay;
-        if (self.glide <= 0.001 and @abs(self.glide_vel) < 0.01) {
+        // Never past rest: velocity left over from an advance the other way
+        // could otherwise carry it through zero.
+        const crossed = x != 0 and (x > 0) != (self.glide > 0);
+        if (crossed or (@abs(self.glide) <= 0.001 and @abs(self.glide_vel) < 0.01)) {
             self.glide = 0;
             self.glide_vel = 0;
             return false;
         }
-        self.glide = @max(self.glide, 0);
         return true;
     }
 
@@ -594,8 +606,30 @@ test "smooth: advance glides in and survives re-declaration" {
     try testing.expectApproxEqAbs(fresh.glide + 1, s.glide, 0.0001);
     // Unknown ids are ignored; bad payloads rejected.
     state.applySmooth(try Smooth.parse("advance;9;1"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;x"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;2"));
+}
+
+test "smooth: negative advance glides down into place" {
+    const testing = std.testing;
+    var state: State = .{ .mutex = undefined, .terminal = undefined };
+    state.applySmooth(try Smooth.parse("8;5;9;0;79;0;0;1"));
+    state.applySmooth(try Smooth.parse("advance;8;-1"));
+    const s = state.smoothAt(0, 5).?;
+    // Drawn a row higher: offset up by one.
+    try testing.expectApproxEqAbs(@as(f32, 1), s.offsetRows(), 0.0001);
+    state.applySmooth(try Smooth.parse("advance;8;-10"));
+    try testing.expectApproxEqAbs(-Smooth.max_glide, s.glide, 0.0001);
+    var frames: i96 = 0;
+    var low: f32 = s.glide;
+    while (state.stepGlides(.fromNanoseconds((frames + 1) * 8_333_333))) : (frames += 1) {
+        // Rises monotonically to rest, never past it.
+        try testing.expect(s.glide >= low and s.glide <= 0);
+        low = s.glide;
+    }
+    try testing.expectEqual(@as(f32, 0), s.glide);
+    try testing.expect(frames > 10 and frames < 240);
 }
 
 test "smooth: no-overscan flag" {

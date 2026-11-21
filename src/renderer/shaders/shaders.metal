@@ -490,6 +490,9 @@ fragment float4 cell_bg_fragment(
     if (ox >= 0.0 && grid_pos.x == int(uniforms.smooth_rects[region].w)) return bg;
     float y = in.position.y - uniforms.grid_padding.x + uniforms.smooth_offsets[region];
     grid_pos.y = int(floor(y / uniforms.cell_size.y));
+    // Shifted up past its bottom edge (a downward glide), nothing is drawn
+    // in the space that opens: never the row under the region.
+    if (grid_pos.y > int(uniforms.smooth_rects[region].y)) return bg;
     if (ox >= 0.0) {
       float x = in.position.x - uniforms.grid_padding.w + ox;
       grid_pos.x = int(floor(x / uniforms.cell_size.x));
