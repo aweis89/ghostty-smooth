@@ -4947,9 +4947,14 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     // the pointer to the cell actually displayed under it.
     const hit = self.renderer_state.readHit();
     const cell_h: f64 = @floatFromInt(self.size.cell.height);
+    // Where regions nest, the one with the fewest rows is drawn, as here.
+    var inner: ?rendererpkg.State.Hit.HitRegion = null;
     for (hit.regions) |slot| {
         const r = slot orelse continue;
         if (cell.x < r.left or cell.x > r.right or cell.y < r.top or cell.y >= r.bottom) continue;
+        if (inner == null or r.bottom - r.top < inner.?.bottom - inner.?.top) inner = r;
+    }
+    if (inner) |r| {
         const shifted = self.posToViewportUnshifted(xpos, ypos + @as(f64, r.offset_rows) * cell_h);
         return .{ .x = cell.x, .y = @min(shifted.y, r.bottom) };
     }

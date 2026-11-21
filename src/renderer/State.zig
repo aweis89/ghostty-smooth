@@ -535,15 +535,18 @@ pub fn stepGlides(self: *State, now: std.Io.Timestamp) bool {
     return moving;
 }
 
-/// The smooth scroll region containing viewport cell (x, y), if any.
+/// The smooth scroll region containing viewport cell (x, y), if any; where
+/// regions nest, the one with the fewest rows, as the renderer draws it.
 /// Caller must hold the mutex.
 pub fn smoothAt(self: *State, x: usize, y: usize) ?*Smooth {
+    var found: ?*Smooth = null;
     for (&self.smooth) |*slot| {
         if (slot.*) |*s| {
-            if (s.contains(x, y)) return s;
+            if (!s.contains(x, y)) continue;
+            if (found == null or s.bottom - s.top < found.?.bottom - found.?.top) found = s;
         }
     }
-    return null;
+    return found;
 }
 
 test "smooth: parse an app-set shift" {
@@ -630,6 +633,16 @@ test "smooth: negative advance glides down into place" {
     }
     try testing.expectEqual(@as(f32, 0), s.glide);
     try testing.expect(frames > 10 and frames < 240);
+}
+
+test "smooth: the innermost of nested regions wins" {
+    const testing = std.testing;
+    var state: State = .{ .mutex = undefined, .terminal = undefined };
+    state.applySmooth(try Smooth.parse("9;12;14;0;79;0;0;1"));
+    state.applySmooth(try Smooth.parse("7;0;15;0;79;0;0"));
+    try testing.expectEqual(@as(u32, 9), state.smoothAt(0, 13).?.id);
+    try testing.expectEqual(@as(u32, 7), state.smoothAt(0, 11).?.id);
+    try testing.expectEqual(@as(u32, 7), state.smoothAt(0, 15).?.id);
 }
 
 test "smooth: no-overscan flag" {

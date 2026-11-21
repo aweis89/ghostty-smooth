@@ -39,14 +39,21 @@ static bool smooth_no_overscan(constant Uniforms& u, int i) {
 // The smooth scroll region containing a grid cell (overscan included),
 // or -1. Rects are (top, overscan bottom, left, right), inclusive; a region
 // with a non-negative x offset also has `right` as an overscan column.
+// Where regions nest, the one with the fewest rows wins: an app glides a
+// few rows inside a larger region without redeclaring the larger one.
 static int smooth_region_at(constant Uniforms& u, int2 cell) {
+  int found = -1;
+  int rows = 0;
   for (uint i = 0; i < u.smooth_count; i++) {
     int4 r = int4(u.smooth_rects[i]);
     if (cell.y >= r.x && cell.y <= r.y && cell.x >= r.z && cell.x <= r.w) {
-      return int(i);
+      if (found < 0 || r.y - r.x < rows) {
+        found = int(i);
+        rows = r.y - r.x;
+      }
     }
   }
-  return -1;
+  return found;
 }
 
 //-------------------------------------------------------------------
