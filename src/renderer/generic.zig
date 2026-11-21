@@ -204,6 +204,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         glide_clock: ?std.Io.Timestamp = null,
         glide_active: bool = false,
 
+        /// A region that starts at the top row has nothing above it to draw
+        /// while it glides in from below, so its rows are built from `k`
+        /// rows further up instead, reaching into scrollback through the
+        /// render state's overscan rows, and drawn `k` rows higher to
+        /// match. `k` is the glide rounded up; when the glide falls a whole
+        /// row below it, the cells are rebuilt (`glide_map_stale`).
+        glide_map: ?struct { slot: u32, bottom: u16, k: u16 } = null,
+        /// The mapping the cells were last built with, so a change rebuilds
+        /// the region's rows.
+        glide_map_built: ?struct { bottom: u16, k: u16 } = null,
+        glide_map_stale: bool = false,
+
         /// Custom shader uniform values.
         custom_shader_uniforms: shadertoy.Uniforms,
 
@@ -1168,6 +1180,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 var x = (x0 + (v0 + omega * x0) * t) * decay;
                 // Glides either way (negative: drawn higher), never past rest.
                 if (@abs(x) > 0.001 and (x > 0) == (x0 > 0)) moving = true else x = 0;
+                // Built from `k` rows up, the region can be drawn at most a
+                // row higher than that: past it, rebuild with a smaller `k`.
+                if (self.glide_map) |m| {
+                    if (m.slot == i and x < @as(f32, @floatFromInt(m.k)) - 1) self.glide_map_stale = true;
+                }
                 self.uniforms.smooth_offsets[i] = self.glide_base_px[i] - x * cell_h;
             }
             if (!moving) self.glide_active = false;
@@ -1203,6 +1220,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // overdue frame is picked up on the next wake.
                 break :kitty @max(next -| now_ms, draw_interval_ms);
             };
+
+            // A glide built from rows further up needs them rebuilt.
+            // Not immediate: an update skipped during synchronized output
+            // leaves this set, and must not spin.
+            if (self.glide_map_stale) return .{ .delay_ms = draw_interval_ms, .kind = .update };
 
             // An update wake includes a draw, so it wins ties.
             if (kitty_delay) |k| {
@@ -1478,22 +1500,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     _ = state.stepGlides(now);
                     self.glide_clock = now;
                     self.glide_active = false;
+                    self.glide_map = null;
+                    self.glide_map_stale = false;
                     self.uniforms.smooth_no_overscan = 0;
+                    var top_region = false;
                     var n: u32 = 0;
                     for (state.smooth) |slot| {
                         const s = slot orelse continue;
                         if (n == self.uniforms.smooth_rects.len) break;
                         self.uniforms.smooth_rects[n] = .{ s.top, s.bottom, s.left, s.right };
-                        self.glide_base_px[n] = (s.offsetRows() + s.glide) * cell_h;
+                        // Rows built from `k` higher up are drawn `k` higher.
+                        var k: u16 = 0;
+                        if (s.top == 0 and s.overscan) {
+                            top_region = true;
+                            if (self.glide_map == null and s.glide > 0) {
+                                k = @intFromFloat(@min(@ceil(s.glide), renderer.State.Smooth.max_glide));
+                                self.glide_map = .{ .slot = n, .bottom = s.bottom, .k = k };
+                            }
+                        }
+                        const shift: f32 = @as(f32, @floatFromInt(k)) * cell_h;
+                        self.glide_base_px[n] = (s.offsetRows() + s.glide) * cell_h + shift;
                         self.glide_x0[n] = s.glide;
                         self.glide_v0[n] = s.glide_vel;
                         if (s.glide != 0 or s.glide_vel != 0) self.glide_active = true;
-                        self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h;
+                        self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h + shift;
                         self.uniforms.smooth_offsets_x[n] = if (s.offsetCols()) |c| c * cell_w else -1;
                         if (!s.overscan) self.uniforms.smooth_no_overscan |= @as(u32, 1) << @intCast(n);
                         n += 1;
                     }
                     self.uniforms.smooth_count = n;
+                    // Scrollback rows to build such a region from. A change
+                    // here makes the next update a full rebuild.
+                    self.terminal_state.overscan_request.above =
+                        if (top_region) @intFromFloat(renderer.State.Smooth.max_glide) else 0;
                 }
 
                 self.scroll_offset_px = if (state.terminal.screens.active.pages.viewport == .active)
@@ -2711,6 +2750,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This requires the draw mutex.
         ///
         /// Dirty state on terminal state won't be reset by this.
+        /// The uniform slot of the region drawn at row `y`, column 0: where
+        /// regions nest, the one with the fewest rows (as the shaders pick).
+        fn innermostRegion(self: *const Self, y: terminal.size.CellCountInt) ?u32 {
+            var found: ?u32 = null;
+            var rows: u16 = 0;
+            for (0..self.uniforms.smooth_count) |i| {
+                const r = self.uniforms.smooth_rects[i];
+                if (y < r[0] or y > r[1] or r[2] > 0) continue;
+                if (found == null or r[1] - r[0] < rows) {
+                    found = @intCast(i);
+                    rows = r[1] - r[0];
+                }
+            }
+            return found;
+        }
+
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
@@ -2776,6 +2831,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 state.rows,
                 self.cells.size.rows,
             );
+            // Viewport rows start here, after any overscan rows above.
+            const vp_start = state.viewportStart();
 
             // Determine our x/y range for preedit. We don't want to render anything
             // here because we will render the preedit separately.
@@ -2789,7 +2846,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                if (!rebuild and !row_dirty[vp_start + cursor_vp.y]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
@@ -2802,34 +2859,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
-            for (
-                0..,
-                row_raws[0..row_len],
-                row_cells[0..row_len],
-                row_dirty[0..row_len],
-                row_selection[0..row_len],
-                row_highlights[0..row_len],
-            ) |y_usize, row, *cells, *dirty, selection, *highlights| {
+            // A region gliding in from below the top row is built from rows
+            // further up (`glide_map`); its rows rebuild whenever that
+            // mapping is in use or has just changed.
+            const map: ?@TypeOf(self.glide_map_built.?) =
+                if (self.glide_map) |m| .{ .bottom = m.bottom, .k = m.k } else null;
+            const map_changed = !std.meta.eql(map, self.glide_map_built);
+            const remapped_rows: usize = if (map) |m| m.bottom + 1 else if (self.glide_map_built) |m| m.bottom + 1 else 0;
+            self.glide_map_built = map;
+            const captured_above = state.overscan.above;
+
+            for (0..row_len) |y_usize| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
+                const in_map = y_usize < remapped_rows and (map != null or map_changed);
+                const k: usize = if (self.glide_map) |m|
+                    (if (y_usize <= m.bottom and self.innermostRegion(y) == m.slot) m.k else 0)
+                else
+                    0;
 
-                if (!rebuild) {
+                if (!rebuild and !in_map) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!dirty.*) continue;
-
-                    // Clear the cells if the row is dirty
-                    self.cells.clear(y);
+                    if (!row_dirty[vp_start + y_usize]) continue;
                 }
+                if (!rebuild) self.cells.clear(y);
+
+                // The row drawn here: `k` rows up, perhaps in scrollback.
+                // Nothing that far up (the top of scrollback): left blank.
+                if (k > y_usize + captured_above) continue;
+                const i = vp_start + y_usize - k;
 
                 // Unmark the dirty state in our render state.
-                dirty.* = false;
+                row_dirty[vp_start + y_usize] = false;
 
                 self.rebuildRow(
                     y,
-                    row,
-                    cells,
-                    preedit_range,
-                    selection,
-                    highlights,
+                    row_raws[i],
+                    &row_cells[i],
+                    if (k == 0) preedit_range else null,
+                    row_selection[i],
+                    &row_highlights[i],
                     links,
                 ) catch |err| {
                     // This should never happen except under exceptional
@@ -2856,7 +2924,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[state.viewportStart() + cursor_vp.y].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
