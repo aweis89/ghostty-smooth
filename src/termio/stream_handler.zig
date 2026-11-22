@@ -533,6 +533,12 @@ pub const StreamHandler = struct {
                         self.messageWriter(.{ .write_stable = "\x1b_pcode;ok;1\x1b\\" });
                         return;
                     }
+                    // Overlay popups have their own version, so pcode can
+                    // tell a drawer-only build from one with popups.
+                    if (std.mem.eql(u8, payload, "popup?")) {
+                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;1\x1b\\" });
+                        return;
+                    }
                     if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {
                         self.surfaceMessageWriter(.{ .pcode_event = req });
                     } else |err| {
