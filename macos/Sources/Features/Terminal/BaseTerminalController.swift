@@ -1308,7 +1308,9 @@ class BaseTerminalController: NSWindowController,
     // MARK: First Responder
 
     @IBAction func close(_ sender: Any) {
-        guard let surface = focusedSurface?.surface else { return }
+        // A pcode overlay with the keyboard closes itself (its owner observes
+        // the close), not the terminal it stands for as the focused surface.
+        guard let surface = (PCode.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
         ghostty.requestClose(surface: surface)
     }
 
@@ -1470,7 +1472,8 @@ class BaseTerminalController: NSWindowController,
     }
 
     @objc func resetTerminal(_ sender: Any) {
-        guard let surface = focusedSurface?.surface else { return }
+        // As `close`: never reset pcode's terminal from inside its overlay.
+        guard let surface = (PCode.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
         ghostty.resetTerminal(surface: surface)
     }
 

@@ -105,7 +105,7 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
     private func replaceViewer(with next: Ghostty.SurfaceView?) {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
-        viewer?.pcodeOwner = nil
+        if let viewer, viewer !== next { PCode.retire(viewer) }
         viewer = next
         guard let next else { return }
         // Cmd+W in the drawer, or the viewer exiting, asks to close its surface.

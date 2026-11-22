@@ -78,8 +78,34 @@ enum PCode {
         config.initialInput = nil
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
-        view.pcodeOwner = owner
+        view.becomePCodeOverlay(of: owner)
         return view
+    }
+
+    /// End an overlay terminal its owner has dropped: free its core surface,
+    /// which hangs up its process and closes its pty, now rather than whenever
+    /// the last reference to the view goes (SwiftUI, a pending focus move).
+    /// pcode, which holds the popup's tty, sees the hangup at once.
+    ///
+    /// On the next turn of the main loop: the drop may come from inside one of
+    /// that surface's own callbacks (`pcode;done`), which is still using it.
+    static func retire(_ overlay: Ghostty.SurfaceView) {
+        DispatchQueue.main.async { overlay.freeSurface() }
+    }
+
+    /// A pcode overlay terminal that has the keyboard in `window`, if one has.
+    ///
+    /// Overlays stand for the terminal they cover as the window's focused
+    /// surface (`pcodeWindowSurface`), so actions that would end or reset
+    /// "the focused surface" must ask this first: Cmd+W in a popup closes the
+    /// popup, not pcode's terminal under it.
+    static func keyboardOverlay(in window: NSWindow?) -> Ghostty.SurfaceView? {
+        var view = window?.firstResponder as? NSView
+        while let current = view {
+            if let surface = current as? Ghostty.SurfaceView { return surface.isPCodeOverlay ? surface : nil }
+            view = current.superview
+        }
+        return nil
     }
 }
 
@@ -126,14 +152,22 @@ extension Ghostty.SurfaceView {
         objc_getAssociatedObject(self, &pcodePopupKey) as? PCodePopup
     }
 
-    /// The drawer or popup this surface is the overlay terminal of, if it is one.
-    var pcodeOwner: PCodeOverlayOwner? {
-        get { (objc_getAssociatedObject(self, &pcodeOwnerKey) as? WeakOwner)?.owner }
-        set {
-            objc_setAssociatedObject(
-                self, &pcodeOwnerKey, newValue.map(WeakOwner.init), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        }
+    private var pcodeOwnerBox: WeakOwner? {
+        objc_getAssociatedObject(self, &pcodeOwnerKey) as? WeakOwner
     }
+
+    /// Make this surface `owner`'s overlay terminal, for good: once dropped or
+    /// orphaned it stays an overlay, so it never passes for a terminal of the
+    /// window: its APCs go nowhere instead of to a drawer or popup of its own.
+    fileprivate func becomePCodeOverlay(of owner: PCodeOverlayOwner) {
+        objc_setAssociatedObject(self, &pcodeOwnerKey, WeakOwner(owner), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+
+    /// True if this surface is a pcode drawer's or popup's overlay terminal, even a dropped one.
+    var isPCodeOverlay: Bool { pcodeOwnerBox != nil }
+
+    /// The drawer or popup this surface is the overlay terminal of, while it is still there.
+    var pcodeOwner: PCodeOverlayOwner? { pcodeOwnerBox?.owner }
 
     /// The surface this one stands for in its window: for a pcode overlay, the
     /// terminal it is laid over, which is in the window's split tree where the
@@ -145,8 +179,8 @@ extension Ghostty.SurfaceView {
 
     /// An APC from pcode in this surface.
     func pcodeEvent(_ payload: String) {
-        if let owner = pcodeOwner {
-            owner.handleFromOverlay(payload, from: self)
+        if isPCodeOverlay {
+            pcodeOwner?.handleFromOverlay(payload, from: self)
             return
         }
         switch payload.prefix(while: { $0 != ";" }) {
@@ -159,7 +193,22 @@ extension Ghostty.SurfaceView {
 
     /// This surface took the keyboard. While its popup is shown, the popup gets it back.
     func pcodeDidFocus() {
-        guard pcodeOwner == nil else { return }
+        guard !isPCodeOverlay else { return }
         existingPCodePopup?.windowSurfaceDidFocus()
+    }
+
+    /// A popup's terminal before pcode is ready: mounted unseen, so the
+    /// mouse must neither focus it nor reach it.
+    var pcodeIgnoresMouse: Bool {
+        guard let popup = pcodeOwner as? PCodePopup else { return false }
+        return !popup.isShowing(self)
+    }
+
+    /// False while the mouse should not focus this surface: an unseen popup
+    /// terminal, or a terminal under its shown popup (hovering the scrim would
+    /// otherwise focus it, and the popup take focus back, on every move).
+    var pcodeAllowsMouseFocus: Bool {
+        if isPCodeOverlay { return !pcodeIgnoresMouse }
+        return existingPCodePopup?.ready != true
     }
 }

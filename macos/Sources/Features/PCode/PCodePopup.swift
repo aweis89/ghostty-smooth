@@ -93,10 +93,16 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         let hadFocus = Self.hasFocus(slot.surface)
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
-        slot.surface.pcodeOwner = nil
         ready = false
         self.slot = nil
+        // Hung up now, whatever still holds the view: pcode's cancel.
+        PCode.retire(slot.surface)
         if hadFocus, let surfaceView { Ghostty.moveFocus(to: surfaceView) }
+    }
+
+    /// True if `surface` is this popup's terminal and is shown.
+    func isShowing(_ surface: Ghostty.SurfaceView) -> Bool {
+        ready && slot?.surface === surface
     }
 
     /// The terminal this popup is over took the keyboard, which the open

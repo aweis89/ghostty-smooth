@@ -437,6 +437,14 @@ extension Ghostty {
             progressReportTimer?.invalidate()
         }
 
+        /// Free the core surface now rather than at deinit: its process is hung
+        /// up and its pty closed even while something still holds this view,
+        /// which is inert afterwards. Only for surfaces no window controller
+        /// owns (pcode overlays).
+        func freeSurface() {
+            surfaceModel = nil
+        }
+
         override func endSearch() {
             Ghostty.moveFocus(to: self)
             super.endSearch()
@@ -1008,7 +1016,8 @@ extension Ghostty {
             let pos = self.convert(event.locationInWindow, from: nil)
             mouseLocationInSurface = pos
 
-            guard let surfaceModel else { return }
+            // An unseen pcode popup: no cursor shape or mouse report from it.
+            guard let surfaceModel, !pcodeIgnoresMouse else { return }
 
             // On mouse enter we need to reset our cursor position. This is
             // super important because we set it to -1/-1 on mouseExit and
@@ -1047,7 +1056,7 @@ extension Ghostty {
             let pos = self.convert(event.locationInWindow, from: nil)
             mouseLocationInSurface = pos
 
-            guard let surfaceModel else { return }
+            guard let surfaceModel, !pcodeIgnoresMouse else { return }
 
             // Convert window position to view position. Note (0, 0) is bottom left.
             let mouseEvent = Ghostty.Input.MousePosEvent(
@@ -1063,7 +1072,8 @@ extension Ghostty {
                !controller.commandPaletteIsShowing,
                window.isKeyWindow &&
                     !self.focused &&
-                    controller.focusFollowsMouse {
+                    controller.focusFollowsMouse &&
+                    pcodeAllowsMouseFocus {
                 Ghostty.moveFocus(to: self)
             }
         }
