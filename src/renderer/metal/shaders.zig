@@ -271,6 +271,17 @@ pub const Uniforms = extern struct {
     /// like any other and content shifted below it is clipped at its edge.
     smooth_no_overscan: u32 align(4) = 0,
 
+    /// Soft bottom-edge dissolve height in pixels per region (0 = crisp).
+    smooth_fade_bottom: [max_smooth_regions]f32 align(4) = @splat(0),
+
+    /// Protocol 8 native reveal uniforms (ink sweep / vertical curtain).
+    smooth_reveal_region: i32 align(4) = -1,
+    smooth_reveal_mode: u32 align(4) = 0,
+    smooth_reveal_active_row: i32 align(4) = 0,
+    smooth_reveal_end_row: i32 align(4) = -1,
+    smooth_reveal_pos_px: f32 align(4) = 0,
+    smooth_reveal_feather_px: f32 align(4) = 0,
+
     pub const max_smooth_regions = 8;
 
     const PaddingExtend = packed struct(u8) {

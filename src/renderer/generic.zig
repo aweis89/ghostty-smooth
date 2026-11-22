@@ -200,6 +200,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// update wakes.
         glide_base_px: [8]f32 = @splat(0),
         glide_snap: [8]renderer.State.Smooth.Glide = @splat(.{}),
+        reveal_snap: [8]renderer.State.Smooth.Reveal = @splat(.{}),
+        smooth_overscan_flags: [8]bool = @splat(true),
         glide_clock: ?std.Io.Timestamp = null,
         glide_active: bool = false,
 
@@ -1160,9 +1162,65 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
-        /// Advance the smooth region glide snapshots to the current time
-        /// into the offset uniforms, using the same `State.Smooth.Glide.step`
-        /// as `State.stepGlides`.
+        /// Write per-region soft bottom-edge fade and protocol 8 reveal uniforms
+        /// from the current snapshots (`glide_snap`, `reveal_snap`, `glide_map`).
+        fn syncSmoothEffects(self: *Self) void {
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            self.uniforms.smooth_reveal_region = -1;
+            self.uniforms.smooth_reveal_mode = 0;
+            self.uniforms.smooth_reveal_active_row = 0;
+            self.uniforms.smooth_reveal_end_row = -1;
+            self.uniforms.smooth_reveal_pos_px = 0;
+            self.uniforms.smooth_reveal_feather_px = 0;
+            for (0..self.uniforms.smooth_count) |i| {
+                const x = self.glide_snap[i].rows;
+                self.uniforms.smooth_fade_bottom[i] = if (self.glide_snap[i].fade and x > 0)
+                    std.math.clamp(x / 0.6, 0.0, 1.0) * 1.05 * cell_h
+                else
+                    0;
+                if (self.uniforms.smooth_reveal_region < 0 and self.reveal_snap[i].isActive()) {
+                    const r = self.reveal_snap[i];
+                    const k_off: i32 = if (self.glide_map) |m|
+                        (if (m.slot == i) @intCast(m.k) else 0)
+                    else
+                        0;
+                    self.uniforms.smooth_reveal_region = @intCast(i);
+                    self.uniforms.smooth_reveal_mode = @intFromEnum(r.mode);
+                    const pad_top = self.uniforms.grid_padding[0];
+                    const pad_left = self.uniforms.grid_padding[3];
+                    switch (r.mode) {
+                        .none => {},
+                        .sweep => {
+                            self.uniforms.smooth_reveal_active_row =
+                                r.start_row + @as(i32, r.active_idx) + k_off;
+                            self.uniforms.smooth_reveal_end_row =
+                                r.start_row + @as(i32, r.count) - 1 + k_off;
+                            const ox = if (self.uniforms.smooth_offsets_x[i] >= 0)
+                                self.uniforms.smooth_offsets_x[i]
+                            else
+                                0;
+                            self.uniforms.smooth_reveal_pos_px = pad_left + r.pos * cell_w - ox;
+                            self.uniforms.smooth_reveal_feather_px =
+                                renderer.State.Smooth.Reveal.sweep_feather_cols * cell_w;
+                        },
+                        .curtain => {
+                            self.uniforms.smooth_reveal_active_row = r.start_row + k_off;
+                            self.uniforms.smooth_reveal_end_row =
+                                r.start_row + @as(i32, r.count) - 1 + k_off;
+                            self.uniforms.smooth_reveal_pos_px = pad_top +
+                                (@as(f32, @floatFromInt(r.start_row + k_off)) + r.pos) * cell_h -
+                                self.uniforms.smooth_offsets[i];
+                            self.uniforms.smooth_reveal_feather_px =
+                                renderer.State.Smooth.Reveal.curtain_feather_rows * cell_h;
+                        },
+                    }
+                }
+            }
+        }
+
+        /// Advance the smooth region glide and reveal snapshots to the current time
+        /// into the uniforms, using the same step functions as `State.stepGlides`.
         fn applyGlide(self: *Self) void {
             if (!self.glide_active) return;
             const clock = self.glide_clock orelse return;
@@ -1187,7 +1245,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
                 self.uniforms.smooth_offsets[i] = self.glide_base_px[i] - x * cell_h;
+                if (self.reveal_snap[i].step(
+                    dt,
+                    x,
+                    self.uniforms.smooth_rects[i][1],
+                    self.smooth_overscan_flags[i],
+                )) moving = true;
             }
+            self.syncSmoothEffects();
             if (!moving) self.glide_active = false;
         }
 
@@ -1548,24 +1613,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const full = s.left == 0 and s.right + 1 >= state.terminal.cols;
                             const cursor_in = screen.cursor.y <= s.bottom;
                             if (self.glide_map == null and s.glide.rows > 0 and full and !cursor_in) {
-                                k = @intFromFloat(@min(@ceil(s.glide.rows), renderer.State.Smooth.max_glide));
+                                k = @intFromFloat(@min(@ceil(s.glide.rows), renderer.State.Smooth.max_batch_glide));
                                 self.glide_map = .{ .slot = n, .bottom = s.bottom, .k = k };
                             }
                         }
                         const shift: f32 = @as(f32, @floatFromInt(k)) * cell_h;
                         self.glide_base_px[n] = (s.offsetRows() + s.glide.rows) * cell_h + shift;
                         self.glide_snap[n] = s.glide;
-                        if (s.glide.isActive()) self.glide_active = true;
+                        self.reveal_snap[n] = s.reveal;
+                        self.smooth_overscan_flags[n] = s.overscan;
+                        if (s.glide.isActive() or s.reveal.isActive()) self.glide_active = true;
                         self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h + shift;
                         self.uniforms.smooth_offsets_x[n] = if (s.offsetCols()) |c| c * cell_w else -1;
                         if (!s.overscan) self.uniforms.smooth_no_overscan |= @as(u32, 1) << @intCast(n);
                         n += 1;
                     }
                     self.uniforms.smooth_count = n;
+                    self.syncSmoothEffects();
                     // Scrollback rows to build such a region from. A change
                     // here makes the next update a full rebuild.
                     self.terminal_state.overscan_request.above =
-                        if (top_region) @intFromFloat(renderer.State.Smooth.max_glide) else 0;
+                        if (top_region) @intFromFloat(renderer.State.Smooth.max_batch_glide) else 0;
                 }
 
                 self.scroll_offset_px = if (state.terminal.screens.active.pages.viewport == .active)

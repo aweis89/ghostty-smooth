@@ -265,17 +265,23 @@ test "preedit range shifts left at right edge" {
 ///   ESC _ smooth;ID;top;bottom;left;right;pos;max;flags ESC \
 ///                                                         ...with flags (protocol 5);
 ///                                                         bit 0: no overscan row
-///   ESC _ smooth;advance;ID;N[;rate] ESC \                content just moved up
+///   ESC _ smooth;advance;ID;N[;rate[;flags]] ESC \        content just moved up
 ///                                                         N rows; glide it in.
 ///                                                         Negative N (protocol
 ///                                                         6): moved down.
 ///                                                         Optional rate in
 ///                                                         centi-rows/s (protocol
-///                                                         7): hold a steady
-///                                                         cruise speed while
-///                                                         more rows follow; 0 or
-///                                                         omitted drains to rest
-///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;7
+///                                                         7). Optional flags
+///                                                         (protocol 8): bit 0 =
+///                                                         batch glide (up to 32
+///                                                         rows, adaptive catch-up),
+///                                                         bit 1 = soft bottom fade
+///   ESC _ smooth;reveal;ID;top;count;rate[;flags] ESC \   protocol 8: animate
+///                                                         newly committed rows
+///                                                         in region ID (flags 0:
+///                                                         120 Hz soft ink sweep;
+///                                                         flags 1: vertical curtain)
+///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;8
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
 /// as by writing new lines above a pinned editor: sent in the same
@@ -304,10 +310,20 @@ pub const Smooth = struct {
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;7\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;8\x1b\\";
 
-    /// Rows of glide kept at most; a bigger backlog jumps the excess.
+    /// Rows of glide kept at most for legacy/spring glides; a bigger backlog jumps the excess.
     pub const max_glide: f32 = 3;
+    /// Rows of glide kept at most for protocol 8 paced batch glides.
+    pub const max_batch_glide: f32 = 32;
+    /// Batch glide pacing bounds and catch-up horizon.
+    pub const batch_min_rate: f32 = 5.0;
+    pub const batch_max_rate: f32 = 18.0;
+    pub const batch_catch_up_s: f32 = 2.5;
+    /// Protocol 8 `advance` flags bitmask.
+    pub const advance_flag_batch: u32 = 1;
+    pub const advance_flag_fade: u32 = 2;
+    pub const advance_flags_mask: u32 = advance_flag_batch | advance_flag_fade;
     /// Spring stiffness for isolated/downward glides (critically damped).
     pub const glide_stiffness: f32 = 220;
     /// Maximum accepted rate hint in centi-rows/s (100.00 rows/s).
@@ -340,22 +356,51 @@ pub const Smooth = struct {
         /// Seconds elapsed since the last `advance` (safety timeout so a
         /// vanished stream still drains to rest).
         since: f32 = 0,
+        /// True while draining a protocol 8 paced batch commit (larger cap,
+        /// adaptive cruise speed, no tight cushion surge).
+        batch: bool = false,
+        /// True when the renderer should dissolve newly emerging rows softly
+        /// at the region's bottom clip edge while gliding.
+        fade: bool = false,
 
         pub fn isActive(self: Glide) bool {
             return self.rows != 0 or self.vel != 0;
         }
 
         pub fn advance(self: *Glide, delta: f32, rate_hint: f32) void {
-            self.rows = std.math.clamp(self.rows + delta, -max_glide, max_glide);
+            self.advanceFlags(delta, rate_hint, 0);
+        }
+
+        pub fn advanceFlags(self: *Glide, delta: f32, rate_hint: f32, flags: u32) void {
+            const is_batch = (flags & advance_flag_batch) != 0 and delta > 0;
+            const cap = if (is_batch or self.batch) max_batch_glide else max_glide;
+            self.rows = std.math.clamp(self.rows + delta, -cap, cap);
             self.since = 0;
             if (self.rows == 0) {
                 self.vel = 0;
                 self.rate = 0;
                 self.cruise = 0;
+                self.batch = false;
+                self.fade = false;
             } else if (self.rows < 0) {
                 self.rate = 0;
                 self.cruise = 0;
+                self.batch = false;
+                self.fade = false;
+            } else if (is_batch) {
+                self.batch = true;
+                if ((flags & advance_flag_fade) != 0) self.fade = true;
+                const raw_base = if (rate_hint >= min_conveyor_rate) rate_hint else batch_min_rate;
+                const base = std.math.clamp(raw_base, min_conveyor_rate, batch_max_rate);
+                const target = std.math.clamp(
+                    @max(base, self.rows / batch_catch_up_s),
+                    base,
+                    batch_max_rate,
+                );
+                self.rate = target;
+                if (self.cruise == 0) self.cruise = target;
             } else if (delta > 0 and rate_hint >= min_conveyor_rate) {
+                if ((flags & advance_flag_fade) != 0) self.fade = true;
                 self.rate = rate_hint;
                 if (self.cruise == 0) self.cruise = rate_hint;
             } else {
@@ -363,7 +408,8 @@ pub const Smooth = struct {
                 // gliding up: stop streaming, but keep `cruise` if we were
                 // already cruising so we coast smoothly to rest without
                 // surging into a stiff spring.
-                self.rate = 0;
+                if ((flags & advance_flag_fade) != 0) self.fade = true;
+                if (!self.batch) self.rate = 0;
             }
         }
 
@@ -374,11 +420,14 @@ pub const Smooth = struct {
             if (!self.isActive()) {
                 self.rate = 0;
                 self.cruise = 0;
+                self.batch = false;
+                self.fade = false;
                 return false;
             }
             if (self.cruise == 0 or self.rows <= 0) {
                 self.rate = 0;
                 self.cruise = 0;
+                self.batch = false;
                 return self.stepSpring(dt);
             }
             return self.stepConveyor(dt);
@@ -397,6 +446,7 @@ pub const Smooth = struct {
             if (crossed or (@abs(self.rows) <= 0.001 and @abs(self.vel) < 0.01)) {
                 self.rows = 0;
                 self.vel = 0;
+                self.fade = false;
                 return false;
             }
             return true;
@@ -408,12 +458,15 @@ pub const Smooth = struct {
                 const h = @min(rem_dt, conveyor_substep);
                 rem_dt -= h;
                 self.since += h;
-                if (self.rate > 0) {
+                if (!self.batch and self.rate > 0) {
                     const timeout = std.math.clamp(2.0 / self.rate, 0.45, 4.0);
                     if (self.since > timeout) self.rate = 0;
                 }
                 var v_des: f32 = undefined;
-                if (self.rate > 0) {
+                if (self.batch) {
+                    self.cruise += (self.rate - self.cruise) * (1 - @exp(-h / tau_cruise));
+                    v_des = self.cruise;
+                } else if (self.rate > 0) {
                     self.cruise += (self.rate - self.cruise) * (1 - @exp(-h / tau_cruise));
                     v_des = self.cruise;
                     const cushion_hi = @min(
@@ -437,10 +490,289 @@ pub const Smooth = struct {
                     self.vel = 0;
                     self.rate = 0;
                     self.cruise = 0;
+                    self.batch = false;
+                    self.fade = false;
                     return false;
                 }
             }
             return true;
+        }
+    };
+
+    /// Self-contained native reveal animation (protocol 8): 120 Hz feathered
+    /// horizontal ink sweep across prose lines, or vertical curtain dissolve
+    /// for in-place blocks. Snapshotted alongside `Glide` for vsync drawing.
+    pub const Reveal = struct {
+        pub const max_rows: usize = 32;
+        pub const max_rate_param: u32 = 10_000;
+        pub const default_sweep_rate: f32 = 280.0;
+        pub const max_sweep_rate: f32 = 2400.0;
+        pub const sweep_catch_up_s: f32 = 2.0;
+        pub const sweep_feather_cols: f32 = 6.0;
+        pub const default_curtain_rate: f32 = 10.0;
+        pub const max_curtain_rate: f32 = 30.0;
+        pub const curtain_catch_up_s: f32 = 1.5;
+        pub const curtain_feather_rows: f32 = 1.5;
+
+        pub const Mode = enum(u8) {
+            none = 0,
+            sweep = 1,
+            curtain = 2,
+        };
+
+        pub const Span = struct {
+            lead: u16 = 0,
+            end: u16 = 0,
+
+            pub fn len(self: Span) u16 {
+                return self.end -| self.lead;
+            }
+        };
+
+        mode: Mode = .none,
+        /// Active-screen row (0-based) of `spans[0]`. May become negative if
+        /// rows scroll off the top, and is trimmed in `shiftRows`.
+        start_row: i32 = 0,
+        /// Number of valid rows in `spans` (0..max_rows).
+        count: u16 = 0,
+        /// Per-row visible content bounds [lead, end) in grid cells.
+        spans: [max_rows]Span = @splat(.{}),
+        /// Current row index sweeping (0..count) for `.sweep`.
+        active_idx: u16 = 0,
+        /// `.sweep`: frontier x in cells on `spans[active_idx]`.
+        /// `.curtain`: frontier y in rows relative to `start_row`.
+        pos: f32 = 0,
+        /// Current speed (cells/s for `.sweep`, rows/s for `.curtain`).
+        speed: f32 = 0,
+        /// Requested base rate (0 = mode default).
+        base_rate: f32 = 0,
+
+        pub fn isActive(self: Reveal) bool {
+            return self.mode != .none and self.count > 0;
+        }
+
+        pub fn clear(self: *Reveal) void {
+            self.mode = .none;
+            self.start_row = 0;
+            self.count = 0;
+            self.active_idx = 0;
+            self.pos = 0;
+            self.speed = 0;
+            self.base_rate = 0;
+        }
+
+        /// Drop completed leading rows in `.sweep` to free buffer room.
+        fn compact(self: *Reveal) void {
+            if (self.mode != .sweep or self.active_idx == 0) return;
+            const drop = self.active_idx;
+            if (drop >= self.count) {
+                self.clear();
+                return;
+            }
+            const keep = self.count - drop;
+            for (0..keep) |i| self.spans[i] = self.spans[i + drop];
+            self.start_row += @intCast(drop);
+            self.count = keep;
+            self.active_idx = 0;
+        }
+
+        /// Shift active reveal rows up when the terminal scrolls by `delta > 0`.
+        /// Rows still inside the gliding scrollback window (`>= -ceil(glide_rows)`)
+        /// are kept so `syncSmoothEffects` continues revealing them via `k_off`.
+        pub fn shiftRows(self: *Reveal, delta: i32, glide_rows: f32) void {
+            if (!self.isActive() or delta <= 0) return;
+            self.start_row -= delta;
+            const min_row: i32 = -@as(i32, @intFromFloat(@ceil(@max(@as(f32, 0), glide_rows))));
+            if (self.start_row + @as(i32, self.count) <= min_row) {
+                self.clear();
+                return;
+            }
+            if (self.start_row < min_row) {
+                const drop_i = min_row - self.start_row;
+                if (drop_i >= @as(i32, self.count)) {
+                    self.clear();
+                    return;
+                }
+                const drop: u16 = @intCast(drop_i);
+                const keep = self.count - drop;
+                for (0..keep) |i| self.spans[i] = self.spans[i + drop];
+                self.start_row = min_row;
+                self.count = keep;
+                if (self.mode == .sweep) {
+                    if (self.active_idx >= drop) {
+                        self.active_idx -= drop;
+                    } else {
+                        self.active_idx = 0;
+                        self.skipEmpty();
+                        if (self.isActive()) {
+                            self.pos = @floatFromInt(self.spans[self.active_idx].lead);
+                        }
+                    }
+                } else if (self.mode == .curtain) {
+                    self.pos = @max(@as(f32, 0), self.pos - @as(f32, @floatFromInt(drop)));
+                }
+            }
+        }
+
+        fn skipEmpty(self: *Reveal) void {
+            while (self.active_idx < self.count and self.spans[self.active_idx].len() == 0) {
+                self.active_idx += 1;
+            }
+            if (self.active_idx >= self.count) {
+                self.clear();
+            }
+        }
+
+        fn recomputeSpeed(self: *Reveal) void {
+            switch (self.mode) {
+                .none => self.speed = 0,
+                .sweep => {
+                    var rem_cells: f32 = 0;
+                    for (self.active_idx..self.count) |i| {
+                        const sp = self.spans[i];
+                        if (sp.len() == 0) continue;
+                        if (i == self.active_idx) {
+                            const end_f = @as(f32, @floatFromInt(sp.end)) + sweep_feather_cols;
+                            rem_cells += @max(@as(f32, 0), end_f - self.pos);
+                        } else {
+                            rem_cells += @as(f32, @floatFromInt(sp.len())) + sweep_feather_cols;
+                        }
+                    }
+                    const raw_base = if (self.base_rate > 0) self.base_rate else default_sweep_rate;
+                    const base = @min(max_sweep_rate, raw_base);
+                    self.speed = std.math.clamp(
+                        @max(self.speed, @max(base, rem_cells / sweep_catch_up_s)),
+                        base,
+                        max_sweep_rate,
+                    );
+                },
+                .curtain => {
+                    const raw_base = if (self.base_rate > 0) self.base_rate else default_curtain_rate;
+                    const base = @min(max_curtain_rate, raw_base);
+                    const rem = @max(
+                        @as(f32, 0),
+                        @as(f32, @floatFromInt(self.count)) + curtain_feather_rows - self.pos,
+                    );
+                    self.speed = std.math.clamp(
+                        @max(self.speed, @max(base, rem / curtain_catch_up_s)),
+                        base,
+                        max_curtain_rate,
+                    );
+                },
+            }
+        }
+
+        pub fn start(
+            self: *Reveal,
+            mode: Mode,
+            top: u16,
+            new_spans: []const Span,
+            rate_param: u32,
+        ) void {
+            if (mode == .none or new_spans.len == 0) {
+                self.clear();
+                return;
+            }
+            const req_rate: f32 = switch (mode) {
+                .none => 0,
+                .sweep => @floatFromInt(rate_param),
+                .curtain => @as(f32, @floatFromInt(rate_param)) / 100.0,
+            };
+            const top_i32: i32 = @intCast(top);
+            // Chain seamlessly if the new block directly follows the active reveal.
+            if (self.isActive() and self.mode == mode and top_i32 == self.start_row + @as(i32, self.count)) {
+                self.compact();
+                const room = max_rows - @as(usize, self.count);
+                if (new_spans.len <= room) {
+                    for (new_spans, 0..) |sp, i| self.spans[self.count + i] = sp;
+                    self.count += @intCast(new_spans.len);
+                    if (req_rate > 0) self.base_rate = req_rate;
+                    self.recomputeSpeed();
+                    return;
+                }
+            }
+            // Start fresh for a non-adjacent block, mode switch, or full buffer.
+            self.clear();
+            const n = @min(new_spans.len, max_rows);
+            const offset = new_spans.len - n;
+            self.mode = mode;
+            self.start_row = top_i32 + @as(i32, @intCast(offset));
+            self.count = @intCast(n);
+            for (0..n) |i| self.spans[i] = new_spans[offset + i];
+            self.base_rate = req_rate;
+            if (mode == .sweep) {
+                self.active_idx = 0;
+                self.skipEmpty();
+                if (!self.isActive()) return;
+                self.pos = @floatFromInt(self.spans[self.active_idx].lead);
+            } else {
+                self.pos = 0;
+            }
+            self.recomputeSpeed();
+        }
+
+        /// Advance the reveal frontier by `dt` seconds. Returns whether it is
+        /// still active. When `glide_rows > 0`, `.sweep` waits for each row to
+        /// cross above the region's bottom edge before sweeping it, and boosts
+        /// speed if the conveyor pulls multiple rows ahead.
+        pub fn step(
+            self: *Reveal,
+            dt: f32,
+            glide_rows: f32,
+            region_bottom: u16,
+            overscan: bool,
+        ) bool {
+            if (!self.isActive()) return false;
+            if (dt <= 0) return true;
+            switch (self.mode) {
+                .none => return false,
+                .curtain => {
+                    self.pos += self.speed * @min(dt, 10.0);
+                    const end_pos = @as(f32, @floatFromInt(self.count)) + curtain_feather_rows;
+                    if (self.pos >= end_pos) {
+                        self.clear();
+                        return false;
+                    }
+                    return true;
+                },
+                .sweep => {
+                    var rem_dt = @min(dt, 10.0);
+                    const clip_row: f32 = @floatFromInt(
+                        if (overscan) @as(u32, region_bottom) else @as(u32, region_bottom) + 1,
+                    );
+                    while (rem_dt > 0 and self.isActive()) {
+                        const active_row_f: f32 = @floatFromInt(self.start_row + @as(i32, self.active_idx));
+                        var eff_speed = self.speed;
+                        if (glide_rows > 0) {
+                            const visible_limit = clip_row - glide_rows - 0.35;
+                            if (active_row_f > visible_limit) {
+                                // Row is still below the visible clip edge: hold at its start.
+                                return true;
+                            }
+                            const rows_above = visible_limit - active_row_f;
+                            if (rows_above > 1.0) {
+                                eff_speed = @min(max_sweep_rate, eff_speed * (1.0 + rows_above));
+                            }
+                        }
+                        const sp = self.spans[self.active_idx];
+                        const row_end = @as(f32, @floatFromInt(sp.end)) + sweep_feather_cols;
+                        const dist = row_end - self.pos;
+                        if (dist <= 0 or eff_speed * rem_dt >= dist) {
+                            if (dist > 0 and eff_speed > 0) {
+                                rem_dt -= dist / eff_speed;
+                            }
+                            self.active_idx += 1;
+                            self.skipEmpty();
+                            if (!self.isActive()) return false;
+                            self.pos = @floatFromInt(self.spans[self.active_idx].lead);
+                        } else {
+                            self.pos += eff_speed * rem_dt;
+                            rem_dt = 0;
+                        }
+                    }
+                    return self.isActive();
+                },
+            }
         }
     };
 
@@ -470,10 +802,11 @@ pub const Smooth = struct {
 
     /// Active glide motion (spring or steady-rate conveyor; see `advance`).
     glide: Glide = .{},
-    /// When `glide` was last brought up to date. An advance must land on the
-    /// glide as it is now, not as it was at the last frame update, or the
-    /// motion jumps.
+    /// When `glide` and `reveal` were last brought up to date. An advance or
+    /// reveal must land on the motion as it is now, not at the last frame.
     glide_at: std.Io.Timestamp = .zero,
+    /// Active native reveal animation (protocol 8; ink sweep or vertical curtain).
+    reveal: Reveal = .{},
 
     /// Whether `bottom` is a hidden overscan row (the default).
     overscan: bool = true,
@@ -484,8 +817,29 @@ pub const Smooth = struct {
         clear: ?u32,
         /// The region's content moved up by `rows`, at `at` (set by the
         /// caller on receipt; parsing leaves it zero), with an optional
-        /// cruise `rate` hint in rows per second (0 = spring / end of stream).
-        advance: struct { id: u32, rows: i32, rate: f32 = 0, at: std.Io.Timestamp = .zero },
+        /// cruise `rate` hint in rows per second (0 = spring / end of stream)
+        /// and optional protocol 8 `flags`.
+        advance: struct {
+            id: u32,
+            rows: i32,
+            rate: f32 = 0,
+            flags: u32 = 0,
+            at: std.Io.Timestamp = .zero,
+        },
+        /// Protocol 8 reveal animation over newly committed viewport rows
+        /// `top .. top + count - 1`. `spans` is filled by the stream handler
+        /// from the active screen; if `has_spans` is false (e.g. unit tests),
+        /// default full-width spans `[left, right + 1)` are used.
+        reveal: struct {
+            id: u32,
+            top: u16,
+            count: u16,
+            rate: u32 = 0,
+            mode: Reveal.Mode = .sweep,
+            spans: [Reveal.max_rows]Reveal.Span = @splat(.{}),
+            has_spans: bool = false,
+            at: std.Io.Timestamp = .zero,
+        },
     };
 
     /// Parse the payload after `smooth;`.
@@ -503,16 +857,49 @@ pub const Smooth = struct {
             const id = it.next() orelse return error.Invalid;
             const rows = it.next() orelse return error.Invalid;
             var rate: f32 = 0;
+            var flags: u32 = 0;
             if (it.next()) |rate_s| {
-                if (it.next() != null) return error.Invalid;
                 const centi = std.fmt.parseInt(u32, rate_s, 10) catch return error.Invalid;
                 if (centi > max_rate_centi) return error.Invalid;
                 rate = @as(f32, @floatFromInt(centi)) / 100.0;
+                if (it.next()) |flags_s| {
+                    if (it.next() != null) return error.Invalid;
+                    flags = std.fmt.parseInt(u32, flags_s, 10) catch return error.Invalid;
+                    if ((flags & ~advance_flags_mask) != 0) return error.Invalid;
+                }
             }
             return .{ .advance = .{
                 .id = std.fmt.parseInt(u32, id, 10) catch return error.Invalid,
                 .rows = std.fmt.parseInt(i32, rows, 10) catch return error.Invalid,
                 .rate = rate,
+                .flags = flags,
+            } };
+        }
+        if (std.mem.eql(u8, it.peek() orelse "", "reveal")) {
+            _ = it.next();
+            const id_s = it.next() orelse return error.Invalid;
+            const top_s = it.next() orelse return error.Invalid;
+            const count_s = it.next() orelse return error.Invalid;
+            const rate_s = it.next() orelse return error.Invalid;
+            var flags: u32 = 0;
+            if (it.next()) |flags_s| {
+                if (it.next() != null) return error.Invalid;
+                flags = std.fmt.parseInt(u32, flags_s, 10) catch return error.Invalid;
+                if (flags > 1) return error.Invalid;
+            }
+            const id = std.fmt.parseInt(u32, id_s, 10) catch return error.Invalid;
+            const top = std.fmt.parseInt(u16, top_s, 10) catch return error.Invalid;
+            const count = std.fmt.parseInt(u16, count_s, 10) catch return error.Invalid;
+            const rate = std.fmt.parseInt(u32, rate_s, 10) catch return error.Invalid;
+            if (count == 0 or count > Reveal.max_rows or rate > Reveal.max_rate_param) {
+                return error.Invalid;
+            }
+            return .{ .reveal = .{
+                .id = id,
+                .top = top,
+                .count = count,
+                .rate = rate,
+                .mode = if (flags == 1) .curtain else .sweep,
             } };
         }
         while (it.next()) |field| {
@@ -561,11 +948,14 @@ pub const Smooth = struct {
 
         const acc = self.acc - @as(f32, @floatFromInt(ack));
         const pending = self.pending_rows - @as(i32, @intCast(ack));
+        const same_width = self.left == next.left and self.right == next.right;
         const glide = self.glide;
         const glide_at = self.glide_at;
+        const reveal = if (same_width) self.reveal else Reveal{};
         self.* = next;
         self.glide = glide;
         self.glide_at = glide_at;
+        self.reveal = reveal;
         if (same) {
             self.acc = acc;
             self.pending_rows = pending;
@@ -592,18 +982,63 @@ pub const Smooth = struct {
     }
 
     /// Content moved up `rows` at `now` (negative: down): draw it that much
-    /// lower (higher), up to `max_glide` either way, added to the glide as it
-    /// stands at `now`. A positive `rate` (rows/s) holds steady-rate cruise.
+    /// lower (higher), up to `max_glide` (or `max_batch_glide` when batch flag
+    /// is set), added to the glide as it stands at `now`.
     pub fn advance(self: *Smooth, rows: i32, rate: f32, now: std.Io.Timestamp) void {
-        _ = self.catchUp(now);
-        self.glide.advance(@floatFromInt(rows), rate);
+        self.advanceFlags(rows, rate, 0, now);
     }
 
-    /// Bring the glide up to `now`. Returns whether it is moving.
+    pub fn advanceFlags(self: *Smooth, rows: i32, rate: f32, flags: u32, now: std.Io.Timestamp) void {
+        _ = self.catchUp(now);
+        self.glide.advanceFlags(@floatFromInt(rows), rate, flags);
+        if (rows > 0 and self.reveal.isActive()) {
+            self.reveal.shiftRows(rows, self.glide.rows);
+        }
+    }
+
+    pub fn startReveal(
+        self: *Smooth,
+        mode: Reveal.Mode,
+        top: u16,
+        count: u16,
+        spans: []const Reveal.Span,
+        has_spans: bool,
+        rate: u32,
+        now: std.Io.Timestamp,
+    ) void {
+        _ = self.catchUp(now);
+        const n = @min(@as(usize, count), Reveal.max_rows);
+        var fallback: [Reveal.max_rows]Reveal.Span = undefined;
+        const slice: []const Reveal.Span = if (has_spans)
+            spans[0..n]
+        else blk: {
+            const end_col: u16 = self.right +| 1;
+            for (0..n) |i| fallback[i] = .{ .lead = self.left, .end = end_col };
+            break :blk fallback[0..n];
+        };
+        self.reveal.start(mode, top, slice, rate);
+    }
+
+    /// Bring the glide and reveal up to `now`. Returns whether either is moving.
     pub fn catchUp(self: *Smooth, now: std.Io.Timestamp) bool {
         const ns: f32 = @floatFromInt(@max(self.glide_at.durationTo(now).nanoseconds, 0));
         self.glide_at = now;
-        return self.glide.step(ns / std.time.ns_per_s);
+        const dt = ns / std.time.ns_per_s;
+        // Step glide and reveal together in fine substeps whenever both are
+        // active so catchUp matches the 120 Hz draw loop across rebuilds.
+        if (dt > 0 and self.glide.isActive() and self.reveal.isActive()) {
+            var rem_dt = @min(dt, 10.0);
+            while (rem_dt > 0) {
+                const h = @min(rem_dt, conveyor_substep);
+                rem_dt -= h;
+                _ = self.glide.step(h);
+                _ = self.reveal.step(h, self.glide.rows, self.bottom, self.overscan);
+            }
+            return self.glide.isActive() or self.reveal.isActive();
+        }
+        const glide_moving = self.glide.step(dt);
+        const reveal_moving = self.reveal.step(dt, self.glide.rows, self.bottom, self.overscan);
+        return glide_moving or reveal_moving;
     }
 
     /// The horizontal offset to render, in columns, or null when the
@@ -642,7 +1077,20 @@ pub fn applySmooth(self: *State, cmd: Smooth.Command) void {
         },
         .advance => |a| for (&self.smooth) |*slot| {
             if (slot.*) |*s| {
-                if (s.id == a.id) s.advance(a.rows, a.rate, a.at);
+                if (s.id == a.id) s.advanceFlags(a.rows, a.rate, a.flags, a.at);
+            }
+        },
+        .reveal => |r| for (&self.smooth) |*slot| {
+            if (slot.*) |*s| {
+                if (s.id == r.id) s.startReveal(
+                    r.mode,
+                    r.top,
+                    r.count,
+                    &r.spans,
+                    r.has_spans,
+                    r.rate,
+                    r.at,
+                );
             }
         },
     }
@@ -743,6 +1191,148 @@ test "smooth: advance glides in and survives re-declaration" {
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;-5"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;10001"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;500;extra"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;500;4"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;500;3;extra"));
+}
+
+test "smooth: protocol 8 batch glide and soft fade" {
+    const testing = std.testing;
+    const parsed = (try Smooth.parse("advance;7;16;600;3")).advance;
+    try testing.expectEqual(@as(u32, 7), parsed.id);
+    try testing.expectEqual(@as(i32, 16), parsed.rows);
+    try testing.expectApproxEqAbs(@as(f32, 6.0), parsed.rate, 0.0001);
+    try testing.expectEqual(@as(u32, 3), parsed.flags);
+
+    var g: Smooth.Glide = .{};
+    const dt: f32 = 1.0 / 120.0;
+    g.advanceFlags(16, 6.0, Smooth.advance_flag_batch | Smooth.advance_flag_fade);
+    try testing.expectApproxEqAbs(@as(f32, 16.0), g.rows, 0.0001);
+    try testing.expect(g.batch);
+    try testing.expect(g.fade);
+    // 16 / 2.5 = 6.4 rows/s (no tight cushion_hi surge).
+    try testing.expectApproxEqAbs(@as(f32, 6.4), g.rate, 0.001);
+
+    var prev = g.rows;
+    var peak_speed: f32 = 0;
+    var frames: usize = 0;
+    while (g.step(dt)) : (frames += 1) {
+        try testing.expect(g.rows >= 0 and g.rows <= prev + 0.0001);
+        peak_speed = @max(peak_speed, -g.vel);
+        prev = g.rows;
+        try testing.expect(frames < 600);
+    }
+    // Cruises smoothly around 6.4 rows/s (~2.5s = ~300 frames) without surging.
+    try testing.expect(peak_speed > 6.0 and peak_speed < 6.8);
+    try testing.expect(frames > 240 and frames < 420);
+    try testing.expectEqual(@as(f32, 0), g.rows);
+    try testing.expect(!g.batch);
+    try testing.expect(!g.fade);
+
+    // Clamps to max_batch_glide (32) rather than legacy max_glide (3).
+    g.advanceFlags(60, 5.0, Smooth.advance_flag_batch);
+    try testing.expectApproxEqAbs(Smooth.max_batch_glide, g.rows, 0.0001);
+}
+
+test "smooth: protocol 8 reveal sweep, chaining, curtain, and glide sync" {
+    const testing = std.testing;
+    const sw = (try Smooth.parse("reveal;7;10;4;280")).reveal;
+    try testing.expectEqual(@as(u32, 7), sw.id);
+    try testing.expectEqual(@as(u16, 10), sw.top);
+    try testing.expectEqual(@as(u16, 4), sw.count);
+    try testing.expectEqual(@as(u32, 280), sw.rate);
+    try testing.expectEqual(Smooth.Reveal.Mode.sweep, sw.mode);
+
+    const cu = (try Smooth.parse("reveal;7;10;4;0;1")).reveal;
+    try testing.expectEqual(Smooth.Reveal.Mode.curtain, cu.mode);
+
+    try testing.expectError(error.Invalid, Smooth.parse("reveal;7;10;0;280"));
+    try testing.expectError(error.Invalid, Smooth.parse("reveal;7;10;33;280"));
+    try testing.expectError(error.Invalid, Smooth.parse("reveal;7;10;4;10001"));
+    try testing.expectError(error.Invalid, Smooth.parse("reveal;7;10;4;280;2"));
+    try testing.expectError(error.Invalid, Smooth.parse("reveal;7;10;4;280;1;extra"));
+
+    // Sweep skips leading blank rows and indentation, and finishes cleanly.
+    var rev: Smooth.Reveal = .{};
+    const spans = [_]Smooth.Reveal.Span{
+        .{ .lead = 0, .end = 0 }, // blank
+        .{ .lead = 4, .end = 24 }, // 20 chars indented 4
+        .{ .lead = 0, .end = 0 }, // blank
+        .{ .lead = 2, .end = 12 }, // 10 chars indented 2
+    };
+    rev.start(.sweep, 5, &spans, 200);
+    try testing.expect(rev.isActive());
+    try testing.expectEqual(@as(u16, 1), rev.active_idx);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), rev.pos, 0.001);
+
+    // Chaining adjacent rows appends without resetting progress.
+    const more = [_]Smooth.Reveal.Span{.{ .lead = 0, .end = 10 }};
+    rev.start(.sweep, 9, &more, 200);
+    try testing.expectEqual(@as(u16, 4), rev.count); // leading blank compacted away
+    try testing.expectEqual(@as(i32, 6), rev.start_row);
+    try testing.expectEqual(@as(u16, 0), rev.active_idx);
+
+    // While gliding with rows still below clip edge, sweep holds at lead.
+    try testing.expect(rev.step(0.1, 10.0, 12, true));
+    try testing.expectApproxEqAbs(@as(f32, 4.0), rev.pos, 0.001);
+
+    // Once visible (glide = 0), sweeps to completion.
+    var steps: usize = 0;
+    while (rev.step(1.0 / 120.0, 0.0, 12, true)) : (steps += 1) {
+        try testing.expect(steps < 400);
+    }
+    try testing.expect(!rev.isActive());
+
+    // ShiftRows moves reveal upward on subsequent scrolls, keeps rows inside the
+    // gliding scrollback window, and clears once past it.
+    rev.start(.sweep, 8, &.{ .{ .lead = 0, .end = 20 }, .{ .lead = 0, .end = 20 } }, 280);
+    rev.shiftRows(3, 0.0);
+    try testing.expectEqual(@as(i32, 5), rev.start_row);
+    rev.shiftRows(7, 10.0); // now at -2, still inside 10-row glide window!
+    try testing.expect(rev.isActive());
+    try testing.expectEqual(@as(i32, -2), rev.start_row);
+    rev.shiftRows(12, 0.0); // past window -> cleared
+    try testing.expect(!rev.isActive());
+
+    // Curtain mode progresses top-to-bottom and completes.
+    rev.start(.curtain, 4, &.{ .{ .lead = 0, .end = 40 }, .{ .lead = 0, .end = 40 } }, 0);
+    try testing.expect(rev.isActive());
+    var c_steps: usize = 0;
+    while (rev.step(1.0 / 120.0, 0.0, 20, true)) : (c_steps += 1) {
+        try testing.expect(c_steps < 300);
+    }
+    try testing.expect(!rev.isActive());
+
+    // Max valid APC rates clamp safely without panicking, and u16 max bottom does not overflow.
+    var g_hi: Smooth.Glide = .{};
+    g_hi.advanceFlags(10, 100.0, Smooth.advance_flag_batch);
+    try testing.expectApproxEqAbs(Smooth.batch_max_rate, g_hi.rate, 0.001);
+    rev.start(.sweep, 0, &.{.{ .lead = 0, .end = 20 }}, 10_000);
+    try testing.expectApproxEqAbs(Smooth.Reveal.max_sweep_rate, rev.speed, 0.001);
+    _ = rev.step(0.01, 1.0, std.math.maxInt(u16), false);
+    rev.start(.curtain, 0, &.{.{ .lead = 0, .end = 20 }}, 10_000);
+    try testing.expectApproxEqAbs(Smooth.Reveal.max_curtain_rate, rev.speed, 0.001);
+
+    // Substepped catchUp matches 120 Hz incremental stepping when glide and reveal overlap.
+    var s_bulk: Smooth = .{ .id = 7, .top = 0, .bottom = 20, .left = 0, .right = 79, .pos = 0, .max = 0 };
+    var s_fine = s_bulk;
+    const t0: std.Io.Timestamp = .zero;
+    s_bulk.advanceFlags(6, 5.0, Smooth.advance_flag_batch | Smooth.advance_flag_fade, t0);
+    s_fine.advanceFlags(6, 5.0, Smooth.advance_flag_batch | Smooth.advance_flag_fade, t0);
+    const six_spans: [6]Smooth.Reveal.Span = @splat(.{ .lead = 0, .end = 40 });
+    s_bulk.startReveal(.sweep, 13, 6, &six_spans, true, 280, t0);
+    s_fine.startReveal(.sweep, 13, 6, &six_spans, true, 280, t0);
+    _ = s_bulk.catchUp(.fromNanoseconds(250 * std.time.ns_per_ms));
+    for (1..31) |f| {
+        _ = s_fine.catchUp(.fromNanoseconds(@intCast(f * 250 * std.time.ns_per_ms / 30)));
+    }
+    try testing.expectEqual(s_fine.reveal.active_idx, s_bulk.reveal.active_idx);
+    try testing.expectApproxEqAbs(s_fine.reveal.pos, s_bulk.reveal.pos, 1.5);
+
+    // Width resize clears reveal; vertical-only bottom resize preserves it.
+    s_fine.update(.{ .id = 7, .top = 0, .bottom = 18, .left = 0, .right = 79, .pos = 0, .max = 0 });
+    try testing.expect(s_fine.reveal.isActive());
+    s_fine.update(.{ .id = 7, .top = 0, .bottom = 18, .left = 0, .right = 59, .pos = 0, .max = 0 });
+    try testing.expect(!s_fine.reveal.isActive());
 }
 
 test "smooth: rate-hinted conveyor cruises steadily and coasts cleanly to rest" {
