@@ -95,19 +95,10 @@ final class PCodeDrawer: NSObject, ObservableObject {
         if hadFocus { focusTerminal() }
     }
 
-    /// Showing or hiding the drawer moves the surface in the view tree, which
-    /// takes first responder from it: give it back if it had it, and only then,
-    /// so a pane in the background never takes focus from the one in use.
+    /// The drawer is an overlay (`PCodeDrawerSurface`): the surface stays put
+    /// in the view tree, so whichever had the keyboard keeps it.
     private func setVisible(_ value: Bool) {
-        guard value != visible else { return }
-        let focused = surfaceView.map { $0.window?.firstResponder === $0 } ?? false
-        visible = value
-        guard focused, let surfaceView else { return }
-        DispatchQueue.main.async {
-            if surfaceView.window?.firstResponder !== surfaceView {
-                Ghostty.moveFocus(to: surfaceView)
-            }
-        }
+        if value != visible { visible = value }
     }
 
     func focusTerminal() {
@@ -307,29 +298,30 @@ extension Ghostty.SurfaceView {
     }
 }
 
-/// The terminal surface, with its pcode drawer to the right while one is shown.
+/// The terminal surface, with its pcode drawer laid over its right side while one is shown.
+///
+/// An overlay rather than a split: the terminal keeps its size, so nothing
+/// reflows and pcode's editor stays where it is, and the surface never leaves
+/// the view tree, so it keeps the keyboard. The drawer covers what is under it.
 struct PCodeDrawerSurface: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var surfaceView: Ghostty.SurfaceView
     @ObservedObject var drawer: PCodeDrawer
     var isSplit: Bool
 
-    @State private var split: CGFloat = 0.6
+    /// The drawer's share of the surface's width, set by dragging its left edge.
+    @State private var fraction: CGFloat = 0.42
+    /// `fraction` when the current drag began: drags report distance from their start.
+    @State private var dragStart: CGFloat?
+    private static let minWidth: CGFloat = 260
 
     var body: some View {
-        Group {
-            if drawer.visible {
-                // Snapped open, not animated: the terminal resizes once.
-                SplitView(.horizontal, $split, dividerColor: ghostty.config.splitDividerColor, left: {
-                    Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
-                }, right: {
-                    PCodeWebViewRepresentable(webView: drawer.webView)
-                        .focusedValue(\.ghosttySurfaceView, surfaceView)
-                }, onEqualize: {
-                    split = 0.6
-                })
-            } else {
+        GeometryReader { geometry in
+            ZStack(alignment: .trailing) {
                 Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
+                if drawer.visible {
+                    overlay(width: width(in: geometry.size.width), total: geometry.size.width)
+                }
             }
         }
         .onChange(of: drawer.visible) { visible in
@@ -338,6 +330,45 @@ struct PCodeDrawerSurface: View {
             let foreground: Color = NSColor(background).isLightColor ? .black : .white
             drawer.apply(background: background, foreground: foreground)
         }
+    }
+
+    private func width(in total: CGFloat) -> CGFloat {
+        let upper = max(Self.minWidth, total * 0.85)
+        return min(upper, max(Self.minWidth, total * fraction))
+    }
+
+    private func overlay(width: CGFloat, total: CGFloat) -> some View {
+        HStack(spacing: 0) {
+            // The left edge: a thin line to see, a wider strip to drag.
+            Rectangle()
+                .fill(ghostty.config.splitDividerColor)
+                .frame(width: 1)
+                .overlay(
+                    Color.clear
+                        .frame(width: 8)
+                        .contentShape(Rectangle())
+                        .onHover { inside in
+                            if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                        }
+                        .gesture(
+                            DragGesture(coordinateSpace: .global)
+                                .onChanged { gesture in
+                                    guard total > 0 else { return }
+                                    let start = dragStart ?? fraction
+                                    dragStart = start
+                                    let next = start - gesture.translation.width / total
+                                    fraction = min(0.85, max(Self.minWidth / total, next))
+                                }
+                                .onEnded { _ in dragStart = nil }
+                        )
+                )
+            PCodeWebViewRepresentable(webView: drawer.webView)
+                .focusedValue(\.ghosttySurfaceView, surfaceView)
+        }
+        .frame(width: width)
+        // Opaque even before the page has drawn, so the terminal never shows through.
+        .background(ghostty.config.backgroundColor)
+        .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 0)
     }
 }
 
