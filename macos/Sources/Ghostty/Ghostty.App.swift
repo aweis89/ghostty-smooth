@@ -1948,7 +1948,12 @@ extension Ghostty {
                   let surfaceView = self.surfaceView(from: surface),
                   // Copied now: the string is only valid during this call.
                   let text = String(cString: v.payload, encoding: .utf8) else { return }
-            surfaceView.pcodeDrawer.handle(text)
+            // The drawer's own terminal speaks to the drawer it is in, not to a drawer of its own.
+            if let owner = surfaceView.pcodeOwner {
+                owner.handleFromViewer(text)
+            } else {
+                surfaceView.pcodeDrawer.handle(text)
+            }
         }
 
         private static func pwdChanged(
