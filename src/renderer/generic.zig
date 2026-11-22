@@ -9,6 +9,7 @@ const font = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");
 const os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
+const FrameLog = @import("frame_log.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
@@ -204,6 +205,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         smooth_overscan_flags: [8]bool = @splat(true),
         glide_clock: ?std.Io.Timestamp = null,
         glide_active: bool = false,
+        /// Draw-to-draw gaps while a glide animates (`GHOSTTY_SMOOTH_FRAME_LOG`).
+        frame_log: FrameLog = .{},
 
         /// A region that starts at the top row has nothing above it to draw
         /// while it glides in from below, so its rows are built from `k`
@@ -1230,6 +1233,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const dt: f32 = @as(f32, @floatFromInt(@max(clock.durationTo(now).nanoseconds, 0))) /
                 std.time.ns_per_s;
             self.glide_clock = now;
+            self.frame_log.frame(now.nanoseconds);
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
             var moving = false;
             for (0..self.uniforms.smooth_count) |i| {
@@ -1255,7 +1259,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 )) moving = true;
             }
             self.syncSmoothEffects();
-            if (!moving) self.glide_active = false;
+            if (!moving) {
+                self.glide_active = false;
+                self.frame_log.settle();
+            }
         }
 
         pub fn animationWake(self: *const Self) ?AnimationWake {
@@ -1632,6 +1639,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                     self.uniforms.smooth_count = n;
                     self.syncSmoothEffects();
+                    // Settled at an update rather than a draw: idle time until
+                    // the next glide must not count as a frame gap.
+                    if (!self.glide_active) self.frame_log.settle();
                     // Scrollback rows to build such a region from. A change
                     // here makes the next update a full rebuild.
                     self.terminal_state.overscan_request.above =

@@ -14,8 +14,10 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+built=0
 if [ "${1:-}" = "--build" ]; then
     zig build -Doptimize=ReleaseFast
+    built=1
 fi
 
 src="${SRC_APP:-macos/build/ReleaseLocal/Ghostty.app}"
@@ -24,11 +26,29 @@ if [ ! -d "$src" ]; then
     exit 1
 fi
 
+# Packaging a stale build installs old code under the new commit's name, and
+# nothing else notices: a protocol bump then silently turns pcode's glide off.
+# Skipped after --build: zig caches by content, so a touched but unchanged
+# file need not relink.
+bin="$src/Contents/MacOS/ghostty"
+if [ ! -f "$bin" ]; then
+    echo "error: $bin not found" >&2
+    exit 1
+fi
+newer=""
+if [ "$built" = 0 ]; then
+    newer=$(find src macos/Sources -newer "$bin" -type f \( -name '*.zig' -o -name '*.metal' -o -name '*.swift' \) | head -n 1)
+fi
+if [ -n "$newer" ] && [ "${ALLOW_STALE:-}" != 1 ]; then
+    echo "error: $newer is newer than $bin; pass --build (or ALLOW_STALE=1)" >&2
+    exit 1
+fi
+
 name="${APP_NAME:-pcode}"
 bundle_id="${BUNDLE_ID:-com.pcode.terminal}"
 
 rev=$(git rev-parse --short HEAD)
-if ! git diff --quiet HEAD -- src; then
+if [ -n "$(git status --porcelain -- src)" ]; then
     rev="$rev-dirty-$(date +%H%M%S)"
 fi
 
