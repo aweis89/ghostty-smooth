@@ -20,6 +20,9 @@ import SwiftUI
 /// - `pcode;ready`, from the popup's own terminal once pcode holds its tty:
 ///   show the popup over a dimmed terminal and give it the keyboard. Only that
 ///   terminal can, so output in the main terminal cannot pull the keyboard away.
+/// - `pcode;title;<base64 utf-8>`, from the popup's own terminal: the
+///   popup's title, shown in a slim header above its terminal (hidden while
+///   empty). Cut to `titleLimit` characters, with control characters dropped.
 /// - `pcode;done`, from the popup's own terminal: close the popup.
 /// - `pcode;popup-close;<token>`, from the terminal: close the popup if it is
 ///   still `token`'s (pcode gave up waiting for it).
@@ -42,6 +45,10 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published private(set) var slot: Slot?
     /// pcode holds the popup's tty: it is shown and has the keyboard.
     @Published private(set) var ready = false
+    /// The popup's title, from pcode in its terminal: empty for none.
+    @Published private(set) var title = ""
+
+    static let titleLimit = 200
 
     weak var surfaceView: Ghostty.SurfaceView?
     private var closeObserver: NSObjectProtocol?
@@ -76,6 +83,11 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     /// From the popup's own terminal.
     func handleFromOverlay(_ payload: String, from overlay: Ghostty.SurfaceView) {
         guard let slot, slot.surface === overlay else { return }
+        if payload.hasPrefix("title;") {
+            let decoded = Self.title(fromBase64: String(payload.dropFirst("title;".count)))
+            if decoded != title { title = decoded }
+            return
+        }
         switch payload {
         case "ready":
             guard !ready else { return }
@@ -94,6 +106,7 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
         ready = false
+        title = ""
         self.slot = nil
         // Hung up now, whatever still holds the view: pcode's cancel.
         PCode.retire(slot.surface)
@@ -138,6 +151,18 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         slot = Slot(token: token, layout: layout, surface: surface)
     }
 
+    /// A title as pcode sends it: base64 UTF-8, shown as plain text on one line.
+    static func title(fromBase64 encoded: String) -> String {
+        // Base64 grows text by a third, and a character is at most 4 bytes.
+        guard encoded.count <= titleLimit * 6,
+              let data = Data(base64Encoded: encoded),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        let plain = String(String.UnicodeScalarView(
+            text.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        ))
+        return String(plain.trimmingCharacters(in: .whitespaces).prefix(titleLimit))
+    }
+
     private static func hasFocus(_ view: NSView) -> Bool {
         guard let responder = view.window?.firstResponder as? NSView else { return false }
         return responder === view || responder.isDescendant(of: view)
@@ -157,6 +182,7 @@ struct PCodePopupLayer: View {
     /// Keeps the terminal's square corners inside the rounded ones.
     private static let inset: CGFloat = 4
     private static let minSheet = CGSize(width: 480, height: 280)
+    private static let headerFontSize: CGFloat = 12
 
     var body: some View {
         GeometryReader { geometry in
@@ -169,20 +195,26 @@ struct PCodePopupLayer: View {
                 }
                 if let slot = popup.slot {
                     let size = Self.size(slot.layout, in: geometry.size)
-                    Ghostty.SurfaceWrapper(surfaceView: slot.surface, isSplit: false)
-                        .id(ObjectIdentifier(slot.surface))
-                        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
-                        .padding(Self.inset)
-                        .frame(width: size.width, height: size.height)
-                        .background(ghostty.config.backgroundColor)
-                        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Self.cornerRadius)
-                                .strokeBorder(ghostty.config.splitDividerColor, lineWidth: 1)
-                        )
-                        .shadow(color: .black.opacity(0.45), radius: 18, x: 0, y: 6)
-                        .opacity(popup.ready ? 1 : 0)
-                        .allowsHitTesting(popup.ready)
+                    VStack(spacing: 0) {
+                        if !popup.title.isEmpty {
+                            header(popup.title)
+                        }
+                        // The terminal's grid gets whatever the header leaves.
+                        Ghostty.SurfaceWrapper(surfaceView: slot.surface, isSplit: false)
+                            .id(ObjectIdentifier(slot.surface))
+                            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
+                    }
+                    .padding(Self.inset)
+                    .frame(width: size.width, height: size.height)
+                    .background(ghostty.config.backgroundColor)
+                    .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Self.cornerRadius)
+                            .strokeBorder(ghostty.config.splitDividerColor, lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 18, x: 0, y: 6)
+                    .opacity(popup.ready ? 1 : 0)
+                    .allowsHitTesting(popup.ready)
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -190,6 +222,22 @@ struct PCodePopupLayer: View {
         }
         // Clicks reach the terminal underneath until the popup is shown.
         .allowsHitTesting(popup.ready)
+    }
+
+    /// The popup's title above its terminal, in the system font, as secondary
+    /// text for the panel's own background rather than the system appearance.
+    private func header(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: Self.headerFontSize, weight: .medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+            .environment(\.colorScheme, NSColor(ghostty.config.backgroundColor).isLightColor ? .light : .dark)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private static func size(_ layout: PCodePopup.Layout, in total: CGSize) -> CGSize {
