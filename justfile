@@ -12,6 +12,10 @@ install:
 reinstall:
     scripts/install-macos.sh
 
+# Show whether this terminal and running instances are on the latest build.
+status:
+    @scripts/status.sh
+
 # Trash old builds/pcode-*.app bundles, keeping current and any running one.
 prune *args:
     scripts/prune-builds.sh {{args}}
