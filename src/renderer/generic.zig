@@ -195,12 +195,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Smooth region glides (`State.Smooth.advance`), snapshotted per
         /// uniform slot at the last frame update: the offset without the
-        /// glide, and the glide spring's position and velocity at
-        /// `glide_clock`. Draws evaluate the spring at their own time, so
-        /// the motion follows vsync rather than update wakes.
+        /// glide, and the glide state at `glide_clock`. Draws advance the
+        /// snapshot on their own time, so motion follows vsync rather than
+        /// update wakes.
         glide_base_px: [8]f32 = @splat(0),
-        glide_x0: [8]f32 = @splat(0),
-        glide_v0: [8]f32 = @splat(0),
+        glide_snap: [8]renderer.State.Smooth.Glide = @splat(.{}),
         glide_clock: ?std.Io.Timestamp = null,
         glide_active: bool = false,
 
@@ -1161,25 +1160,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
-        /// Evaluate the smooth region glide springs at the current time
-        /// into the offset uniforms. Closed form from the snapshot taken
-        /// at the last update, so it is exact however draws are spaced.
+        /// Advance the smooth region glide snapshots to the current time
+        /// into the offset uniforms, using the same `State.Smooth.Glide.step`
+        /// as `State.stepGlides`.
         fn applyGlide(self: *Self) void {
             if (!self.glide_active) return;
             const clock = self.glide_clock orelse return;
             const now: std.Io.Timestamp = .now(global.io(), .awake);
-            const t: f32 = @as(f32, @floatFromInt(clock.durationTo(now).nanoseconds)) /
+            const dt: f32 = @as(f32, @floatFromInt(@max(clock.durationTo(now).nanoseconds, 0))) /
                 std.time.ns_per_s;
+            self.glide_clock = now;
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-            const omega = @sqrt(renderer.State.Smooth.glide_stiffness);
-            const decay = @exp(-omega * t);
             var moving = false;
             for (0..self.uniforms.smooth_count) |i| {
-                const x0 = self.glide_x0[i];
-                const v0 = self.glide_v0[i];
-                var x = (x0 + (v0 + omega * x0) * t) * decay;
-                // Glides either way (negative: drawn higher), never past rest.
-                if (@abs(x) > 0.001 and (x > 0) == (x0 > 0)) moving = true else x = 0;
+                if (self.glide_snap[i].step(dt)) moving = true;
+                var x = self.glide_snap[i].rows;
                 // Built from `k` rows up, the region can be drawn at most a
                 // row higher than that: past it, rebuild with a smaller `k`.
                 if (self.glide_map) |m| {
@@ -1522,7 +1517,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 {
                     const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                    // Bring the glide springs up to now, then snapshot them.
+                    // Bring the glides up to now, then snapshot them.
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
                     _ = state.stepGlides(now);
                     self.glide_clock = now;
@@ -1535,7 +1530,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Regions are declared in active-screen rows. Scrolled
                     // into history, those rows show other lines, so none
                     // apply: a hidden row would blank whatever history line
-                    // passes it. The springs keep running in `state`.
+                    // passes it. The glides keep running in `state`.
                     const at_active = state.terminal.screens.active.pages.viewport == .active;
                     for (state.smooth) |slot| {
                         if (!at_active) break;
@@ -1552,16 +1547,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const screen = state.terminal.screens.active;
                             const full = s.left == 0 and s.right + 1 >= state.terminal.cols;
                             const cursor_in = screen.cursor.y <= s.bottom;
-                            if (self.glide_map == null and s.glide > 0 and full and !cursor_in) {
-                                k = @intFromFloat(@min(@ceil(s.glide), renderer.State.Smooth.max_glide));
+                            if (self.glide_map == null and s.glide.rows > 0 and full and !cursor_in) {
+                                k = @intFromFloat(@min(@ceil(s.glide.rows), renderer.State.Smooth.max_glide));
                                 self.glide_map = .{ .slot = n, .bottom = s.bottom, .k = k };
                             }
                         }
                         const shift: f32 = @as(f32, @floatFromInt(k)) * cell_h;
-                        self.glide_base_px[n] = (s.offsetRows() + s.glide) * cell_h + shift;
-                        self.glide_x0[n] = s.glide;
-                        self.glide_v0[n] = s.glide_vel;
-                        if (s.glide != 0 or s.glide_vel != 0) self.glide_active = true;
+                        self.glide_base_px[n] = (s.offsetRows() + s.glide.rows) * cell_h + shift;
+                        self.glide_snap[n] = s.glide;
+                        if (s.glide.isActive()) self.glide_active = true;
                         self.uniforms.smooth_offsets[n] = s.offsetRows() * cell_h + shift;
                         self.uniforms.smooth_offsets_x[n] = if (s.offsetCols()) |c| c * cell_w else -1;
                         if (!s.overscan) self.uniforms.smooth_no_overscan |= @as(u32, 1) << @intCast(n);

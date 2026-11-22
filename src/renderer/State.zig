@@ -265,17 +265,28 @@ test "preedit range shifts left at right edge" {
 ///   ESC _ smooth;ID;top;bottom;left;right;pos;max;flags ESC \
 ///                                                         ...with flags (protocol 5);
 ///                                                         bit 0: no overscan row
-///   ESC _ smooth;advance;ID;N ESC \                       content just moved up
+///   ESC _ smooth;advance;ID;N[;rate] ESC \                content just moved up
 ///                                                         N rows; glide it in.
 ///                                                         Negative N (protocol
-///                                                         6): moved down
-///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;5
+///                                                         6): moved down.
+///                                                         Optional rate in
+///                                                         centi-rows/s (protocol
+///                                                         7): hold a steady
+///                                                         cruise speed while
+///                                                         more rows follow; 0 or
+///                                                         omitted drains to rest
+///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;7
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
 /// as by writing new lines above a pinned editor: sent in the same
 /// synchronized update as the rows, it makes Ghostty draw the region N rows
-/// lower and spring it back into place on its own frame clock. The glide
-/// survives re-declarations, including ones that move the region's edges.
+/// lower and glide it back into place on its own frame clock. With no rate
+/// hint (or rate 0 from rest), a critically damped spring settles isolated
+/// moves crisply. With a positive rate hint (protocol 7, in hundredths of a
+/// row per second), a velocity-slewed conveyor cruises at that steady speed
+/// across discrete row commits, then coasts smoothly to rest without surging
+/// once the stream stops (rate 0 or no further advances). The glide survives
+/// re-declarations, including ones that move the region's edges.
 /// The region's `bottom` stays an overscan row the glide moves rows behind,
 /// unless declared with the no-overscan flag: then `bottom` is drawn like any
 /// other row, and rows glided below it are clipped at its lower edge. That
@@ -293,12 +304,145 @@ pub const Smooth = struct {
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;6\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;7\x1b\\";
 
     /// Rows of glide kept at most; a bigger backlog jumps the excess.
     pub const max_glide: f32 = 3;
-    /// Spring stiffness for the glide (critically damped, so no overshoot).
+    /// Spring stiffness for isolated/downward glides (critically damped).
     pub const glide_stiffness: f32 = 220;
+    /// Maximum accepted rate hint in centi-rows/s (100.00 rows/s).
+    pub const max_rate_centi: u32 = 10_000;
+    /// Minimum rate hint (rows/s) that engages steady-rate conveyor motion;
+    /// slower hints fall back to the spring.
+    pub const min_conveyor_rate: f32 = 0.5;
+    /// Conveyor velocity ramp-up, braking, and cruise-change time constants.
+    /// `4 * brake_gain * tau_brake = 0.98 <= 1`, so braking is critically
+    /// damped and approaches rest with zero overshoot.
+    pub const tau_ramp: f32 = 0.14;
+    pub const tau_brake: f32 = 0.035;
+    pub const tau_cruise: f32 = 0.35;
+    pub const brake_gain: f32 = 7.0;
+    pub const conveyor_substep: f32 = 0.01;
+
+    /// Self-contained glide dynamics, snapshotted by the renderer so draw
+    /// wakes evaluate the exact same motion as `State.stepGlides`.
+    pub const Glide = struct {
+        /// Rows the content is drawn below where it is (negative: above).
+        rows: f32 = 0,
+        /// Velocity of `rows` in rows per second (negative while gliding up).
+        vel: f32 = 0,
+        /// Active cruise rate hint in rows/s (>0 while streaming; 0 when
+        /// draining or using the spring).
+        rate: f32 = 0,
+        /// Smoothed cruise speed in rows/s; non-zero while in conveyor mode
+        /// (both while streaming and while coasting cleanly to rest).
+        cruise: f32 = 0,
+        /// Seconds elapsed since the last `advance` (safety timeout so a
+        /// vanished stream still drains to rest).
+        since: f32 = 0,
+
+        pub fn isActive(self: Glide) bool {
+            return self.rows != 0 or self.vel != 0;
+        }
+
+        pub fn advance(self: *Glide, delta: f32, rate_hint: f32) void {
+            self.rows = std.math.clamp(self.rows + delta, -max_glide, max_glide);
+            self.since = 0;
+            if (self.rows == 0) {
+                self.vel = 0;
+                self.rate = 0;
+                self.cruise = 0;
+            } else if (self.rows < 0) {
+                self.rate = 0;
+                self.cruise = 0;
+            } else if (delta > 0 and rate_hint >= min_conveyor_rate) {
+                self.rate = rate_hint;
+                if (self.cruise == 0) self.cruise = rate_hint;
+            } else {
+                // End of stream (rate 0) or non-positive delta while still
+                // gliding up: stop streaming, but keep `cruise` if we were
+                // already cruising so we coast smoothly to rest without
+                // surging into a stiff spring.
+                self.rate = 0;
+            }
+        }
+
+        /// Step the glide forward by `dt` seconds. Returns whether it is still
+        /// moving.
+        pub fn step(self: *Glide, dt: f32) bool {
+            if (dt <= 0) return self.isActive();
+            if (!self.isActive()) {
+                self.rate = 0;
+                self.cruise = 0;
+                return false;
+            }
+            if (self.cruise == 0 or self.rows <= 0) {
+                self.rate = 0;
+                self.cruise = 0;
+                return self.stepSpring(dt);
+            }
+            return self.stepConveyor(dt);
+        }
+
+        fn stepSpring(self: *Glide, dt: f32) bool {
+            const omega = @sqrt(glide_stiffness);
+            const x = self.rows;
+            const c = self.vel + omega * x;
+            const decay = @exp(-omega * dt);
+            self.rows = (x + c * dt) * decay;
+            self.vel = (self.vel - omega * c * dt) * decay;
+            // Never past rest: velocity left over from an advance the other
+            // way could otherwise carry it through zero.
+            const crossed = x != 0 and (x > 0) != (self.rows > 0);
+            if (crossed or (@abs(self.rows) <= 0.001 and @abs(self.vel) < 0.01)) {
+                self.rows = 0;
+                self.vel = 0;
+                return false;
+            }
+            return true;
+        }
+
+        fn stepConveyor(self: *Glide, dt: f32) bool {
+            var rem_dt = @min(dt, 10.0);
+            while (rem_dt > 0) {
+                const h = @min(rem_dt, conveyor_substep);
+                rem_dt -= h;
+                self.since += h;
+                if (self.rate > 0) {
+                    const timeout = std.math.clamp(2.0 / self.rate, 0.45, 4.0);
+                    if (self.since > timeout) self.rate = 0;
+                }
+                var v_des: f32 = undefined;
+                if (self.rate > 0) {
+                    self.cruise += (self.rate - self.cruise) * (1 - @exp(-h / tau_cruise));
+                    v_des = self.cruise;
+                    const cushion_hi = @min(
+                        max_glide - 0.65,
+                        @max(@as(f32, 1.4), self.cruise * tau_ramp + 1.05),
+                    );
+                    if (self.rows > cushion_hi) {
+                        v_des += 3.0 * (self.rows - cushion_hi);
+                    }
+                } else {
+                    v_des = self.cruise;
+                }
+                v_des = @min(v_des, brake_gain * self.rows);
+                const prev_speed = @max(@as(f32, 0), -self.vel);
+                const tau = if (v_des >= prev_speed) tau_ramp else tau_brake;
+                const speed = prev_speed + (v_des - prev_speed) * (1 - @exp(-h / tau));
+                self.vel = -speed;
+                self.rows -= 0.5 * (prev_speed + speed) * h;
+                if (self.rows <= 0.001) {
+                    self.rows = 0;
+                    self.vel = 0;
+                    self.rate = 0;
+                    self.cruise = 0;
+                    return false;
+                }
+            }
+            return true;
+        }
+    };
 
     id: u32,
     top: u16,
@@ -324,14 +468,11 @@ pub const Smooth = struct {
     /// shifts left into it. The y shift adds to the scroll remainder.
     shift: ?[2]u16 = null,
 
-    /// Rows the content is drawn below where it is (negative: above),
-    /// springing back to zero, and that spring's velocity in rows per
-    /// second (see `advance`).
-    glide: f32 = 0,
-    glide_vel: f32 = 0,
-    /// When `glide` and `glide_vel` were last brought up to date. An
-    /// advance must land on the glide as it is now, not as it was at the
-    /// last frame update, or the motion jumps.
+    /// Active glide motion (spring or steady-rate conveyor; see `advance`).
+    glide: Glide = .{},
+    /// When `glide` was last brought up to date. An advance must land on the
+    /// glide as it is now, not as it was at the last frame update, or the
+    /// motion jumps.
     glide_at: std.Io.Timestamp = .zero,
 
     /// Whether `bottom` is a hidden overscan row (the default).
@@ -342,8 +483,9 @@ pub const Smooth = struct {
         /// Clear one region, or all of them when null.
         clear: ?u32,
         /// The region's content moved up by `rows`, at `at` (set by the
-        /// caller on receipt; parsing leaves it zero).
-        advance: struct { id: u32, rows: i32, at: std.Io.Timestamp = .zero },
+        /// caller on receipt; parsing leaves it zero), with an optional
+        /// cruise `rate` hint in rows per second (0 = spring / end of stream).
+        advance: struct { id: u32, rows: i32, rate: f32 = 0, at: std.Io.Timestamp = .zero },
     };
 
     /// Parse the payload after `smooth;`.
@@ -360,10 +502,17 @@ pub const Smooth = struct {
             _ = it.next();
             const id = it.next() orelse return error.Invalid;
             const rows = it.next() orelse return error.Invalid;
-            if (it.next() != null) return error.Invalid;
+            var rate: f32 = 0;
+            if (it.next()) |rate_s| {
+                if (it.next() != null) return error.Invalid;
+                const centi = std.fmt.parseInt(u32, rate_s, 10) catch return error.Invalid;
+                if (centi > max_rate_centi) return error.Invalid;
+                rate = @as(f32, @floatFromInt(centi)) / 100.0;
+            }
             return .{ .advance = .{
                 .id = std.fmt.parseInt(u32, id, 10) catch return error.Invalid,
                 .rows = std.fmt.parseInt(i32, rows, 10) catch return error.Invalid,
+                .rate = rate,
             } };
         }
         while (it.next()) |field| {
@@ -413,11 +562,9 @@ pub const Smooth = struct {
         const acc = self.acc - @as(f32, @floatFromInt(ack));
         const pending = self.pending_rows - @as(i32, @intCast(ack));
         const glide = self.glide;
-        const glide_vel = self.glide_vel;
         const glide_at = self.glide_at;
         self.* = next;
         self.glide = glide;
-        self.glide_vel = glide_vel;
         self.glide_at = glide_at;
         if (same) {
             self.acc = acc;
@@ -441,44 +588,22 @@ pub const Smooth = struct {
     /// only one overscan row exists.
     pub fn offsetRows(self: Smooth) f32 {
         const app: f32 = if (self.shift) |sh| @as(f32, @floatFromInt(sh[1])) / 1000 else 0;
-        return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999) - self.glide;
+        return std.math.clamp(std.math.clamp(self.acc, 0, 0.999) + app, 0, 0.999) - self.glide.rows;
     }
 
     /// Content moved up `rows` at `now` (negative: down): draw it that much
     /// lower (higher), up to `max_glide` either way, added to the glide as it
-    /// stands at `now`.
-    pub fn advance(self: *Smooth, rows: i32, now: std.Io.Timestamp) void {
+    /// stands at `now`. A positive `rate` (rows/s) holds steady-rate cruise.
+    pub fn advance(self: *Smooth, rows: i32, rate: f32, now: std.Io.Timestamp) void {
         _ = self.catchUp(now);
-        const next = self.glide + @as(f32, @floatFromInt(rows));
-        self.glide = std.math.clamp(next, -max_glide, max_glide);
+        self.glide.advance(@floatFromInt(rows), rate);
     }
 
-    /// Bring the glide spring up to `now`. Returns whether it is moving.
+    /// Bring the glide up to `now`. Returns whether it is moving.
     pub fn catchUp(self: *Smooth, now: std.Io.Timestamp) bool {
         const ns: f32 = @floatFromInt(@max(self.glide_at.durationTo(now).nanoseconds, 0));
         self.glide_at = now;
-        return self.stepGlide(ns / std.time.ns_per_s);
-    }
-
-    /// Step the glide spring by `dt` seconds (closed form, exact at any
-    /// frame rate). Returns whether it is still moving.
-    pub fn stepGlide(self: *Smooth, dt: f32) bool {
-        if (self.glide == 0 and self.glide_vel == 0) return false;
-        const omega = @sqrt(glide_stiffness);
-        const x = self.glide;
-        const c = self.glide_vel + omega * x;
-        const decay = @exp(-omega * dt);
-        self.glide = (x + c * dt) * decay;
-        self.glide_vel = (self.glide_vel - omega * c * dt) * decay;
-        // Never past rest: velocity left over from an advance the other way
-        // could otherwise carry it through zero.
-        const crossed = x != 0 and (x > 0) != (self.glide > 0);
-        if (crossed or (@abs(self.glide) <= 0.001 and @abs(self.glide_vel) < 0.01)) {
-            self.glide = 0;
-            self.glide_vel = 0;
-            return false;
-        }
-        return true;
+        return self.glide.step(ns / std.time.ns_per_s);
     }
 
     /// The horizontal offset to render, in columns, or null when the
@@ -517,7 +642,7 @@ pub fn applySmooth(self: *State, cmd: Smooth.Command) void {
         },
         .advance => |a| for (&self.smooth) |*slot| {
             if (slot.*) |*s| {
-                if (s.id == a.id) s.advance(a.rows, a.at);
+                if (s.id == a.id) s.advance(a.rows, a.rate, a.at);
             }
         },
     }
@@ -586,13 +711,13 @@ test "smooth: advance glides in and survives re-declaration" {
     try testing.expectApproxEqAbs(@as(f32, -1), state.smoothAt(0, 0).?.offsetRows(), 0.0001);
     // A resized live panel moves the edge; the glide carries on.
     state.applySmooth(try Smooth.parse("7;0;18;0;79;0;0;0;0"));
-    try testing.expectApproxEqAbs(@as(f32, 1), state.smoothAt(0, 0).?.glide, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1), state.smoothAt(0, 0).?.glide.rows, 0.0001);
     // Capped, then decays to rest.
     state.applySmooth(try Smooth.parse("advance;7;10"));
-    try testing.expectApproxEqAbs(Smooth.max_glide, state.smoothAt(0, 0).?.glide, 0.0001);
+    try testing.expectApproxEqAbs(Smooth.max_glide, state.smoothAt(0, 0).?.glide.rows, 0.0001);
     var frames: i96 = 0;
     while (state.stepGlides(.fromNanoseconds((frames + 1) * 8_333_333))) frames += 1;
-    try testing.expectEqual(@as(f32, 0), state.smoothAt(0, 0).?.glide);
+    try testing.expectEqual(@as(f32, 0), state.smoothAt(0, 0).?.glide.rows);
     try testing.expect(frames > 10 and frames < 240);
 
     // An advance adds to the glide as it is when the advance arrives.
@@ -604,14 +729,88 @@ test "smooth: advance glides in and survives re-declaration" {
     cmd.advance.at = t0.addDuration(.fromMilliseconds(100));
     state.applySmooth(cmd);
     var fresh: Smooth = .{ .id = 0, .top = 0, .bottom = 1, .left = 0, .right = 1, .pos = 0, .max = 0 };
-    fresh.advance(1, .zero);
+    fresh.advance(1, 0, .zero);
     _ = fresh.catchUp(.fromNanoseconds(100 * std.time.ns_per_ms));
-    try testing.expectApproxEqAbs(fresh.glide + 1, s.glide, 0.0001);
+    try testing.expectApproxEqAbs(fresh.glide.rows + 1, s.glide.rows, 0.0001);
+    // Optional rate hint (centi-rows/s) parses and validates bounds.
+    const hinted = (try Smooth.parse("advance;7;1;525")).advance;
+    try testing.expectApproxEqAbs(@as(f32, 5.25), hinted.rate, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0), (try Smooth.parse("advance;7;1;0")).advance.rate, 0.0001);
     // Unknown ids are ignored; bad payloads rejected.
     state.applySmooth(try Smooth.parse("advance;9;1"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7;x"));
     try testing.expectError(error.Invalid, Smooth.parse("advance;7"));
-    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;2"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;-5"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;10001"));
+    try testing.expectError(error.Invalid, Smooth.parse("advance;7;1;500;extra"));
+}
+
+test "smooth: rate-hinted conveyor cruises steadily and coasts cleanly to rest" {
+    const testing = std.testing;
+    var g: Smooth.Glide = .{};
+    const dt: f32 = 1.0 / 120.0;
+
+    // Feed 15 rows at a steady 5 rows/s (every 24 frames at 120 fps),
+    // with rate=0 on the last row to signal end of stream.
+    var min_cruise: f32 = 999;
+    var max_cruise: f32 = 0;
+    var step_idx: usize = 0;
+    while (step_idx < 360) : (step_idx += 1) {
+        if (step_idx % 24 == 0) {
+            const row_idx = step_idx / 24;
+            const rate: f32 = if (row_idx < 14) 5.0 else 0.0;
+            g.advance(1, rate);
+        }
+        _ = g.step(dt);
+        // After warm-up (rows 5..13), speed stays nearly flat at 5 rows/s.
+        if (step_idx >= 120 and step_idx < 336) {
+            const speed = -g.vel;
+            min_cruise = @min(min_cruise, speed);
+            max_cruise = @max(max_cruise, speed);
+        }
+    }
+    try testing.expect(min_cruise > 4.6 and max_cruise < 5.2);
+    try testing.expect(max_cruise / min_cruise < 1.15);
+
+    // After the final row (rate=0), coasts monotonically to rest with no surge or overshoot.
+    var prev_rows = g.rows;
+    var peak_after_stop: f32 = -g.vel;
+    var settle_frames: usize = 0;
+    while (g.step(dt)) : (settle_frames += 1) {
+        try testing.expect(g.rows >= 0 and g.rows <= prev_rows + 0.0001);
+        peak_after_stop = @max(peak_after_stop, -g.vel);
+        prev_rows = g.rows;
+        try testing.expect(settle_frames < 240);
+    }
+    try testing.expect(peak_after_stop < 5.2);
+    try testing.expectEqual(@as(f32, 0), g.rows);
+    try testing.expectEqual(@as(f32, 0), g.vel);
+    try testing.expectEqual(@as(f32, 0), g.cruise);
+
+    // If an app hints a rate and then goes silent, the safety timeout drains it to rest.
+    g.advance(1, 5.0);
+    var silent_frames: usize = 0;
+    while (g.step(dt)) : (silent_frames += 1) {
+        try testing.expect(silent_frames < 300);
+    }
+    try testing.expectEqual(@as(f32, 0), g.rows);
+    try testing.expectEqual(@as(f32, 0), g.cruise);
+
+    // Slowest conveyor rate (0.5 rows/s) from max_glide settles cleanly on a single large dt.
+    g.advance(3, 0.5);
+    g.advance(0, 0);
+    try testing.expect(!g.step(10.0));
+    try testing.expectEqual(@as(f32, 0), g.rows);
+    try testing.expectEqual(@as(f32, 0), g.vel);
+
+    // Rate below min_conveyor_rate falls back to spring; cancelling back to 0 clears vel.
+    g.advance(1, 0.49);
+    try testing.expectEqual(@as(f32, 0), g.cruise);
+    _ = g.step(0.05);
+    g.advance(-g.rows, 0);
+    try testing.expectEqual(@as(f32, 0), g.rows);
+    try testing.expectEqual(@as(f32, 0), g.vel);
+    try testing.expect(!g.isActive());
 }
 
 test "smooth: negative advance glides down into place" {
@@ -623,15 +822,15 @@ test "smooth: negative advance glides down into place" {
     // Drawn a row higher: offset up by one.
     try testing.expectApproxEqAbs(@as(f32, 1), s.offsetRows(), 0.0001);
     state.applySmooth(try Smooth.parse("advance;8;-10"));
-    try testing.expectApproxEqAbs(-Smooth.max_glide, s.glide, 0.0001);
+    try testing.expectApproxEqAbs(-Smooth.max_glide, s.glide.rows, 0.0001);
     var frames: i96 = 0;
-    var low: f32 = s.glide;
+    var low: f32 = s.glide.rows;
     while (state.stepGlides(.fromNanoseconds((frames + 1) * 8_333_333))) : (frames += 1) {
         // Rises monotonically to rest, never past it.
-        try testing.expect(s.glide >= low and s.glide <= 0);
-        low = s.glide;
+        try testing.expect(s.glide.rows >= low and s.glide.rows <= 0);
+        low = s.glide.rows;
     }
-    try testing.expectEqual(@as(f32, 0), s.glide);
+    try testing.expectEqual(@as(f32, 0), s.glide.rows);
     try testing.expect(frames > 10 and frames < 240);
 }
 
