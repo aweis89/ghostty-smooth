@@ -7,9 +7,11 @@ import SwiftUI
 /// pcode keeps the popup in-process: a small bridge it runs in the popup's
 /// terminal hands pcode that terminal's tty, and pcode reads keys from and
 /// draws onto it directly. We only host the terminal: its place, size and the
-/// keyboard. APCs (protocol 1, see `PCode`):
+/// keyboard. Or, for a pick list, pcode sends only the list and we draw it
+/// natively (`PCodePicker`). APCs (protocol 2, see `PCode`):
 ///
-/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;1`.
+/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;2`:
+///   1 was terminal popups only, 2 adds native pick lists.
 /// - `pcode;popup;<token>;<layout>`, from the terminal: open a popup, replacing
 ///   any open one. `token` is 16 lowercase hex digits, `layout` is `sheet` or
 ///   `wide`. Its interpreter is `python` in
@@ -24,24 +26,46 @@ import SwiftUI
 ///   popup's title, shown in a slim header above its terminal (hidden while
 ///   empty). Cut to `titleLimit` characters, with control characters dropped.
 /// - `pcode;done`, from the popup's own terminal: close the popup.
+/// - `pcode;pick;<token>;<layout>`, from the terminal: open a native pick list
+///   instead, replacing any open popup. We connect to pcode's socket for the
+///   token (`~/.local/state/pcode/popups/<token>.sock`) ourselves, and show the
+///   list, and give it the keyboard, once pcode has sent it (`PCodePicker`).
 /// - `pcode;popup-close;<token>`, from the terminal: close the popup if it is
-///   still `token`'s (pcode gave up waiting for it).
+///   still `token`'s (pcode gave up waiting for it, or is done picking).
 ///
 /// Cmd+W in the popup, its bridge exiting, or a click on the dimmed terminal
-/// also close it. Closing drops the popup's terminal, which hangs up its tty;
-/// pcode takes that as a cancel. Escape and other keys are pcode's.
+/// also close it. Closing drops the popup's terminal, which hangs up its tty,
+/// or a picker's socket; pcode takes that as a cancel. In a terminal popup
+/// Escape and other keys are pcode's; a picker answers them itself.
 final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     enum Layout: String {
         case sheet, wide
     }
 
     struct Slot {
+        enum Content {
+            case terminal(Ghostty.SurfaceView)
+            case picker(PCodePicker)
+        }
+
         let token: String
         let layout: Layout
-        let surface: Ghostty.SurfaceView
+        let content: Content
+
+        /// The popup's terminal, unless it is a native picker.
+        var surface: Ghostty.SurfaceView? {
+            if case .terminal(let surface) = content { return surface }
+            return nil
+        }
+
+        var picker: PCodePicker? {
+            if case .picker(let picker) = content { return picker }
+            return nil
+        }
     }
 
-    /// The open popup: its terminal is mounted, unseen until `ready`.
+    /// The open popup: its terminal is mounted, unseen until `ready` (a picker
+    /// is ready once pcode sent its list).
     @Published private(set) var slot: Slot?
     /// pcode holds the popup's tty: it is shown and has the keyboard.
     @Published private(set) var ready = false
@@ -72,6 +96,11 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
                 return
             }
             open(token: parts[1], layout: layout)
+        case "pick" where parts.count == 3:
+            guard PCode.valid(parts[1], length: 16...16, hex: true), let layout = Layout(rawValue: parts[2]) else {
+                return
+            }
+            openPicker(token: parts[1], layout: layout)
         case "popup-close" where parts.count == 2:
             // Only the popup it opened: a stale token never closes a newer one.
             if let slot, slot.token == parts[1] { close() }
@@ -92,7 +121,7 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         case "ready":
             guard !ready else { return }
             ready = true
-            Ghostty.moveFocus(to: slot.surface)
+            Ghostty.moveFocus(to: overlay)
         case "done":
             close()
         default:
@@ -102,14 +131,21 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
 
     func close() {
         guard let slot else { return }
-        let hadFocus = Self.hasFocus(slot.surface)
+        let hadFocus: Bool
+        switch slot.content {
+        case .terminal(let surface): hadFocus = Self.hasFocus(surface)
+        case .picker(let picker): hadFocus = picker.field?.hasKeyboard ?? false
+        }
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
         ready = false
         title = ""
         self.slot = nil
         // Hung up now, whatever still holds the view: pcode's cancel.
-        PCode.retire(slot.surface)
+        switch slot.content {
+        case .terminal(let surface): PCode.retire(surface)
+        case .picker(let picker): picker.stop()
+        }
         if hadFocus, let surfaceView { Ghostty.moveFocus(to: surfaceView) }
     }
 
@@ -122,7 +158,10 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     /// popup should have: by a split or tab change, say. Give it back.
     func windowSurfaceDidFocus() {
         guard ready, let slot else { return }
-        Ghostty.moveFocus(to: slot.surface)
+        switch slot.content {
+        case .terminal(let surface): Ghostty.moveFocus(to: surface)
+        case .picker(let picker): picker.focus()
+        }
     }
 
     // MARK: The popup's terminal
@@ -148,7 +187,28 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
                 self.close()
             }
         }
-        slot = Slot(token: token, layout: layout, surface: surface)
+        slot = Slot(token: token, layout: layout, content: .terminal(surface))
+    }
+
+    // MARK: A native picker
+
+    private func openPicker(token: String, layout: Layout) {
+        close()
+        let picker = PCodePicker()
+        // Each list pcode sends: the first shows the picker (its search field
+        // takes the keyboard as it mounts), and each titles the header.
+        picker.onList = { [weak self, weak picker] title in
+            guard let self, let picker, self.slot?.picker === picker else { return }
+            let plain = Self.plainTitle(title)
+            if plain != self.title { self.title = plain }
+            if !self.ready { self.ready = true }
+        }
+        picker.onClosed = { [weak self, weak picker] in
+            guard let self, let picker, self.slot?.picker === picker else { return }
+            self.close()
+        }
+        slot = Slot(token: token, layout: layout, content: .picker(picker))
+        picker.start(token: token)
     }
 
     /// A title as pcode sends it: base64 UTF-8, shown as plain text on one line.
@@ -157,6 +217,11 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         guard encoded.count <= titleLimit * 6,
               let data = Data(base64Encoded: encoded),
               let text = String(data: data, encoding: .utf8) else { return "" }
+        return plainTitle(text)
+    }
+
+    /// `text` on one line without control characters, cut to `titleLimit`.
+    static func plainTitle(_ text: String) -> String {
         let plain = String(String.UnicodeScalarView(
             text.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
         ))
@@ -199,10 +264,20 @@ struct PCodePopupLayer: View {
                         if !popup.title.isEmpty {
                             header(popup.title)
                         }
-                        // The terminal's grid gets whatever the header leaves.
-                        Ghostty.SurfaceWrapper(surfaceView: slot.surface, isSplit: false)
-                            .id(ObjectIdentifier(slot.surface))
-                            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
+                        switch slot.content {
+                        case .terminal(let surface):
+                            // The terminal's grid gets whatever the header leaves.
+                            Ghostty.SurfaceWrapper(surfaceView: surface, isSplit: false)
+                                .id(ObjectIdentifier(surface))
+                                .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
+                        case .picker(let picker):
+                            // Mounted once pcode sent its list, so its field takes the keyboard then.
+                            if popup.ready {
+                                PCodePickerView(picker: picker)
+                                    .id(ObjectIdentifier(picker))
+                                    .environment(\.colorScheme, colorScheme)
+                            }
+                        }
                     }
                     .padding(Self.inset)
                     .frame(width: size.width, height: size.height)
@@ -236,8 +311,13 @@ struct PCodePopupLayer: View {
             .padding(.horizontal, 12)
             .padding(.top, 4)
             .padding(.bottom, 6)
-            .environment(\.colorScheme, NSColor(ghostty.config.backgroundColor).isLightColor ? .light : .dark)
+            .environment(\.colorScheme, colorScheme)
             .accessibilityAddTraits(.isHeader)
+    }
+
+    /// The panel's own scheme: its background is the terminal's, not the system's.
+    private var colorScheme: ColorScheme {
+        NSColor(ghostty.config.backgroundColor).isLightColor ? .light : .dark
     }
 
     private static func size(_ layout: PCodePopup.Layout, in total: CGSize) -> CGSize {

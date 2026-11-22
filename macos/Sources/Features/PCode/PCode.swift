@@ -107,6 +107,17 @@ enum PCode {
         }
         return nil
     }
+
+    /// A native pcode picker whose search field has the keyboard in `window`, if one has.
+    ///
+    /// No terminal has the keyboard then, so `keyboardOverlay` finds none and
+    /// "the focused surface" is still pcode's terminal under the picker: ask
+    /// this first too, so Cmd+W closes the picker rather than that terminal.
+    static func keyboardPicker(in window: NSWindow?) -> PCodePicker? {
+        guard let editor = window?.firstResponder as? NSTextView,
+              let field = editor.delegate as? PCodePickField else { return nil }
+        return field.picker
+    }
 }
 
 /// A drawer or popup that runs overlay terminals over a terminal of the window.
@@ -184,7 +195,7 @@ extension Ghostty.SurfaceView {
             return
         }
         switch payload.prefix(while: { $0 != ";" }) {
-        case "popup", "popup-close":
+        case "popup", "pick", "popup-close":
             pcodePopup.handle(payload)
         default:
             pcodeDrawer.handle(payload)

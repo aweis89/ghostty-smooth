@@ -534,9 +534,10 @@ pub const StreamHandler = struct {
                         return;
                     }
                     // Overlay popups have their own version, so pcode can
-                    // tell a drawer-only build from one with popups.
+                    // tell a drawer-only build from one with popups: 1 has
+                    // terminal popups, 2 native pick lists too.
                     if (std.mem.eql(u8, payload, "popup?")) {
-                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;1\x1b\\" });
+                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;2\x1b\\" });
                         return;
                     }
                     if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {
