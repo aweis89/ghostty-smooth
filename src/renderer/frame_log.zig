@@ -1,8 +1,10 @@
 //! Frame-gap log for smooth region animations, for benchmarking pacing.
 //!
 //! Off unless `GHOSTTY_SMOOTH_FRAME_LOG` names a file. While a smooth glide or
-//! reveal animates, each draw records the gap since the previous animated draw;
-//! when the animation settles one JSON line summarising those gaps is appended:
+//! reveal animates, each draw records the gap since the previous animated draw.
+//! When the animation settles, after a gap of 250 ms or more (a pause, not a
+//! frame, so a longer stall is not counted either), and every 512 frames, one
+//! JSON line summarising those gaps is appended:
 //!
 //!   {"frames":412,"p50_ms":8.50,"p99_ms":12.75,"max_ms":33.00,
 //!    "over_12_5ms":3,"over_20_8ms":1,"hist":"33:398,34:11,50:2,132:1"}
@@ -52,13 +54,24 @@ fn enabled(self: *FrameLog) bool {
     return self.path_len > 0;
 }
 
+/// A gap this long is a pause between animations, not a slow frame.
+const pause_ms = 250;
+/// Lines are also written every this many frames, so an animation that
+/// never reports settled still shows up.
+const flush_frames = 512;
+
 /// An animated draw at monotonic time `now_ns`.
 pub fn frame(self: *FrameLog, now_ns: i96) void {
     if (!self.enabled()) return;
     defer self.last_ns = now_ns;
     const last = self.last_ns orelse return;
     const ms = @as(f64, @floatFromInt(@max(now_ns - last, 0))) / std.time.ns_per_ms;
+    if (ms >= pause_ms) {
+        self.settle();
+        return;
+    }
     self.record(ms);
+    if (self.count >= flush_frames) self.write();
 }
 
 fn bucket(ms: f64) usize {
@@ -74,6 +87,10 @@ fn record(self: *FrameLog, ms: f64) void {
 /// The animation settled: write the summary and start over.
 pub fn settle(self: *FrameLog) void {
     self.last_ns = null;
+    self.write();
+}
+
+fn write(self: *FrameLog) void {
     if (self.count == 0) return;
     defer self.reset();
     if (self.path_len == 0) return;
@@ -172,4 +189,24 @@ test "smooth frame log ignores the gap before the first animated draw" {
     log.settle();
     try std.testing.expectEqual(@as(u32, 0), log.count);
     try std.testing.expectEqual(@as(?i96, null), log.last_ns);
+}
+
+test "smooth frame log treats a long gap as a pause and flushes long animations" {
+    var log: FrameLog = .{ .checked = true };
+    @memcpy(log.path_buf[0..10], "/dev/null\x00");
+    log.path_len = 9;
+    var t: i96 = 0;
+    log.frame(t);
+    t += 8_000_000;
+    log.frame(t);
+    try std.testing.expectEqual(@as(u32, 1), log.count);
+    t += 400_000_000; // a pause: not recorded, and the stretch is written
+    log.frame(t);
+    try std.testing.expectEqual(@as(u32, 0), log.count);
+    for (0..flush_frames + 3) |_| {
+        t += 8_000_000;
+        log.frame(t);
+    }
+    // 512 recorded and written, then 3 more.
+    try std.testing.expectEqual(@as(u32, 3), log.count);
 }
