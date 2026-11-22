@@ -14,6 +14,9 @@ final class PCodeHostConnection: @unchecked Sendable {
     var onLine: ((Data) -> Void)?
     var onClose: (() -> Void)?
 
+    /// The socket accepted the connection (set before `onClose`, read on main after it).
+    private(set) var connected = false
+
     private let lock = NSLock()
     private var descriptor: Int32 = -1
     private var stopped = false
@@ -51,6 +54,7 @@ final class PCodeHostConnection: @unchecked Sendable {
             return
         }
         descriptor = fd
+        connected = true
         lock.unlock()
         defer {
             lock.lock()

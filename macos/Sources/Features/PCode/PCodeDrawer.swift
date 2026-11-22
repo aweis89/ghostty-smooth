@@ -151,6 +151,9 @@ final class PCodeDrawer: NSObject, ObservableObject {
             self.host = nil
             if self.pageReady {
                 self.evaluate("window.pcode.message({type: 'notify', method: 'host_closed', args: []})")
+            } else if connection.connected {
+                // A host from before drawers closes on a hello it does not know.
+                self.showError("This session host's pcode predates the drawer. Run /restart in pcode, then open the thread again.")
             } else {
                 self.showError("Could not reach the pcode session host.")
             }
