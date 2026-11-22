@@ -2,8 +2,8 @@ import Foundation
 
 /// How a pcode pick list filters, ported from `pcode.pick_ui` and
 /// `pcode.popup_ui.fuzzy_match` so the native list matches what pcode's own
-/// terminal list would. pcode pins the shared cases in `tests/test_pick_ui.py`;
-/// `PCodePickMatchTests` holds the same table.
+/// terminal list would. pcode pins the shared cases in
+/// `tests/data/pick_fuzzy_cases.json`; `PCodePickMatchTests` reads a copy.
 ///
 /// pcode sends each item's search texts casefolded already, so only the query
 /// is folded here.
@@ -62,9 +62,24 @@ enum PCodePickMatch {
         return result
     }
 
-    /// The query's words, casefolded (near enough: Swift's lowercasing).
+    /// The query's words, casefolded.
     static func terms(_ query: String) -> [String] {
-        query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+        casefold(query).split(whereSeparator: \.isWhitespace).map(String.init)
+    }
+
+    /// Python's `str.casefold()` for the cases that differ from lowercasing in
+    /// practice: ß and ẞ fold to "ss", final sigma to σ. pcode pins these in
+    /// the shared fixture's `casefold` table.
+    static func casefold(_ text: String) -> String {
+        var folded = ""
+        for scalar in text.lowercased().unicodeScalars {
+            switch scalar {
+            case "ß": folded += "ss"
+            case "ς": folded += "σ"
+            default: folded.unicodeScalars.append(scalar)
+            }
+        }
+        return folded
     }
 
     /// Every word matches one of `texts`, fuzzily or as a substring.

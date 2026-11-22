@@ -115,7 +115,8 @@ enum PCode {
     /// this first too, so Cmd+W closes the picker rather than that terminal.
     static func keyboardPicker(in window: NSWindow?) -> PCodePicker? {
         guard let editor = window?.firstResponder as? NSTextView,
-              let field = editor.delegate as? PCodePickField else { return nil }
+              // The field editor's delegate is its text field, typed as a text view delegate.
+              let field = (editor.delegate as AnyObject?) as? PCodePickField else { return nil }
         return field.picker
     }
 }

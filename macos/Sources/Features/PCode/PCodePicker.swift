@@ -8,12 +8,16 @@ import SwiftUI
 ///
 /// - we send `pcode-pick 1\n`;
 /// - pcode sends a list, one JSON object per line (`pcode.pick_ui.payload`);
+/// - we send `{"shown": true}` once it is on screen, or `{"error": …}` and
+///   hang up if we cannot read it (pcode then shows it itself);
 /// - we send the pick, `{"id": …, "action": …, "query": …}`, and wait;
 /// - pcode sends another list to show in its place, or closes the socket,
 ///   which closes the picker. Us closing it is pcode's cancel.
 ///
 /// The callbacks stay in pcode: we only filter, select and answer. The picker
 /// is shown, and takes the keyboard, only once the first list has arrived.
+/// Everything here runs on the main queue but the socket's own thread (not
+/// `@MainActor`: `PCodePopup`, which drives it, is not isolated either).
 final class PCodePicker: ObservableObject {
     struct Item: Decodable {
         let id: String
@@ -48,6 +52,13 @@ final class PCodePicker: ObservableObject {
         let custom: String?
         let items: [Item]
         let actions: [Action]
+        /// Ctrl chords that cancel, as prompt_toolkit names them (`c-l`).
+        let cancelKeys: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case title, header, empty, selected, query, match, custom, items, actions
+            case cancelKeys = "cancel_keys"
+        }
     }
 
     /// A row on show: an item, its tree guide, or the query as a custom row.
@@ -63,11 +74,14 @@ final class PCodePicker: ObservableObject {
     static let hello = Data("pcode-pick 1\n".utf8)
     static let customMarker = "custom"
     /// The longest list line we read.
-    private static let lineLimit = 16 << 20
+    static let lineLimit = 16 << 20
+    /// Lists this long refilter once typing pauses (`filterDelay`), not on every key.
+    static let instantFilterLimit = 500
+    static let filterDelay: TimeInterval = 0.06
 
     @Published private(set) var payload: Payload?
     @Published var query = "" {
-        didSet { if query != oldValue { refilter() } }
+        didSet { if query != oldValue { queryChanged() } }
     }
     @Published private(set) var rows: [Row] = []
     @Published private(set) var selected = 0
@@ -86,11 +100,7 @@ final class PCodePicker: ObservableObject {
     private var armed: (key: String, id: String)?
     private var connection: Connection?
     private var keyMonitor: Any?
-
-    deinit {
-        connection?.close()
-        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
-    }
+    private var pendingFilter: DispatchWorkItem?
 
     // MARK: The connection
 
@@ -108,6 +118,8 @@ final class PCodePicker: ObservableObject {
     func stop() {
         connection?.close()
         connection = nil
+        pendingFilter?.cancel()
+        pendingFilter = nil
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
     }
@@ -119,10 +131,17 @@ final class PCodePicker: ObservableObject {
     }
 
     private func receive(_ line: Data) {
-        guard connection != nil else { return }
-        guard let list = try? JSONDecoder().decode(Payload.self, from: line) else {
-            // Not a list we can show: as if pcode had gone.
-            connectionClosed()
+        guard let connection else { return }
+        let list: Payload
+        do {
+            list = try JSONDecoder().decode(Payload.self, from: line)
+        } catch {
+            // Not a list we can show (a newer or older pcode): say so, so pcode
+            // shows it itself, and close.
+            connection.send(Self.line(["error": String(String(describing: error).prefix(300))]), thenClose: true)
+            self.connection = nil
+            stop()
+            onClosed?()
             return
         }
         let first = payload == nil
@@ -132,25 +151,57 @@ final class PCodePicker: ObservableObject {
         armed = nil
         status = ""
         busy = false
-        // Set without filtering twice; then filtered toward pcode's selection.
-        if query != list.query { query = list.query } else { refilter() }
-        if let wanted = list.selected, let index = rows.firstIndex(where: { $0.id == wanted }) {
-            selected = index
-        }
+        // A new list: no row carries over, so pcode's selection or the first.
+        rows = []
+        if query != list.query { query = list.query }
+        // Filtered now, whatever the query's change left waiting.
+        pendingFilter?.cancel()
+        pendingFilter = nil
+        refilter()
+        select(list.selected.flatMap { wanted in rows.firstIndex { $0.id == wanted } } ?? 0)
         onList?(list.title)
         if first { watchKeys() }
+        connection.send(Self.line(["shown": true]))
+    }
+
+    /// `object` as one line of JSON, if it can be.
+    private static func line(_ object: [String: Any]) -> Data? {
+        guard var data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        data.append(0x0A)
+        return data
     }
 
     private func send(id: String?, action: String?) {
-        guard let connection, !busy else { return }
+        guard let connection, !busy,
+              let data = Self.line(["id": id ?? NSNull(), "action": action ?? NSNull(), "query": query])
+        else { return }
         busy = true
-        let reply: [String: Any] = ["id": id ?? NSNull(), "action": action ?? NSNull(), "query": query]
-        guard var data = try? JSONSerialization.data(withJSONObject: reply) else { return }
-        data.append(0x0A)
         connection.send(data)
     }
 
     // MARK: Filtering and selection
+
+    private func queryChanged() {
+        pendingFilter?.cancel()
+        pendingFilter = nil
+        guard let payload, payload.items.count >= Self.instantFilterLimit else {
+            refilter()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushFilter()
+        }
+        pendingFilter = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.filterDelay, execute: work)
+    }
+
+    /// Filter now if typing left a filter waiting: before acting on the rows.
+    private func flushFilter() {
+        guard pendingFilter != nil else { return }
+        pendingFilter?.cancel()
+        pendingFilter = nil
+        refilter()
+    }
 
     private func refilter() {
         guard let payload else { rows = []; return }
@@ -186,6 +237,7 @@ final class PCodePicker: ObservableObject {
 
     func move(_ offset: Int) {
         guard !busy else { return }
+        flushFilter()
         select(selected + offset)
     }
 
@@ -194,14 +246,15 @@ final class PCodePicker: ObservableObject {
     // MARK: Keys
 
     func accept() {
-        guard !busy, let current else { return }
+        guard !busy else { return }
+        flushFilter()
+        guard let current else { return }
         send(id: current.id, action: nil)
     }
 
-    /// Escape: clear the search, else cancel.
+    /// Escape: clear the search, else cancel. Waiting on pcode, it cancels.
     func escape() {
-        guard !busy else { return }
-        if query.isEmpty { cancel() } else { query = "" }
+        if busy || query.isEmpty { cancel() } else { query = "" }
     }
 
     /// Cancel: close the connection, then the popup.
@@ -214,6 +267,7 @@ final class PCodePicker: ObservableObject {
     /// Run `action`: once armed if it asks first, then picks.
     func run(_ action: Action, label: String) {
         guard !busy else { return }
+        flushFilter()
         let row = current
         if action.needsItem && row == nil { return }
         if !action.confirm.isEmpty, let row, armed?.key != action.key || armed?.id != row.id {
@@ -234,29 +288,65 @@ final class PCodePicker: ObservableObject {
         query.isEmpty ? payload?.actions.first(where: \.delete) : nil
     }
 
+    /// The empty list's text, with `{action:K}` as the key that runs action K.
+    var emptyText: String {
+        let text = payload?.empty ?? ""
+        guard let pattern = try? NSRegularExpression(pattern: "\\{action:([a-z])\\}") else { return text }
+        var result = text
+        for match in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+            guard let whole = Range(match.range, in: text), let key = Range(match.range(at: 1), in: text)
+            else { continue }
+            let offset = text.distance(from: text.startIndex, to: whole.lowerBound)
+            let start = result.index(result.startIndex, offsetBy: offset)
+            let end = result.index(start, offsetBy: text.distance(from: whole.lowerBound, to: whole.upperBound))
+            result.replaceSubrange(start..<end, with: Self.keyLabel(String(text[key])))
+        }
+        return result
+    }
+
     static func keyLabel(_ key: String) -> String { "⌘" + key.uppercased() }
 
-    /// Cmd+key shortcuts while the search field has the keyboard: the actions,
-    /// and Cmd+W, which closes the picker rather than pcode's terminal under it.
+    /// Keys the search field would otherwise take, while it has the keyboard:
+    /// Cmd+key actions; Cmd+W, which closes the picker rather than pcode's
+    /// terminal under it; Ctrl+U/Ctrl+D half pages; and pcode's cancel chords.
     private func watchKeys() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let field = self.field, field.hasKeyboard, event.window === field.window else {
+            self?.handleKey(event) ?? event
+        }
+    }
+
+    private func handleKey(_ event: NSEvent) -> NSEvent? {
+        guard let field, field.hasKeyboard, event.window === field.window,
+              let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
+        // Not `.deviceIndependentFlagsMask`, which has Caps Lock and the function key.
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if modifiers == .control {
+            switch key {
+            case "u":
+                move(-PCodePickerView.pageRows / 2)
+                return nil
+            case "d":
+                move(PCodePickerView.pageRows / 2)
+                return nil
+            default:
+                if payload?.cancelKeys?.contains("c-\(key)") == true {
+                    cancel()
+                    return nil
+                }
                 return event
             }
-            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard modifiers.subtracting(.shift) == .command,
-                  let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
-            if key == "w" {
-                self.cancel()
-                return nil
-            }
-            if let action = self.action(forKey: key) {
-                self.run(action, label: Self.keyLabel(key))
-                return nil
-            }
-            return event
         }
+        guard modifiers.subtracting(.shift) == .command else { return event }
+        if key == "w" {
+            cancel()
+            return nil
+        }
+        if let action = action(forKey: key) {
+            run(action, label: Self.keyLabel(key))
+            return nil
+        }
+        return event
     }
 
     /// Give the search field the keyboard.
@@ -276,7 +366,11 @@ extension PCodePicker {
         private var closed = false
         private let writes = DispatchQueue(label: "pcode.pick.write")
 
-        func start(path: String, onLine: @escaping (Data) -> Void, onClosed: @escaping () -> Void) {
+        func start(
+            path: String,
+            onLine: @escaping (Data) -> Void,
+            onClosed: @escaping () -> Void
+        ) {
             Thread.detachNewThread { [self] in
                 if connect(path) {
                     readLines(onLine)
@@ -290,7 +384,8 @@ extension PCodePicker {
             }
         }
 
-        /// Hang up: the reader wakes, closes the socket and reports it closed.
+        /// Hang up: a blocked reader or writer wakes, the reader closes the
+        /// socket and reports it closed.
         func close() {
             lock.lock()
             closed = true
@@ -298,16 +393,25 @@ extension PCodePicker {
             lock.unlock()
         }
 
-        func send(_ data: Data) {
+        /// Write `data`, off the main queue; then hang up if `thenClose`.
+        func send(_ data: Data?, thenClose: Bool = false) {
             writes.async { [self] in
+                // A copy of the socket, taken under the lock and written outside
+                // it: `close()` never waits on a write, and its shutdown wakes one
+                // that blocks. The reader closing its fd leaves this one valid.
                 lock.lock()
-                defer { lock.unlock() }
-                guard fd >= 0, !closed else { return }
-                Self.writeAll(fd, data)
+                let copy = fd >= 0 && !closed ? dup(fd) : -1
+                lock.unlock()
+                if copy >= 0 {
+                    if let data { Self.writeAll(copy, data) }
+                    Darwin.close(copy)
+                }
+                if thenClose { close() }
             }
         }
 
-        /// Connect to `path` and say hello, if it is this user's socket in this user's own directory.
+        /// Connect to `path` and say hello, if it is this user's socket in this
+        /// user's own directory, and this user is listening on it.
         private func connect(_ path: String) -> Bool {
             var directory = stat()
             var info = stat()
@@ -337,9 +441,12 @@ extension PCodePicker {
                     Darwin.connect(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
+            var peerUID = uid_t.max
+            var peerGID = gid_t.max
+            let samePeer = connected == 0 && getpeereid(socketFD, &peerUID, &peerGID) == 0 && peerUID == getuid()
             lock.lock()
             defer { lock.unlock() }
-            guard connected == 0, !closed else {
+            guard samePeer, !closed else {
                 Darwin.close(socketFD)
                 return false
             }
@@ -357,13 +464,17 @@ extension PCodePicker {
                 let count = chunk.withUnsafeMutableBytes { read(socketFD, $0.baseAddress, $0.count) }
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { return }
+                // Only the new bytes can hold the next newline.
+                var searchFrom = pending.count
                 pending.append(contentsOf: chunk[0..<count])
-                while let newline = pending.firstIndex(of: 0x0A) {
-                    let line = pending[pending.startIndex..<newline]
-                    pending = Data(pending[(newline + 1)...])
-                    let copy = Data(line)
-                    DispatchQueue.main.async { onLine(copy) }
+                var lineStart = 0
+                while let newline = pending[(pending.startIndex + searchFrom)...].firstIndex(of: 0x0A) {
+                    let line = Data(pending[(pending.startIndex + lineStart)..<newline])
+                    DispatchQueue.main.async { onLine(line) }
+                    lineStart = newline + 1 - pending.startIndex
+                    searchFrom = lineStart
                 }
+                if lineStart > 0 { pending = Data(pending[(pending.startIndex + lineStart)...]) }
                 if pending.count > PCodePicker.lineLimit { return }
             }
         }
@@ -394,7 +505,7 @@ final class PCodePickField: NSTextField, NSTextFieldDelegate {
     /// True while this field's editor has its window's keyboard.
     var hasKeyboard: Bool {
         guard let editor = window?.firstResponder as? NSTextView else { return false }
-        return editor.delegate === self
+        return (editor.delegate as AnyObject?) === self
     }
 
     override func viewDidMoveToWindow() {
@@ -422,7 +533,8 @@ final class PCodePickField: NSTextField, NSTextFieldDelegate {
         case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
             break  // The search line keeps the keyboard: there is nothing else to focus.
         case #selector(NSResponder.deleteForward(_:)):
-            guard let action = picker.deleteAction else { return false }
+            // Only the forward-delete key: AppKit sends Ctrl+D here too.
+            guard NSApp.currentEvent?.keyCode == 0x75, let action = picker.deleteAction else { return false }
             picker.run(action, label: "Delete")
         default:
             return false
@@ -505,7 +617,7 @@ struct PCodePickerView: View {
     @ViewBuilder
     private var list: some View {
         if picker.rows.isEmpty {
-            Text(picker.payload?.empty ?? "")
+            Text(picker.emptyText)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -572,6 +684,9 @@ struct PCodePickerView: View {
             hint("↩", "Choose")
             ForEach(picker.payload?.actions ?? [], id: \.key) { action in
                 hint(PCodePicker.keyLabel(action.key), action.label)
+                if action.delete {
+                    hint("⌦", action.label)
+                }
             }
             hint("esc", "Cancel")
             Spacer()

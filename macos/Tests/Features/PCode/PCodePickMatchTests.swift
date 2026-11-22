@@ -2,38 +2,54 @@ import Foundation
 import Testing
 @testable import Ghostty
 
-/// The native pick list must filter as pcode does: this is the table in
-/// pcode's `tests/test_pick_ui.py` (`FUZZY_CASES`), case for case.
+/// The native pick list must filter as pcode does. `pick_fuzzy_cases.json`
+/// is a byte-for-byte copy of pcode's `tests/data/pick_fuzzy_cases.json`,
+/// which pcode's own `fuzzy_match` and `casefold` are tested against: copy it
+/// over again whenever it changes there.
 @Suite
 struct PCodePickMatchTests {
-    static let fuzzyCases: [(String, String, Bool)] = [
-        ("edit_ui", "src/pcode/edit_ui.py", true),
-        ("ed_ui", "src/pcode/edit_ui.py", true),
-        ("pc/edui", "src/pcode/edit_ui.py", true),
-        ("edui", "src/pcode/edit_ui.py", true),
-        ("dtui", "src/pcode/edit_ui.py", false),
-        ("sel_row", "+self.selected_row = 1", true),
-        ("_", "anything", false),
-        ("", "anything", true),
-        ("anthopus", "anthropic claude-opus-5", true),
-        ("anthopus", "anthropic:claude-sonnet-5", false),
-        ("claopus", "anthropic:claude-opus-5", true),
-        ("codluna", "openai-codex:gpt-5.6-luna", true),
-        ("gpt-5.6", "openai-codex:gpt-5.6-luna", true),
-        ("gpt56", "openai-codex:gpt-5.6-luna", true),
-        ("g5l", "openai-codex:gpt-5.6-luna", true),
-        ("lunagpt", "openai-codex:gpt-5.6-luna", false),
-        ("aab", "aa ab", true),
-        ("abc", "a-b-c", true),
-        ("abd", "ab-c", false),
-        ("café", "le café", true),
-        ("cafe", "le café", false),
-        ("x", "", false),
-    ]
+    struct FuzzyCase: Decodable, Sendable, CustomTestStringConvertible {
+        let term: String
+        let text: String
+        let match: Bool
+        var testDescription: String { "\(term) in \(text)" }
+    }
 
-    @Test(arguments: fuzzyCases)
-    func fuzzyMatchesLikePcode(term: String, text: String, expected: Bool) {
-        #expect(PCodePickMatch.fuzzy(term, text) == expected)
+    struct FoldCase: Decodable, Sendable, CustomTestStringConvertible {
+        let text: String
+        let folded: String
+        var testDescription: String { text }
+    }
+
+    struct Fixture: Decodable {
+        let fuzzy: [FuzzyCase]
+        let casefold: [FoldCase]
+    }
+
+    private final class Anchor {}
+
+    static let fixture: Fixture = {
+        guard let url = Bundle(for: Anchor.self).url(forResource: "pick_fuzzy_cases", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let fixture = try? JSONDecoder().decode(Fixture.self, from: data) else {
+            return Fixture(fuzzy: [], casefold: [])
+        }
+        return fixture
+    }()
+
+    @Test func theFixtureLoads() {
+        #expect(Self.fixture.fuzzy.count > 10)
+        #expect(!Self.fixture.casefold.isEmpty)
+    }
+
+    @Test(arguments: fixture.fuzzy)
+    func fuzzyMatchesLikePcode(_ testCase: FuzzyCase) {
+        #expect(PCodePickMatch.fuzzy(testCase.term, testCase.text) == testCase.match)
+    }
+
+    @Test(arguments: fixture.casefold)
+    func foldsLikeCasefold(_ testCase: FoldCase) {
+        #expect(PCodePickMatch.casefold(testCase.text) == testCase.folded)
     }
 
     static let treeCases: [([Int], [String])] = [
