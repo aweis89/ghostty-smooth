@@ -134,6 +134,7 @@ protocol PCodeOverlayOwner: AnyObject {
 private var pcodeDrawerKey: UInt8 = 0
 private var pcodePopupKey: UInt8 = 0
 private var pcodeOwnerKey: UInt8 = 0
+private var pcodeSessionKey: UInt8 = 0
 
 /// Holds the owner weakly: the owner holds its overlay's surface, not the other way round.
 private final class WeakOwner: NSObject {
@@ -175,6 +176,26 @@ extension Ghostty.SurfaceView {
         objc_setAssociatedObject(self, &pcodeOwnerKey, WeakOwner(owner), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     }
 
+    /// The pcode session this terminal shows (`pcode;session;<id>`), saved with
+    /// the window so a restored terminal reopens it with `pcode -c <id>`.
+    var pcodeSession: String? {
+        get { objc_getAssociatedObject(self, &pcodeSessionKey) as? String }
+        set {
+            guard newValue != pcodeSession else { return }
+            objc_setAssociatedObject(self, &pcodeSessionKey, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+            // The window encodes its surface tree, so it is the window that is now stale.
+            window?.invalidateRestorableState()
+        }
+    }
+
+    /// What a restored terminal types to reopen `session`, or nil if it is not a session ID.
+    static func pcodeResumeInput(_ session: String?) -> String? {
+        guard let session, !session.isEmpty, session.count <= 64,
+              session.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") })
+        else { return nil }
+        return "pcode -c \(session)\n"
+    }
+
     /// True if this surface is a pcode drawer's or popup's overlay terminal, even a dropped one.
     var isPCodeOverlay: Bool { pcodeOwnerBox != nil }
 
@@ -196,6 +217,9 @@ extension Ghostty.SurfaceView {
             return
         }
         switch payload.prefix(while: { $0 != ";" }) {
+        case "session":
+            let id = String(payload.dropFirst("session;".count))
+            pcodeSession = Self.pcodeResumeInput(id) == nil ? nil : id
         case "popup", "pick", "popup-close":
             pcodePopup.handle(payload)
         default:

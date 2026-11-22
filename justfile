@@ -16,6 +16,10 @@ reinstall:
 status:
     @scripts/status.sh
 
+# Quit running instances and reopen builds/current with the same windows and pcode sessions.
+restart:
+    scripts/restart.sh
+
 # Trash old builds/pcode-*.app bundles, keeping current and any running one.
 prune *args:
     scripts/prune-builds.sh {{args}}

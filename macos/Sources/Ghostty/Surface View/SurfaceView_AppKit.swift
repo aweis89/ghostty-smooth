@@ -1910,6 +1910,7 @@ extension Ghostty {
             case uuid
             case title
             case isUserSetTitle
+            case pcodeSession
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -1926,6 +1927,9 @@ extension Ghostty {
             config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
+            // The pcode session this terminal showed: its shell reopens it.
+            let pcodeSession = try container.decodeIfPresent(String.self, forKey: .pcodeSession)
+            config.initialInput = Self.pcodeResumeInput(pcodeSession)
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -1945,6 +1949,7 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
+            try container.encodeIfPresent(pcodeSession, forKey: .pcodeSession)
         }
     }
 }
