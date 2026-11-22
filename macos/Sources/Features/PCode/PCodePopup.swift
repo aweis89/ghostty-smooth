@@ -200,6 +200,11 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     private func openPicker(token: String, layout: Layout) {
         close()
         let picker = PCodePicker()
+        // pcode's own terminal font, at its size now (zoom later isn't followed).
+        // The call hands us a copy we own (+1), so take it retained.
+        if let surface = surfaceView?.surface, let font = ghostty_surface_quicklook_font(surface) {
+            picker.font = Unmanaged<CTFont>.fromOpaque(font).takeRetainedValue()
+        }
         // Each list pcode sends: the first shows the picker (its search field
         // takes the keyboard as it mounts), and each titles the header.
         picker.onList = { [weak self, weak picker] title in
@@ -281,7 +286,7 @@ struct PCodePopupLayer: View {
                         case .picker(let picker):
                             // Mounted once pcode sent its list, so its field takes the keyboard then.
                             if popup.ready {
-                                PCodePickerView(picker: picker)
+                                PCodePickerView(picker: picker, base: PCodePickTheme.Base(ghostty.config))
                                     .id(ObjectIdentifier(picker))
                                     .environment(\.colorScheme, colorScheme)
                             }
