@@ -91,11 +91,14 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     func handle(_ payload: String) {
         let parts = payload.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
         switch parts.first {
-        case "popup" where parts.count == 3:
+        case "popup" where parts.count == 3 || parts.count == 4:
             guard PCode.valid(parts[1], length: 16...16, hex: true), let layout = Layout(rawValue: parts[2]) else {
                 return
             }
-            open(token: parts[1], layout: layout)
+            // A title given at open is laid out before the terminal first
+            // reports its size, so pcode's first frame already fits under it.
+            let title = parts.count == 4 ? Self.title(fromBase64: parts[3]) : ""
+            open(token: parts[1], layout: layout, title: title)
         case "pick" where parts.count == 3:
             guard PCode.valid(parts[1], length: 16...16, hex: true), let layout = Layout(rawValue: parts[2]) else {
                 return
@@ -166,12 +169,14 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
 
     // MARK: The popup's terminal
 
-    private func open(token: String, layout: Layout) {
+    private func open(token: String, layout: Layout, title: String) {
         close()
         guard let python = PCode.entryPython(PCode.statePath("popups/\(token).json")) else { return }
         // The token is plain by now.
         let command = PCode.pythonCommand(python, module: "pcode.popup_bridge", args: [token])
+        self.title = title
         guard let surface = PCode.makeOverlaySurface(over: surfaceView, command: command, owner: self) else {
+            self.title = ""
             return
         }
         // Cmd+W in the popup, or the bridge exiting, asks to close its surface.
@@ -212,6 +217,8 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     }
 
     /// A title as pcode sends it: base64 UTF-8, shown as plain text on one line.
+    private static let bidi: Set<UInt32> = Set(0x202A...0x202E).union(0x2066...0x2069)
+
     static func title(fromBase64 encoded: String) -> String {
         // Base64 grows text by a third, and a character is at most 4 bytes.
         guard encoded.count <= titleLimit * 6,
@@ -223,7 +230,8 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     /// `text` on one line without control characters, cut to `titleLimit`.
     static func plainTitle(_ text: String) -> String {
         let plain = String(String.UnicodeScalarView(
-            text.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+            // Controls (Cc) and bidi overrides go; joiners in emoji stay.
+            text.unicodeScalars.filter { $0.properties.generalCategory != .control && !bidi.contains($0.value) }
         ))
         return String(plain.trimmingCharacters(in: .whitespaces).prefix(titleLimit))
     }
