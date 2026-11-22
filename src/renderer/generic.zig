@@ -2080,11 +2080,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Upload the background image to the GPU as necessary.
             try self.uploadBackgroundImage();
 
+            // Smooth region glides move with every draw; step them before
+            // custom shader uniforms read the cursor's shifted position.
+            self.applyGlide();
+
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
-
-            // Smooth region glides move with every draw.
-            self.applyGlide();
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
@@ -2699,6 +2700,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 var pixel_y: f32 = @floatFromInt(
                     cursor.grid_pos[1] * cell.height + padding.top,
                 );
+                // Match the grid's sub-row smooth scroll offset and any active
+                // smooth region covering the cursor cell.
+                pixel_y += self.scroll_offset_px;
+                if (self.smoothRegionAt(cursor.grid_pos[0], cursor.grid_pos[1])) |region| {
+                    pixel_y -= self.uniforms.smooth_offsets[region];
+                    const ox = self.uniforms.smooth_offsets_x[region];
+                    if (ox >= 0) pixel_x -= ox;
+                }
 
                 // If +Y is up in our shaders, we need to flip the coordinate
                 // so that it's instead the top edge of the cell relative to
@@ -2843,20 +2852,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This requires the draw mutex.
         ///
         /// Dirty state on terminal state won't be reset by this.
-        /// The uniform slot of the region drawn at row `y`, column 0: where
+        /// The uniform slot of the region drawn at cell `(x, y)`: where
         /// regions nest, the one with the fewest rows (as the shaders pick).
-        fn innermostRegion(self: *const Self, y: terminal.size.CellCountInt) ?u32 {
+        fn smoothRegionAt(
+            self: *const Self,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+        ) ?u32 {
             var found: ?u32 = null;
             var rows: u16 = 0;
             for (0..self.uniforms.smooth_count) |i| {
                 const r = self.uniforms.smooth_rects[i];
-                if (y < r[0] or y > r[1] or r[2] > 0) continue;
+                if (y < r[0] or y > r[1] or x < r[2] or x > r[3]) continue;
                 if (found == null or r[1] - r[0] < rows) {
                     found = @intCast(i);
                     rows = r[1] - r[0];
                 }
             }
             return found;
+        }
+
+        /// The uniform slot of the region drawn at row `y`, column 0.
+        fn innermostRegion(self: *const Self, y: terminal.size.CellCountInt) ?u32 {
+            return self.smoothRegionAt(0, y);
         }
 
         fn rebuildCells(
