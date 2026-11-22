@@ -205,7 +205,9 @@ extension Ghostty.SurfaceView {
 ///
 /// An overlay rather than a split: the terminal keeps its size, so nothing
 /// reflows and pcode's editor stays where it is, and the surface never leaves
-/// the view tree, so it keeps the keyboard. The drawer covers what is under it.
+/// the view tree, so it keeps the keyboard. The drawer slides in from the right
+/// and stops several rows above the bottom so the editor and status bar stay
+/// uncovered.
 struct PCodeDrawerSurface: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var surfaceView: Ghostty.SurfaceView
@@ -213,58 +215,104 @@ struct PCodeDrawerSurface: View {
     var isSplit: Bool
 
     /// The drawer's share of the surface's width, set by dragging its left edge.
-    @State private var fraction: CGFloat = 0.42
+    @State private var fraction: CGFloat = 0.70
     /// `fraction` when the current drag began: drags report distance from their start.
     @State private var dragStart: CGFloat?
     private static let minWidth: CGFloat = 260
+    private static let minHeight: CGFloat = 120
+    /// Terminal rows left uncovered at the bottom so pcode's editor and status bar stay visible.
+    private static let bottomLines: CGFloat = 6
+    private static let fallbackLineHeight: CGFloat = 18
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .trailing) {
-                Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
-                if drawer.visible, let viewer = drawer.viewer {
-                    overlay(viewer, width: width(in: geometry.size.width), total: geometry.size.width)
+            Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
+                .overlay(alignment: .topTrailing) {
+                    ZStack(alignment: .topTrailing) {
+                        Color.clear
+                        if drawer.visible, let viewer = drawer.viewer {
+                            overlay(
+                                viewer,
+                                width: width(in: geometry.size.width),
+                                height: height(in: geometry.size.height),
+                                total: geometry.size.width
+                            )
+                            .allowsHitTesting(drawer.visible)
+                            .transition(.move(edge: .trailing))
+                            .zIndex(1)
+                        }
+                    }
+                    .clipped()
+                    .animation(.easeOut(duration: 0.18), value: drawer.visible)
                 }
-            }
         }
     }
 
     private func width(in total: CGFloat) -> CGFloat {
-        let upper = max(Self.minWidth, total * 0.85)
-        return min(upper, max(Self.minWidth, total * fraction))
+        let floor = min(total, Self.minWidth)
+        let upper = max(floor, total * 0.85)
+        return min(upper, max(floor, total * fraction))
     }
 
-    private func overlay(_ viewer: Ghostty.SurfaceView, width: CGFloat, total: CGFloat) -> some View {
-        HStack(spacing: 0) {
-            // The left edge: a thin line to see, a wider strip to drag.
+    private func height(in total: CGFloat) -> CGFloat {
+        let lineHeight = surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
+        let extraPadding: CGFloat
+        if let rows = surfaceView.surfaceSize?.rows, rows > 0, surfaceView.cellSize.height > 0 {
+            extraPadding = max(0, total - CGFloat(rows) * lineHeight) / 2
+        } else {
+            extraPadding = 0
+        }
+        let inset = min(lineHeight * Self.bottomLines + extraPadding, max(0, total - Self.minHeight))
+        return max(0, total - inset)
+    }
+
+    private func overlay(
+        _ viewer: Ghostty.SurfaceView,
+        width: CGFloat,
+        height: CGFloat,
+        total: CGFloat
+    ) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                // The left edge: a thin line to see, a wider strip to drag.
+                Rectangle()
+                    .fill(ghostty.config.splitDividerColor)
+                    .frame(width: 1)
+                    .overlay(
+                        Color.clear
+                            .frame(width: 8)
+                            .contentShape(Rectangle())
+                            .backport.pointerStyle(.resizeLeftRight)
+                            .onHover { inside in
+                                if #available(macOS 15, *) { return }
+                                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                            }
+                            .gesture(
+                                DragGesture(coordinateSpace: .global)
+                                    .onChanged { gesture in
+                                        guard total > 0 else { return }
+                                        let start = dragStart ?? fraction
+                                        dragStart = start
+                                        let next = start - gesture.translation.width / total
+                                        let minFraction = min(1, Self.minWidth / total)
+                                        let maxFraction = max(minFraction, 0.85)
+                                        fraction = min(maxFraction, max(minFraction, next))
+                                    }
+                                    .onEnded { _ in dragStart = nil }
+                            )
+                    )
+                    .zIndex(1)
+                Ghostty.SurfaceWrapper(surfaceView: viewer, isSplit: false)
+                    .id(ObjectIdentifier(viewer))
+            }
+            // Bottom edge above the uncovered editor rows.
             Rectangle()
                 .fill(ghostty.config.splitDividerColor)
-                .frame(width: 1)
-                .overlay(
-                    Color.clear
-                        .frame(width: 8)
-                        .contentShape(Rectangle())
-                        .onHover { inside in
-                            if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-                        }
-                        .gesture(
-                            DragGesture(coordinateSpace: .global)
-                                .onChanged { gesture in
-                                    guard total > 0 else { return }
-                                    let start = dragStart ?? fraction
-                                    dragStart = start
-                                    let next = start - gesture.translation.width / total
-                                    fraction = min(0.85, max(Self.minWidth / total, next))
-                                }
-                                .onEnded { _ in dragStart = nil }
-                        )
-                )
-            Ghostty.SurfaceWrapper(surfaceView: viewer, isSplit: false)
-                .id(ObjectIdentifier(viewer))
+                .frame(height: 1)
         }
-        .frame(width: width)
+        .frame(width: width, height: height)
         .background(ghostty.config.backgroundColor)
-        .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 0)
+        .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 2)
     }
 }
 
