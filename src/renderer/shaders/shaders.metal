@@ -29,6 +29,13 @@ struct Uniforms {
   float smooth_offsets_x[8];
   uint smooth_count;
   uint smooth_no_overscan;
+  float smooth_fade_bottom[8];
+  int smooth_reveal_region;
+  uint smooth_reveal_mode;
+  int smooth_reveal_active_row;
+  int smooth_reveal_end_row;
+  float smooth_reveal_pos_px;
+  float smooth_reveal_feather_px;
 };
 
 // Whether region i keeps its bottom row visible (no overscan row).
@@ -489,6 +496,7 @@ fragment float4 cell_bg_fragment(
 
   // Smooth scroll region: sample the cell the shifted content puts here.
   // The overscan row's own screen space stays empty.
+  float reveal_alpha = 1.0;
   int region = smooth_region_at(uniforms, grid_pos);
   if (region >= 0) {
     if (!smooth_no_overscan(uniforms, region) &&
@@ -505,6 +513,39 @@ fragment float4 cell_bg_fragment(
     if (ox >= 0.0) {
       float x = in.position.x - uniforms.grid_padding.w + ox;
       grid_pos.x = int(floor(x / uniforms.cell_size.x));
+    }
+    float fade_b = uniforms.smooth_fade_bottom[region];
+    if (fade_b > 0.0) {
+      float r_bot = float(uniforms.smooth_rects[region].y) +
+                    (smooth_no_overscan(uniforms, region) ? 1.0 : 0.0);
+      float clip_y = uniforms.grid_padding.x + r_bot * uniforms.cell_size.y;
+      reveal_alpha *= smoothstep(0.0, fade_b, clip_y - in.position.y);
+    }
+    if (region == uniforms.smooth_reveal_region && uniforms.smooth_reveal_mode != 0u) {
+      float f = max(uniforms.smooth_reveal_feather_px, 1.0);
+      if (uniforms.smooth_reveal_mode == 1u) {
+        if (grid_pos.y > uniforms.smooth_reveal_active_row &&
+            grid_pos.y <= uniforms.smooth_reveal_end_row) {
+          return bg;
+        }
+        if (grid_pos.y == uniforms.smooth_reveal_active_row &&
+            grid_pos.y <= uniforms.smooth_reveal_end_row) {
+          reveal_alpha *= 1.0 - smoothstep(
+            uniforms.smooth_reveal_pos_px - f,
+            uniforms.smooth_reveal_pos_px,
+            in.position.x
+          );
+        }
+      } else if (uniforms.smooth_reveal_mode == 2u) {
+        if (grid_pos.y >= uniforms.smooth_reveal_active_row &&
+            grid_pos.y <= uniforms.smooth_reveal_end_row) {
+          reveal_alpha *= 1.0 - smoothstep(
+            uniforms.smooth_reveal_pos_px - f,
+            uniforms.smooth_reveal_pos_px,
+            in.position.y
+          );
+        }
+      }
     }
   }
 
@@ -552,7 +593,7 @@ fragment float4 cell_bg_fragment(
     cell_color,
     uniforms.use_display_p3,
     uniforms.use_linear_blending
-  );
+  ) * reveal_alpha;
 }
 
 //-------------------------------------------------------------------
@@ -603,6 +644,8 @@ struct CellTextVertexOut {
   float4 bg_color [[flat]];
   float2 tex_coord;
   float4 clip [[flat]];
+  float fade_bottom [[flat]];
+  int reveal_kind [[flat]];
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -638,6 +681,8 @@ vertex CellTextVertexOut cell_text_vertex(
   // Smooth scroll region: shift up and clip to the visible cells.
   // clip is (top, bottom, left, right) in pixels.
   out.clip = float4(-1e9, 1e9, -1e9, 1e9);
+  out.fade_bottom = 0.0;
+  out.reveal_kind = 0;
   int region = smooth_region_at(uniforms, int2(in.grid_pos));
   if (region >= 0) {
     float4 r = float4(uniforms.smooth_rects[region]);
@@ -655,6 +700,21 @@ vertex CellTextVertexOut cell_text_vertex(
       uniforms.grid_padding.x + r.xy * uniforms.cell_size.y,
       uniforms.grid_padding.w + float2(r.z, right) * uniforms.cell_size.x
     );
+    out.fade_bottom = uniforms.smooth_fade_bottom[region];
+    if (region == uniforms.smooth_reveal_region && uniforms.smooth_reveal_mode != 0u) {
+      int gy = int(in.grid_pos.y);
+      if (uniforms.smooth_reveal_mode == 1u) {
+        if (gy > uniforms.smooth_reveal_active_row && gy <= uniforms.smooth_reveal_end_row) {
+          out.reveal_kind = -1;
+        } else if (gy == uniforms.smooth_reveal_active_row && gy <= uniforms.smooth_reveal_end_row) {
+          out.reveal_kind = 1;
+        }
+      } else if (uniforms.smooth_reveal_mode == 2u) {
+        if (gy >= uniforms.smooth_reveal_active_row && gy <= uniforms.smooth_reveal_end_row) {
+          out.reveal_kind = 2;
+        }
+      }
+    }
   }
 
   //              === Grid Cell ===
@@ -755,8 +815,34 @@ fragment float4 cell_text_fragment(
   texture2d<float> textureColor [[texture(1)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  if (in.reveal_kind < 0) {
+    discard_fragment();
+  }
   if (in.position.y < in.clip.x || in.position.y >= in.clip.y ||
       in.position.x < in.clip.z || in.position.x >= in.clip.w) {
+    discard_fragment();
+  }
+
+  float reveal_alpha = 1.0;
+  if (in.fade_bottom > 0.0) {
+    reveal_alpha *= smoothstep(0.0, in.fade_bottom, in.clip.y - in.position.y);
+  }
+  if (in.reveal_kind == 1) {
+    float f = max(uniforms.smooth_reveal_feather_px, 1.0);
+    reveal_alpha *= 1.0 - smoothstep(
+      uniforms.smooth_reveal_pos_px - f,
+      uniforms.smooth_reveal_pos_px,
+      in.position.x
+    );
+  } else if (in.reveal_kind == 2) {
+    float f = max(uniforms.smooth_reveal_feather_px, 1.0);
+    reveal_alpha *= 1.0 - smoothstep(
+      uniforms.smooth_reveal_pos_px - f,
+      uniforms.smooth_reveal_pos_px,
+      in.position.y
+    );
+  }
+  if (reveal_alpha <= 0.001) {
     discard_fragment();
   }
 
@@ -810,10 +896,10 @@ fragment float4 cell_text_fragment(
         }
       }
 
-      // Multiply our whole color by the alpha mask.
+      // Multiply our whole color by the alpha mask and native reveal alpha.
       // Since we use premultiplied alpha, this is
-      // the correct way to apply the mask.
-      color *= a;
+      // the correct way to apply both masks.
+      color *= a * reveal_alpha;
 
       return color;
     }
@@ -825,7 +911,7 @@ fragment float4 cell_text_fragment(
 
       // If we're doing linear blending, we can return this right away.
       if (uniforms.use_linear_blending) {
-        return color;
+        return color * reveal_alpha;
       }
 
       // Otherwise we need to unlinearize the color. Since the alpha is
@@ -834,7 +920,7 @@ fragment float4 cell_text_fragment(
       color = unlinearize(color);
       color.rgb *= color.a;
 
-      return color;
+      return color * reveal_alpha;
     }
   }
 }

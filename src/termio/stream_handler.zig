@@ -561,8 +561,46 @@ pub const StreamHandler = struct {
                     log.warn("invalid smooth APC: {s}", .{unknown.content});
                     return;
                 };
-                // The glide must add to its position now, not at the last frame.
-                if (cmd == .advance) cmd.advance.at = .now(global.io(), .awake);
+                // The glide/reveal must land at now, not at the last frame.
+                const smooth_now: std.Io.Timestamp = .now(global.io(), .awake);
+                switch (cmd) {
+                    .advance => |*a| a.at = smooth_now,
+                    .reveal => |*r| {
+                        r.at = smooth_now;
+                        const screen = self.terminal.screens.active;
+                        if (screen.pages.getTopLeft(.active).down(r.top)) |start_pin| {
+                            var pin: ?terminal.PageList.Pin = start_pin;
+                            for (0..r.count) |row_idx| {
+                                const p = pin orelse break;
+                                const cells = p.cells(.all);
+                                var first: u16 = 0;
+                                var last: u16 = 0;
+                                var found = false;
+                                for (cells, 0..) |cell, col| {
+                                    const cp = cell.codepoint();
+                                    const has_bg = cell.content_tag == .bg_color_palette or
+                                        cell.content_tag == .bg_color_rgb or
+                                        (cell.hasStyling() and p.style(&cell).bg_color.tag != .none);
+                                    const visible = (cp != 0 and cp != ' ' and cp != '\t') or has_bg;
+                                    if (visible) {
+                                        if (!found) {
+                                            first = @intCast(col);
+                                            found = true;
+                                        }
+                                        last = @intCast(col);
+                                    }
+                                }
+                                r.spans[row_idx] = if (found)
+                                    .{ .lead = first, .end = last +| 1 }
+                                else
+                                    .{ .lead = 0, .end = 0 };
+                                pin = p.down(1);
+                            }
+                            r.has_spans = true;
+                        }
+                    },
+                    else => {},
+                }
                 self.renderer_state.applySmooth(cmd);
                 self.renderer_state.publishHit();
                 try self.queueRender();
