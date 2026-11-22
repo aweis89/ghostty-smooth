@@ -1136,6 +1136,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .pcode_event => |w| {
+            defer w.deinit();
+
+            var stack_buf: [256]u8 = undefined;
+            var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.alloc);
+            const alloc = stack.allocator();
+            const str = try alloc.dupeSentinel(u8, w.slice(), 0);
+            defer alloc.free(str);
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .pcode_event,
+                .{ .payload = str },
+            );
+        },
+
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),

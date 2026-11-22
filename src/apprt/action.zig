@@ -367,6 +367,9 @@ pub const Action = union(Key) {
     /// Set the application window theme for this session.
     set_window_theme: WindowTheme,
 
+    /// A pcode drawer command for the target surface (pcode fork).
+    pcode_event: PcodeEvent,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -440,6 +443,7 @@ pub const Action = union(Key) {
         move_tab_to_new_window,
         resize_window,
         set_window_theme,
+        pcode_event,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -786,6 +790,28 @@ pub const SetTitle = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.title });
+    }
+};
+
+pub const PcodeEvent = struct {
+    payload: [:0]const u8,
+
+    // Sync with: ghostty_action_pcode_event_s
+    pub const C = extern struct {
+        payload: [*:0]const u8,
+    };
+
+    pub fn cval(self: PcodeEvent) C {
+        return .{ .payload = self.payload.ptr };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.Options,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.payload });
     }
 };
 

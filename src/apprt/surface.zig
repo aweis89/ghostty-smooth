@@ -134,6 +134,9 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// A pcode drawer command (`ESC _ pcode;... ESC \`), without the prefix.
+    pcode_event: WriteReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 

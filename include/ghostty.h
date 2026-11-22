@@ -743,6 +743,11 @@ typedef struct {
   const char* pwd;
 } ghostty_action_pwd_s;
 
+// apprt.action.PcodeEvent.C
+typedef struct {
+  const char* payload;
+} ghostty_action_pcode_event_s;
+
 // apprt.action.OpenConfig
 typedef enum {
   // Open the config in the OS default editor.
@@ -1041,6 +1046,7 @@ typedef enum {
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_SET_WINDOW_THEME,
+  GHOSTTY_ACTION_PCODE_EVENT,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1086,6 +1092,7 @@ typedef union {
   ghostty_action_readonly_e readonly;
   ghostty_action_open_config_e open_config;
   ghostty_action_window_theme_e set_window_theme;
+  ghostty_action_pcode_event_s pcode_event;
 } ghostty_action_u;
 
 typedef struct {

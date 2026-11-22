@@ -520,9 +520,28 @@ pub const StreamHandler = struct {
         // log.warn("APC command: {}", .{result});
         switch (result) {
             .unknown => |*unknown| {
+                if (unknown.truncated) return;
+                // pcode drawer commands: answered here or handed to the apprt
+                // as one opaque string, so new commands need no Zig changes.
+                const pcode_prefix = "pcode;";
+                // Only the embedded apprt (the macOS app) has a drawer; GTK
+                // must not claim one, so pcode keeps drawing threads itself.
+                const has_drawer = comptime build_config.app_runtime == .none;
+                if (has_drawer and std.mem.startsWith(u8, unknown.content, pcode_prefix)) {
+                    const payload = unknown.content[pcode_prefix.len..];
+                    if (std.mem.eql(u8, payload, "?")) {
+                        self.messageWriter(.{ .write_stable = "\x1b_pcode;ok;1\x1b\\" });
+                        return;
+                    }
+                    if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {
+                        self.surfaceMessageWriter(.{ .pcode_event = req });
+                    } else |err| {
+                        log.warn("error sending pcode event err={}", .{err});
+                    }
+                    return;
+                }
                 const prefix = "smooth;";
-                if (unknown.truncated or
-                    !std.mem.startsWith(u8, unknown.content, prefix)) return;
+                if (!std.mem.startsWith(u8, unknown.content, prefix)) return;
                 // Capability query: answer with the protocol version so apps
                 // can tell this terminal supports smooth scroll regions.
                 if (std.mem.eql(u8, unknown.content[prefix.len..], "?")) {
