@@ -42,9 +42,12 @@ extension Ghostty {
 
                     SurfaceRepresentable(view: surfaceView, size: geo.size)
                         .focused($surfaceFocus)
-                        .focusedValue(\.ghosttySurfacePwd, surfaceView.pwd)
-                        .focusedValue(\.ghosttySurfaceView, surfaceView)
-                        .focusedValue(\.ghosttySurfaceCellSize, surfaceView.cellSize)
+                        // A pcode overlay (drawer viewer, popup) stands in for the
+                        // surface it is over: that one is in the window's split tree,
+                        // so the window keeps its title, directory and split actions.
+                        .focusedValue(\.ghosttySurfacePwd, surfaceView.pcodeWindowSurface.pwd)
+                        .focusedValue(\.ghosttySurfaceView, surfaceView.pcodeWindowSurface)
+                        .focusedValue(\.ghosttySurfaceCellSize, surfaceView.pcodeWindowSurface.cellSize)
                         .onReceive(pubBecomeKey) { notification in
                             guard let window = notification.object as? NSWindow else { return }
                             guard let surfaceWindow = surfaceView.window else { return }

@@ -1941,19 +1941,14 @@ extension Ghostty {
             }
         }
 
-        /// A pcode drawer command for a surface (`Features/PCode`).
+        /// A pcode drawer or popup command for a surface (`Features/PCode`).
         private static func pcodeEvent(target: ghostty_target_s, v: ghostty_action_pcode_event_s) {
             guard target.tag == GHOSTTY_TARGET_SURFACE,
                   let surface = target.target.surface,
                   let surfaceView = self.surfaceView(from: surface),
                   // Copied now: the string is only valid during this call.
                   let text = String(cString: v.payload, encoding: .utf8) else { return }
-            // The drawer's own terminal speaks to the drawer it is in, not to a drawer of its own.
-            if let owner = surfaceView.pcodeOwner {
-                owner.handleFromViewer(text)
-            } else {
-                surfaceView.pcodeDrawer.handle(text)
-            }
+            surfaceView.pcodeEvent(text)
         }
 
         private static func pwdChanged(

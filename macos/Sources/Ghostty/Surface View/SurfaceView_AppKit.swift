@@ -845,7 +845,11 @@ extension Ghostty {
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
-            if result { focusDidChange(true) }
+            if result {
+                focusDidChange(true)
+                // An open pcode popup over this surface takes the keyboard back.
+                pcodeDidFocus()
+            }
             return result
         }
 

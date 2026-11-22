@@ -38,6 +38,8 @@ extension Ghostty {
                     })
                 }
             }
+            // pcode's popup over all of it, with or without the inspector.
+            .overlay { PCodePopupLayer(popup: surfaceView.pcodePopup) }
             .onReceive(pubInspector) { onControlInspector($0) }
             .onChange(of: surfaceView.inspectorVisible) { inspectorVisible in
                 // When we show the inspector, we want to focus on the inspector.

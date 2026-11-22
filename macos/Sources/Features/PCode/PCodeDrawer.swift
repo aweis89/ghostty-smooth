@@ -4,14 +4,25 @@ import SwiftUI
 
 /// A drawer over the right of a terminal surface that shows a pcode /btw thread.
 ///
-/// pcode asks for it with an APC (`ESC _ pcode;btw;<host>;<thread> ESC \`,
-/// `ESC _ pcode;close ESC \`), which reaches us as `GHOSTTY_ACTION_PCODE_EVENT`.
+/// pcode drives it with APCs from the terminal (see `PCode`):
+///
+/// - `pcode;btw;<host>;<thread>`: show the thread (`host` is 8 lowercase hex
+///   digits, `thread` 1-64 plain characters), starting a viewer if needed.
+/// - `pcode;close`: close the drawer and end its viewer.
+/// - `pcode;hide`: hide the drawer but keep its viewer running.
+/// - `pcode;show`: show it again, if it has a viewer.
+/// - `pcode;focus`, from the viewer's own terminal while it has the keyboard:
+///   give the keyboard back to the terminal.
+///
+/// `pcode;?` is answered in Zig (`stream_handler.zig`) with `pcode;ok;1`.
+/// Popups (`pcode;popup;...`) are `PCodePopup`'s.
+///
 /// The drawer is a second terminal surface, so it has this terminal's font,
 /// size and colors. It runs `python -m pcode.btw_tail <host> <thread>` with
 /// the session host's own interpreter, read from the host's entry file; that
 /// viewer reads the thread from the host and draws it. Nothing in the APC
 /// becomes part of the command but the checked host id and thread.
-final class PCodeDrawer: NSObject, ObservableObject {
+final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published var visible = false
     /// The drawer's terminal while it is open; dropping it ends the viewer.
     @Published private(set) var viewer: Ghostty.SurfaceView?
@@ -35,30 +46,30 @@ final class PCodeDrawer: NSObject, ObservableObject {
         let parts = payload.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
         switch parts.first {
         case "btw" where parts.count == 3:
-            guard Self.valid(parts[1], length: 8...8, hex: true), Self.valid(parts[2], length: 1...64) else {
+            guard PCode.valid(parts[1], length: 8...8, hex: true), PCode.valid(parts[2], length: 1...64) else {
                 return
             }
             show(host: parts[1], thread: parts[2])
         case "close":
             close()
+        case "hide" where parts.count == 1:
+            // While pcode draws a full-screen popup of its own over the terminal.
+            let hadFocus = viewerHasFocus
+            visible = false
+            if hadFocus { focusTerminal() }
+        case "show" where parts.count == 1:
+            if viewer != nil { visible = true }
         default:
             break
         }
     }
 
     /// From the viewer in the drawer's own terminal: only asking for the keyboard to go back.
-    func handleFromViewer(_ payload: String) {
+    func handleFromOverlay(_ payload: String, from overlay: Ghostty.SurfaceView) {
         // Only while the drawer has the keyboard: anything else that prints
         // the sequence there must not pull focus from another split.
+        guard overlay === viewer else { return }
         if payload == "focus" && viewerHasFocus { focusTerminal() }
-    }
-
-    private static func valid(_ value: String, length: ClosedRange<Int>, hex: Bool = false) -> Bool {
-        length.contains(value.count) && value.allSatisfy {
-            guard $0.isASCII else { return false }
-            if hex { return $0.isHexDigit && !$0.isUppercase }
-            return $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"
-        }
     }
 
     private func show(host: String, thread: String) {
@@ -94,110 +105,43 @@ final class PCodeDrawer: NSObject, ObservableObject {
     private func replaceViewer(with next: Ghostty.SurfaceView?) {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
+        viewer?.pcodeOwner = nil
         viewer = next
         guard let next else { return }
         // Cmd+W in the drawer, or the viewer exiting, asks to close its surface.
         // No window controller owns this one, so the drawer closes instead.
         closeObserver = NotificationCenter.default.addObserver(
             forName: Ghostty.Notification.ghosttyCloseSurface, object: next, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self, weak next] _ in
             // After the notification, not inside the callback that posted it,
-            // which is still using the surface this frees.
-            DispatchQueue.main.async { self?.close() }
+            // which is still using the surface this frees. Only if it is still
+            // this viewer: a later one may have replaced it meanwhile.
+            DispatchQueue.main.async {
+                guard let self, let next, self.viewer === next else { return }
+                self.close()
+            }
         }
     }
 
     private func makeViewer(host: String, thread: String) -> Ghostty.SurfaceView? {
-        guard let surfaceView, let surface = surfaceView.surface else { return nil }
-        let app = ghostty_surface_app(surface)
-        // As a new split would be: this terminal's font size, directory and environment.
-        var config = Ghostty.SurfaceConfiguration(
-            from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_SPLIT))
-        config.command = Self.viewerCommand(host: host, thread: thread)
-        // Not the pane's directory: nothing from a checkout is near the viewer.
-        config.workingDirectory = NSHomeDirectory()
-        config.initialInput = nil
-        config.waitAfterCommand = false
-        let view = Ghostty.SurfaceView(app, baseConfig: config)
-        view.pcodeOwner = self
-        return view
+        PCode.makeOverlaySurface(
+            over: surfaceView, command: Self.viewerCommand(host: host, thread: thread), owner: self)
     }
 
     /// The viewer, run with the interpreter the session host runs on, so it
     /// is the same pcode; or a message, if the host cannot say which that is.
     private static func viewerCommand(host: String, thread: String) -> String {
-        let entry = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/state/pcode/hosts/\(host).json").path
-        guard let python = hostPython(entry) else {
+        guard let python = PCode.entryPython(PCode.statePath("hosts/\(host).json")) else {
             return message("This session host's pcode predates the drawer: run /restart in pcode.")
         }
-        // The embedded API always runs a surface's command in a shell, as
-        // `bash -c "exec -l <command>"` (`embedded.zig`, `Exec.zig`). `-l`
-        // puts a dash before argv[0], and a venv's Python finds its venv from
-        // argv[0], so `env` starts it with a plain one. `-I` keeps the
-        // directory, user site and PYTHON* variables out of its imports.
         // The ids are plain by now.
-        return "/usr/bin/env \(shellQuoted(python)) -I -m pcode.btw_tail \(host) \(thread)"
-    }
-
-    private static func shellQuoted(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    /// `python` from a host entry this user owns, if it names an executable at a plain path.
-    private static func hostPython(_ path: String) -> String? {
-        // Opened without following a link, then checked: what is checked is what is read.
-        let fd = open(path, O_RDONLY | O_NOFOLLOW)
-        guard fd >= 0 else { return nil }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
-              info.st_size < 1 << 20,
-              let data = try? handle.readToEnd(),
-              let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let python = entry["python"] as? String,
-              python.hasPrefix("/"),
-              // `env` would take a word with `=` for a variable to set.
-              !python.contains("="),
-              !python.contains(where: { $0.asciiValue.map { $0 < 0x20 } ?? false }),
-              FileManager.default.isExecutableFile(atPath: python) else { return nil }
-        return python
+        return PCode.pythonCommand(python, module: "pcode.btw_tail", args: [host, thread])
     }
 
     /// A command that only shows `text`; the embedded API waits after every
     /// command, so it stays until a key or the drawer closes it.
     private static func message(_ text: String) -> String {
-        "printf '%s\\n' \(shellQuoted(text))"
-    }
-}
-
-private var pcodeDrawerKey: UInt8 = 0
-private var pcodeOwnerKey: UInt8 = 0
-
-/// Holds the drawer weakly: the drawer owns the viewer's surface, not the other way round.
-private final class WeakDrawer: NSObject {
-    weak var drawer: PCodeDrawer?
-    init(_ drawer: PCodeDrawer) { self.drawer = drawer }
-}
-
-extension Ghostty.SurfaceView {
-    /// This surface's pcode drawer, made the first time it is asked for.
-    var pcodeDrawer: PCodeDrawer {
-        if let drawer = objc_getAssociatedObject(self, &pcodeDrawerKey) as? PCodeDrawer {
-            return drawer
-        }
-        let drawer = PCodeDrawer(surfaceView: self)
-        objc_setAssociatedObject(self, &pcodeDrawerKey, drawer, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        return drawer
-    }
-
-    /// The drawer this surface is the viewer of, if it is one.
-    var pcodeOwner: PCodeDrawer? {
-        get { (objc_getAssociatedObject(self, &pcodeOwnerKey) as? WeakDrawer)?.drawer }
-        set {
-            objc_setAssociatedObject(
-                self, &pcodeOwnerKey, newValue.map(WeakDrawer.init), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        }
+        "printf '%s\\n' \(PCode.shellQuoted(text))"
     }
 }
 
