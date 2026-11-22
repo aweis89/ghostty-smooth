@@ -744,7 +744,11 @@ pub const Hit = struct {
 /// Refresh the hit-testing copy of the offsets. Caller must hold the mutex.
 pub fn publishHit(self: *State) void {
     var next: Hit = .{ .scrollback_px = self.scroll_offset_px };
+    // Scrolled into history, regions draw nowhere (see the renderer), so
+    // the pointer maps without them.
+    const at_active = self.terminal.screens.active.pages.viewport == .active;
     for (self.smooth, 0..) |slot, i| {
+        if (!at_active) break;
         const s = slot orelse continue;
         next.regions[i] = .{
             .top = s.top,
@@ -776,7 +780,9 @@ pub fn readHit(self: *const State) Hit {
 
 test "smooth: hit snapshot mirrors displayed offsets" {
     const testing = std.testing;
-    var state: State = .{ .mutex = undefined, .terminal = undefined };
+    var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 40, .rows = 12 });
+    defer term.deinit(testing.allocator);
+    var state: State = .{ .mutex = undefined, .terminal = &term };
     state.applySmooth(try Smooth.parse("1;2;10;0;39;0;50"));
     state.smoothAt(5, 3).?.acc = 0.4;
     state.scroll_offset_px = 7;
@@ -789,4 +795,21 @@ test "smooth: hit snapshot mirrors displayed offsets" {
     try testing.expectEqual(@as(u16, 10), r.bottom);
     try testing.expectApproxEqAbs(@as(f32, 0.4), r.offset_rows, 0.0001);
     try testing.expectEqual(@as(?Hit.HitRegion, null), hit.regions[1]);
+}
+
+test "smooth: hit snapshot has no regions while scrolled into history" {
+    const testing = std.testing;
+    var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 40, .rows = 12 });
+    defer term.deinit(testing.allocator);
+    for (0..30) |_| try term.printString("line\r\n");
+    var state: State = .{ .mutex = undefined, .terminal = &term };
+    state.applySmooth(try Smooth.parse("1;2;10;0;39;0;50"));
+
+    term.scrollViewport(.{ .delta = -5 });
+    state.publishHit();
+    try testing.expectEqual(@as(?Hit.HitRegion, null), state.readHit().regions[0]);
+
+    term.scrollViewport(.bottom);
+    state.publishHit();
+    try testing.expect(state.readHit().regions[0] != null);
 }

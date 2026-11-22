@@ -1496,8 +1496,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
 
-                // Smooth scroll: pick up the sub-row offset. Ignore it if the
-                // viewport has since snapped to the bottom (e.g. new output).
+                // If scroll-to-bottom on output is enabled, check if the final line
+                // changed by comparing the bottom-right pin. If the node pointer or
+                // y offset changed, new content was added to the screen.
+                // Update this BEFORE we update our render state so we can
+                // draw the new scrolled data immediately.
+                if (self.config.scroll_to_bottom_on_output) scroll: {
+                    const br = state.terminal.screens.active.pages.getBottomRight(.screen) orelse break :scroll;
+
+                    // If the pin hasn't changed, then don't scroll.
+                    if (self.last_bottom_node == @intFromPtr(br.node) and
+                        self.last_bottom_y == br.y) break :scroll;
+
+                    // Update tracked pin state for next frame
+                    self.last_bottom_node = @intFromPtr(br.node);
+                    self.last_bottom_y = br.y;
+
+                    // Scroll
+                    state.terminal.scrollViewport(.bottom);
+                }
+
+                // Smooth scroll: pick up the sub-row offset and regions. After the
+                // scroll to bottom above, so a viewport it just snapped there
+                // gets both this frame.
                 {
                     const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
@@ -1511,7 +1532,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.uniforms.smooth_no_overscan = 0;
                     var top_region = false;
                     var n: u32 = 0;
+                    // Regions are declared in active-screen rows. Scrolled
+                    // into history, those rows show other lines, so none
+                    // apply: a hidden row would blank whatever history line
+                    // passes it. The springs keep running in `state`.
+                    const at_active = state.terminal.screens.active.pages.viewport == .active;
                     for (state.smooth) |slot| {
+                        if (!at_active) break;
                         const s = slot orelse continue;
                         if (n == self.uniforms.smooth_rects.len) break;
                         self.uniforms.smooth_rects[n] = .{ s.top, s.bottom, s.left, s.right };
@@ -1524,7 +1551,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             // at its own row, not the one rebuilt into it.
                             const screen = state.terminal.screens.active;
                             const full = s.left == 0 and s.right + 1 >= state.terminal.cols;
-                            const cursor_in = screen.pages.viewport == .active and screen.cursor.y <= s.bottom;
+                            const cursor_in = screen.cursor.y <= s.bottom;
                             if (self.glide_map == null and s.glide > 0 and full and !cursor_in) {
                                 k = @intFromFloat(@min(@ceil(s.glide), renderer.State.Smooth.max_glide));
                                 self.glide_map = .{ .slot = n, .bottom = s.bottom, .k = k };
@@ -1551,26 +1578,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @max(state.scroll_offset_px, 0)
                 else
                     state.scroll_offset_px;
-
-                // If scroll-to-bottom on output is enabled, check if the final line
-                // changed by comparing the bottom-right pin. If the node pointer or
-                // y offset changed, new content was added to the screen.
-                // Update this BEFORE we update our render state so we can
-                // draw the new scrolled data immediately.
-                if (self.config.scroll_to_bottom_on_output) scroll: {
-                    const br = state.terminal.screens.active.pages.getBottomRight(.screen) orelse break :scroll;
-
-                    // If the pin hasn't changed, then don't scroll.
-                    if (self.last_bottom_node == @intFromPtr(br.node) and
-                        self.last_bottom_y == br.y) break :scroll;
-
-                    // Update tracked pin state for next frame
-                    self.last_bottom_node = @intFromPtr(br.node);
-                    self.last_bottom_y = br.y;
-
-                    // Scroll
-                    state.terminal.scrollViewport(.bottom);
-                }
 
                 // Advance any running Kitty graphics animations to the
                 // frame due now, and remember when the next frame is

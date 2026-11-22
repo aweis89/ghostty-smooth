@@ -3689,6 +3689,8 @@ pub fn scrollCallback(
         // App-declared smooth scroll region: precision scrolls over it
         // accumulate here and become one wheel event per whole row.
         if (scroll_mods.precision and yoff != 0 and self.isMouseReporting()) region: {
+            // Scrolled into history, the region's rows show other lines.
+            if (self.io.terminal.screens.active.pages.viewport != .active) break :region;
             const pos = try self.rt_surface.getCursorPos();
             const cell = self.posToViewport(pos.x, pos.y);
             const s = self.renderer_state.smoothAt(cell.x, cell.y) orelse break :region;
