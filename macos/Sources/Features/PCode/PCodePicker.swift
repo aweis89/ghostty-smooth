@@ -96,9 +96,14 @@ final class PCodePicker: ObservableObject {
     /// pcode closed the socket or it failed: the popup closes.
     var onClosed: (() -> Void)?
 
+    /// The terminal columns the widest shown row's guide and label take, when
+    /// some row has a detail to line up after them; nil when none has.
+    @Published private(set) var labelColumns: Int?
+
     weak var field: PCodePickField?
-    /// pcode's terminal font, read as the picker opens; nil for the system's.
-    var font: CTFont?
+    /// The theme last worked out, kept until the config, fonts or style change.
+    private var themeCache: (config: Ghostty.Config, fonts: PCodePickFonts?, style: PCodePickStyle?,
+                             theme: PCodePickTheme)?
     private var guides: [String] = []
     private var custom: NSRegularExpression?
     private var armed: (key: String, id: String)?
@@ -227,6 +232,9 @@ final class PCodePicker: ObservableObject {
                 guide: nested ? guides[index] : "", confirm: item.confirm))
         }
         rows = shown
+        labelColumns = shown.contains { !$0.detail.isEmpty }
+            ? shown.lazy.map { $0.label.count + PCodePickGuide.columns($0.guide) }.max()
+            : nil
         select(shown.firstIndex(where: { $0.id == previous }) ?? 0)
     }
 
@@ -354,6 +362,17 @@ final class PCodePicker: ObservableObject {
     }
 
     /// Give the search field the keyboard.
+    /// The theme for `config` and `fonts`, under the current list's style.
+    func theme(config: Ghostty.Config, fonts: PCodePickFonts?) -> PCodePickTheme {
+        let style = payload?.style
+        if let cache = themeCache, cache.config === config, cache.fonts == fonts, cache.style == style {
+            return cache.theme
+        }
+        let theme = PCodePickTheme(base: PCodePickTheme.Base(config), style: style, fonts: fonts)
+        themeCache = (config, fonts, style, theme)
+        return theme
+    }
+
     func focus() {
         guard let field, let window = field.window else { return }
         window.makeFirstResponder(field)
@@ -512,51 +531,21 @@ final class PCodePickField: NSTextField, NSTextFieldDelegate {
         return (editor.delegate as AnyObject?) === self
     }
 
-    /// The field editor's caret and selection colors (`apply(_:)`).
-    var caretColor: NSColor?
-    var selectionAttributes: [NSAttributedString.Key: Any] = [:]
-    /// The shared field editor's own colors, put back once we stop editing.
-    private var editorDefaults: (editor: NSTextView, caret: NSColor, selection: [NSAttributedString.Key: Any])?
+    /// The theme last applied (`apply(_:)`).
+    fileprivate var appliedTheme: PCodePickTheme?
+
+    override class var cellClass: AnyClass? {
+        get { PCodePickFieldCell.self }
+        set { super.cellClass = newValue }
+    }
+
+    /// This field's own field editor, never the window's shared one.
+    var editor: NSTextView? { (cell as? PCodePickFieldCell)?.editor }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // Mounted once the first list arrived: take the keyboard then.
         if window != nil { DispatchQueue.main.async { [weak self] in self?.picker?.focus() } }
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        let became = super.becomeFirstResponder()
-        // The window's shared field editor only now edits this field.
-        if became { styleEditor() }
-        return became
-    }
-
-    override func textDidEndEditing(_ notification: Notification) {
-        restoreEditor()
-        super.textDidEndEditing(notification)
-    }
-
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow == nil { restoreEditor() }
-        super.viewWillMove(toWindow: newWindow)
-    }
-
-    /// Color the field editor, if it is editing this field.
-    func styleEditor() {
-        guard let editor = currentEditor() as? NSTextView else { return }
-        if editorDefaults == nil {
-            editorDefaults = (editor, editor.insertionPointColor, editor.selectedTextAttributes)
-        }
-        if let caretColor { editor.insertionPointColor = caretColor }
-        if !selectionAttributes.isEmpty { editor.selectedTextAttributes = selectionAttributes }
-    }
-
-    /// The window's field editor is shared with its other fields: undo our colors.
-    private func restoreEditor() {
-        guard let defaults = editorDefaults else { return }
-        editorDefaults = nil
-        defaults.editor.insertionPointColor = defaults.caret
-        defaults.editor.selectedTextAttributes = defaults.selection
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -592,6 +581,18 @@ final class PCodePickField: NSTextField, NSTextFieldDelegate {
     }
 }
 
+/// The search field's cell: it edits with a field editor of its own, so the
+/// colors we give the caret and selection never reach the window's other fields.
+final class PCodePickFieldCell: NSTextFieldCell {
+    let editor: NSTextView = {
+        let editor = NSTextView()
+        editor.isFieldEditor = true
+        return editor
+    }()
+
+    override func fieldEditor(for controlView: NSView) -> NSTextView? { editor }
+}
+
 struct PCodePickFieldView: NSViewRepresentable {
     @ObservedObject var picker: PCodePicker
     let theme: PCodePickTheme
@@ -617,21 +618,77 @@ struct PCodePickFieldView: NSViewRepresentable {
 }
 
 extension PCodePickField {
-    /// The terminal's font and colors; the caret and selection follow the
-    /// foreground and the selected row, so both stay readable.
+    /// The terminal's font and colors; the caret follows the foreground and
+    /// the selection the selected row, so both stay readable.
     func apply(_ theme: PCodePickTheme) {
-        let font = theme.font ?? .systemFont(ofSize: 15)
+        guard theme != appliedTheme else { return }
+        appliedTheme = theme
+        let font = theme.fonts?.regular ?? .systemFont(ofSize: 15)
         let foreground = NSColor(theme.foreground)
-        if self.font != font { self.font = font }
-        if textColor != foreground { textColor = foreground }
+        self.font = font
+        textColor = foreground
         placeholderAttributedString = NSAttributedString(
             string: "Search", attributes: [.font: font, .foregroundColor: NSColor(theme.muted)])
-        caretColor = foreground
-        selectionAttributes = [
+        editor?.insertionPointColor = foreground
+        editor?.selectedTextAttributes = [
             .backgroundColor: theme.selectedBackground.nsColor,
             .foregroundColor: theme.selectedText.nsColor,
         ]
-        styleEditor()
+    }
+}
+
+// MARK: - Tree guides
+
+/// A row's tree guide (`PCodePickMatch.treeGuides`) drawn as lines, which
+/// run on through the row's padding into the rows above and below.
+struct PCodePickGuide: Shape {
+    enum Cell {
+        case blank, line, tee, elbow
+    }
+
+    /// Terminal columns per guide cell.
+    static let cellColumns = 2
+    /// The gap between rows, which a line crosses to meet the next row's.
+    static let rowGap: CGFloat = 1
+
+    let cells: [Cell]
+
+    init(_ guide: String) {
+        cells = Self.cells(guide)
+    }
+
+    /// The cells of a guide: three characters each (`├─ `, `└─ `, `│  `, `   `).
+    static func cells(_ guide: String) -> [Cell] {
+        let characters = Array(guide)
+        return stride(from: 0, to: characters.count, by: 3).map { start in
+            switch characters[start] {
+            case "├": .tee
+            case "└": .elbow
+            case "│": .line
+            default: .blank
+            }
+        }
+    }
+
+    static func columns(_ guide: String) -> Int {
+        (guide.count + 2) / 3 * cellColumns
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard !cells.isEmpty else { return path }
+        let width = rect.width / CGFloat(cells.count)
+        for (index, cell) in cells.enumerated() where cell != .blank {
+            let x = (rect.minX + width * (CGFloat(index) + 0.5)).rounded(.down) + 0.5
+            let bottom = cell == .elbow ? rect.midY : rect.maxY + Self.rowGap
+            path.move(to: CGPoint(x: x, y: rect.minY))
+            path.addLine(to: CGPoint(x: x, y: bottom))
+            if cell != .line {
+                path.move(to: CGPoint(x: x, y: rect.midY))
+                path.addLine(to: CGPoint(x: rect.minX + width * CGFloat(index + 1) - 2, y: rect.midY))
+            }
+        }
+        return path
     }
 }
 
@@ -641,14 +698,21 @@ extension PCodePickField {
 /// line for an action that asks first, and the keys it answers.
 struct PCodePickerView: View {
     @ObservedObject var picker: PCodePicker
-    /// The terminal's colors, from the config.
-    let base: PCodePickTheme.Base
+    /// The terminal's config, for its colors.
+    let config: Ghostty.Config
+    /// pcode's terminal font, if it could be read.
+    let fonts: PCodePickFonts?
 
     /// Rows PgUp/PgDn move by.
     static let pageRows = 10
+    /// The widest label column, in terminal columns, that details line up after.
+    static let maxLabelColumns = 40
+    /// A guide cell's width without the terminal font.
+    static let fallbackGuideCell: CGFloat = 14
+    static let rowPadding: CGFloat = 5
 
     var body: some View {
-        let theme = PCodePickTheme(base: base, style: picker.payload?.style, font: picker.font)
+        let theme = picker.theme(config: config, fonts: fonts)
         VStack(alignment: .leading, spacing: 0) {
             if let header = picker.payload?.header, !header.isEmpty {
                 Text(header)
@@ -689,11 +753,15 @@ struct PCodePickerView: View {
                 .foregroundStyle(theme.muted)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
+            // Details line up after the widest label, in the terminal's font.
+            let column = theme.fonts.flatMap { fonts in
+                picker.labelColumns.map { CGFloat(min($0, Self.maxLabelColumns)) * fonts.advance }
+            }
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
+                    LazyVStack(alignment: .leading, spacing: PCodePickGuide.rowGap) {
                         ForEach(Array(picker.rows.enumerated()), id: \.offset) { index, row in
-                            rowView(row, chosen: index == picker.selected, theme: theme)
+                            rowView(row, chosen: index == picker.selected, theme: theme, column: column)
                                 .id(index)
                                 .contentShape(Rectangle())
                                 .onTapGesture(count: 2) {
@@ -711,40 +779,49 @@ struct PCodePickerView: View {
         }
     }
 
-    private func rowView(_ row: PCodePicker.Row, chosen: Bool, theme: PCodePickTheme) -> some View {
+    private func rowView(
+        _ row: PCodePicker.Row, chosen: Bool, theme: PCodePickTheme, column: CGFloat?
+    ) -> some View {
         // The selected row's text is one readable color throughout.
         let text = chosen ? theme.selectedText.color : nil
-        return HStack(spacing: 8) {
-            if !row.guide.isEmpty {
-                Text(row.guide)
+        let cell = theme.fonts.map { $0.advance * CGFloat(PCodePickGuide.cellColumns) } ?? Self.fallbackGuideCell
+        let guide = PCodePickGuide(row.guide)
+        let guideWidth = cell * CGFloat(guide.cells.count)
+        return HStack(spacing: 0) {
+            if !guide.cells.isEmpty {
+                // Outside the row's vertical padding, so its lines meet the next row's.
+                guide
+                    .stroke(text ?? theme.muted, lineWidth: 1)
+                    .frame(width: guideWidth)
+            }
+            HStack(spacing: 8) {
+                Text(row.label)
                     .font(theme.labelFont(fallbackSize: 13))
-                    .foregroundStyle(text ?? theme.muted)
-            }
-            Text(row.label)
-                .font(theme.labelFont(fallbackSize: 13))
-                .foregroundStyle(text ?? theme.foreground)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .layoutPriority(1)
-            if !row.detail.isEmpty {
-                Text(row.detail)
-                    .font(theme.smallFont(fallbackSize: 12))
-                    .foregroundStyle(text.map { $0.opacity(0.8) } ?? theme.muted)
+                    .foregroundStyle(text ?? theme.foreground)
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
+                    .frame(width: column.map { max(0, $0 - guideWidth) }, alignment: .leading)
+                    .layoutPriority(1)
+                if !row.detail.isEmpty {
+                    Text(row.detail)
+                        .font(theme.smallFont(fallbackSize: 12))
+                        .foregroundStyle(text.map { $0.opacity(0.8) } ?? theme.muted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 8)
+                if !row.marker.isEmpty {
+                    Text(row.marker)
+                        .font(theme.smallFont(fallbackSize: 11, weight: .medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill((text ?? theme.badge).opacity(0.15)))
+                        .foregroundStyle(text ?? theme.badge)
+                }
             }
-            Spacer(minLength: 8)
-            if !row.marker.isEmpty {
-                Text(row.marker)
-                    .font(theme.smallFont(fallbackSize: 11, weight: .medium))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill((text ?? theme.badge).opacity(0.15)))
-                    .foregroundStyle(text ?? theme.badge)
-            }
+            .padding(.vertical, Self.rowPadding)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 5)
                 .fill(chosen ? theme.selectedBackground.color : Color.clear))

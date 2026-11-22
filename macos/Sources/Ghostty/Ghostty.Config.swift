@@ -479,19 +479,20 @@ extension Ghostty {
             colorValue("foreground") ?? Color(NSColor.textColor)
         }
 
-        /// The configured selection colors, or nil when unset or a
-        /// `cell-foreground`/`cell-background` reference.
-        var selectionBackground: Color? { colorValue("selection-background") }
-        var selectionForeground: Color? { colorValue("selection-foreground") }
-
-        /// The 256-color palette, or nil if the config can't be read.
-        var palette: [Color]? {
+        /// The palette's colors at `indexes` (0...255; others are skipped), or
+        /// nil if the config can't be read.
+        func palette(_ indexes: [Int]) -> [Int: Color]? {
             guard let config = self.config else { return nil }
             var v: ghostty_config_palette_s = .init()
             let key = "palette"
             guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
             return withUnsafeBytes(of: &v.colors) { raw in
-                raw.bindMemory(to: ghostty_config_color_s.self).map(Self.color)
+                let colors = raw.bindMemory(to: ghostty_config_color_s.self)
+                var result: [Int: Color] = [:]
+                for index in indexes where colors.indices.contains(index) {
+                    result[index] = Self.color(colors[index])
+                }
+                return result
             }
         }
 

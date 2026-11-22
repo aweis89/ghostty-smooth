@@ -51,6 +51,8 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         let token: String
         let layout: Layout
         let content: Content
+        /// pcode's terminal font as the popup opened, for its header and a picker.
+        let fonts: PCodePickFonts?
 
         /// The popup's terminal, unless it is a native picker.
         var surface: Ghostty.SurfaceView? {
@@ -192,7 +194,7 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
                 self.close()
             }
         }
-        slot = Slot(token: token, layout: layout, content: .terminal(surface))
+        slot = Slot(token: token, layout: layout, content: .terminal(surface), fonts: currentFonts())
     }
 
     // MARK: A native picker
@@ -200,11 +202,6 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     private func openPicker(token: String, layout: Layout) {
         close()
         let picker = PCodePicker()
-        // pcode's own terminal font, at its size now (zoom later isn't followed).
-        // The call hands us a copy we own (+1), so take it retained.
-        if let surface = surfaceView?.surface, let font = ghostty_surface_quicklook_font(surface) {
-            picker.font = Unmanaged<CTFont>.fromOpaque(font).takeRetainedValue()
-        }
         // Each list pcode sends: the first shows the picker (its search field
         // takes the keyboard as it mounts), and each titles the header.
         picker.onList = { [weak self, weak picker] title in
@@ -217,8 +214,13 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
             guard let self, let picker, self.slot?.picker === picker else { return }
             self.close()
         }
-        slot = Slot(token: token, layout: layout, content: .picker(picker))
+        slot = Slot(token: token, layout: layout, content: .picker(picker), fonts: currentFonts())
         picker.start(token: token)
+    }
+
+    /// pcode's own terminal font, at its size now (zoom later isn't followed).
+    private func currentFonts() -> PCodePickFonts? {
+        PCodePickFonts.of(surfaceView?.surface)
     }
 
     /// A title as pcode sends it: base64 UTF-8, shown as plain text on one line.
@@ -275,7 +277,7 @@ struct PCodePopupLayer: View {
                     let size = Self.size(slot.layout, in: geometry.size)
                     VStack(spacing: 0) {
                         if !popup.title.isEmpty {
-                            header(popup.title)
+                            header(popup.title, fonts: slot.fonts)
                         }
                         switch slot.content {
                         case .terminal(let surface):
@@ -286,7 +288,7 @@ struct PCodePopupLayer: View {
                         case .picker(let picker):
                             // Mounted once pcode sent its list, so its field takes the keyboard then.
                             if popup.ready {
-                                PCodePickerView(picker: picker, base: PCodePickTheme.Base(ghostty.config))
+                                PCodePickerView(picker: picker, config: ghostty.config, fonts: slot.fonts)
                                     .id(ObjectIdentifier(picker))
                                     .environment(\.colorScheme, colorScheme)
                             }
@@ -312,12 +314,12 @@ struct PCodePopupLayer: View {
         .allowsHitTesting(popup.ready)
     }
 
-    /// The popup's title above its terminal, in the system font, as secondary
-    /// text for the panel's own background rather than the system appearance.
-    private func header(_ title: String) -> some View {
+    /// The popup's title above its terminal, in pcode's terminal font (else
+    /// the system's), muted on the panel's own background.
+    private func header(_ title: String, fonts: PCodePickFonts?) -> some View {
         Text(title)
-            .font(.system(size: Self.headerFontSize, weight: .medium))
-            .foregroundStyle(.secondary)
+            .font(PCodePickFonts.small(fonts, fallbackSize: Self.headerFontSize, weight: .medium))
+            .foregroundStyle(ghostty.config.foregroundColor.opacity(PCodePickTheme.mutedOpacity))
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity)

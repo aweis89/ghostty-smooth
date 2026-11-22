@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Testing
 @testable import Ghostty
 
@@ -22,61 +23,85 @@ struct PCodePickStyleTests {
         #expect(PCodeRGB(hex: text) == nil)
     }
 
-    private struct List: Decodable {
-        let title: String
-        let style: PCodePickStyle?
-    }
+    // MARK: Decoding, through the picker's own list
 
-    private func decode(_ json: String) throws -> List {
-        try JSONDecoder().decode(List.self, from: Data(json.utf8))
+    /// A list as pcode sends it, with `style` as given (left out when nil).
+    private func list(style: String?) throws -> PCodePicker.Payload {
+        let styleField = style.map { #", "style": \#($0)"# } ?? ""
+        let json = ##"""
+        {"title": "t", "header": "", "empty": "", "query": "", "match": "fuzzy",
+         "items": [{"id": "a", "label": "A", "detail": "", "marker": "", "depth": 0, "search": ["a"], "confirm": ""}],
+         "actions": []\##(styleField)}
+        """##
+        return try JSONDecoder().decode(PCodePicker.Payload.self, from: Data(json.utf8))
     }
 
     @Test func styleAbsentOrNull() throws {
-        #expect(try decode(#"{"title": "t"}"#).style == nil)
-        #expect(try decode(#"{"title": "t", "style": null}"#).style == nil)
+        #expect(try list(style: nil).style == nil)
+        #expect(try list(style: "null").style == nil)
     }
 
     @Test func styleDecodes() throws {
-        let style = try decode(##"{"title": "t", "style": {"accent": "#ff0000", "selected": "#00ff00", "dim": "#0000ff", "new": "#123456"}}"##).style
+        let style = try list(style: ##"{"accent": "#ff0000", "selected": "#00ff00", "dim": "#0000ff", "new": "#123456"}"##).style
         #expect(style == PCodePickStyle(
             accent: PCodeRGB(red: 1, green: 0, blue: 0),
             selected: PCodeRGB(red: 0, green: 1, blue: 0),
             dim: PCodeRGB(red: 0, green: 0, blue: 1)))
     }
 
-    @Test(arguments: [##""red""##, "5", "[]", "true", ##"["#ff0000"]"##])
+    @Test(arguments: [#""red""#, "5", "[]", "true", ##"["#ff0000"]"##])
     func styleOfWrongTypeIsEmpty(_ value: String) throws {
-        let list = try decode(##"{"title": "t", "style": \##(value)}"##)
+        let list = try list(style: value)
         #expect(list.title == "t")
+        #expect(list.items.count == 1)
         #expect(list.style == PCodePickStyle())
     }
 
     @Test func badValuesAreIgnored() throws {
-        let style = try decode(##"{"title": "t", "style": {"accent": 3, "selected": "#zzzzzz", "dim": {"x": 1}}}"##).style
+        let style = try list(style: ##"{"accent": 3, "selected": "#zzzzzz", "dim": {"x": 1}}"##).style
         #expect(style == PCodePickStyle())
-        let partial = try decode(##"{"title": "t", "style": {"accent": "red", "dim": "#808080"}}"##).style
+        let partial = try list(style: ##"{"accent": "red", "dim": "#808080"}"##).style
         #expect(partial?.accent == nil)
         #expect(partial?.dim == PCodeRGB(hex: "#808080"))
+        let null = try list(style: ##"{"accent": null, "selected": "#000080"}"##).style
+        #expect(null == PCodePickStyle(selected: PCodeRGB(hex: "#000080")))
     }
 
+    // MARK: Colors
+
+    private static let cyan = PCodeRGB(hex: "#56d6e6")!
     private let dark = PCodePickTheme.Base(background: black, foreground: white)
+    private let light = PCodePickTheme.Base(background: white, foreground: PCodeRGB(hex: "#202020")!)
 
     @Test func contrastRatio() {
         #expect(abs(Self.black.contrast(with: Self.white) - 21) < 0.01)
         #expect(Self.white.contrast(with: Self.white) == 1)
     }
 
-    @Test func styleOverridesConfigSelection() {
-        var base = dark
-        base.selectionBackground = PCodeRGB(hex: "#444444")
-        base.selectionForeground = PCodeRGB(hex: "#eeeeee")
-        let config = PCodePickTheme.selection(base: base, style: nil)
-        #expect(config.background == PCodeRGB(hex: "#444444"))
-        #expect(config.text == PCodeRGB(hex: "#eeeeee"))
+    @Test func styleSetsTheSelectedRow() {
         let styled = PCodePickTheme.selection(
-            base: base, style: PCodePickStyle(accent: PCodeRGB(hex: "#ffff00"), selected: PCodeRGB(hex: "#000080")))
+            base: dark, style: PCodePickStyle(accent: PCodeRGB(hex: "#ffff00"), selected: PCodeRGB(hex: "#000080")))
         #expect(styled.background == PCodeRGB(hex: "#000080"))
         #expect(styled.text == PCodeRGB(hex: "#ffff00"))
+    }
+
+    @Test func noSelectedIsTheTerminalListsReverseCyan() {
+        var base = dark
+        base.palette = [6: Self.cyan]
+        let plain = PCodePickTheme.selection(base: base, style: nil)
+        #expect(plain.background == Self.cyan)
+        #expect(plain.text == Self.black)
+        let accented = PCodePickTheme.selection(base: base, style: PCodePickStyle(accent: PCodeRGB(hex: "#101040")))
+        #expect(accented.background == Self.cyan)
+        #expect(accented.text == PCodeRGB(hex: "#101040"))
+    }
+
+    @Test func selectedTooCloseToThePanelFallsBack() {
+        var base = dark
+        base.palette = [6: Self.cyan]
+        let almostBlack = PCodePickStyle(selected: PCodeRGB(hex: "#050505"))
+        #expect(PCodePickTheme.selection(base: base, style: almostBlack).background == Self.cyan)
+        #expect(PCodePickTheme.selection(base: dark, style: almostBlack).background == dark.background.mixed(with: dark.foreground, 0.22))
     }
 
     @Test func faintSelectedTextFallsBack() {
@@ -91,14 +116,28 @@ struct PCodePickStyleTests {
 
     @Test func unsetSelectionTintsTheForeground() {
         let selection = PCodePickTheme.selection(base: dark, style: nil)
-        #expect(selection.background != Self.black)
+        #expect(selection.background == dark.background.mixed(with: dark.foreground, 0.22))
         #expect(selection.text == Self.white)
         #expect(selection.text.contrast(with: selection.background) >= PCodePickTheme.minimumContrast)
     }
-}
 
-private extension PCodePickTheme.Base {
-    init(background: PCodeRGB, foreground: PCodeRGB) {
-        self.init(background: background, foreground: foreground, selectionBackground: nil, selectionForeground: nil, palette: nil)
+    @Test func lightBase() {
+        let tint = PCodePickTheme.selection(base: light, style: nil)
+        #expect(tint.text == light.foreground)
+        #expect(tint.text.contrast(with: tint.background) >= PCodePickTheme.minimumContrast)
+        var base = light
+        base.palette = [6: Self.cyan]
+        let cyan = PCodePickTheme.selection(base: base, style: nil)
+        #expect(cyan.background == Self.cyan)
+        // The panel's white is too faint on cyan: the dark foreground reads instead.
+        #expect(cyan.text == light.foreground)
+    }
+
+    @Test func dimNeedsContrastWithThePanel() {
+        let readable = PCodePickTheme.muted(base: dark, style: PCodePickStyle(dim: PCodeRGB(hex: "#808080")))
+        #expect(readable == PCodeRGB(hex: "#808080")!.color)
+        let faint = PCodePickTheme.muted(base: dark, style: PCodePickStyle(dim: PCodeRGB(hex: "#202020")))
+        #expect(faint == Self.white.color.opacity(PCodePickTheme.mutedOpacity))
+        #expect(PCodePickTheme.muted(base: dark, style: nil) == Self.white.color.opacity(PCodePickTheme.mutedOpacity))
     }
 }

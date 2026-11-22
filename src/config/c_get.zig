@@ -3,7 +3,6 @@ const std = @import("std");
 const key = @import("key.zig");
 const Config = @import("Config.zig");
 const Color = Config.Color;
-const TerminalColor = Config.TerminalColor;
 const Key = key.Key;
 const Value = key.Value;
 
@@ -51,13 +50,6 @@ fn getValue(ptr_raw: *anyopaque, value: anytype) bool {
         f32, f64 => |Float| {
             const ptr: *Float = @ptrCast(@alignCast(ptr_raw));
             ptr.* = @floatCast(value);
-        },
-
-        // A concrete color reads as a color. `cell-foreground` and
-        // `cell-background` depend on the cell, so they read as unset.
-        TerminalColor => switch (value) {
-            .color => |color| return getValue(ptr_raw, color),
-            .@"cell-foreground", .@"cell-background" => return false,
         },
 
         else => |T| switch (@typeInfo(T)) {
@@ -190,48 +182,6 @@ test "c_get: optional" {
         try testing.expectEqual(0, cval.g);
         try testing.expectEqual(0, cval.b);
     }
-}
-
-test "c_get: terminal color" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var c = try Config.default(alloc);
-    defer c.deinit();
-
-    {
-        c.@"selection-background" = null;
-        var cval: Color.C = undefined;
-        try testing.expect(!get(&c, .@"selection-background", @ptrCast(&cval)));
-    }
-    {
-        c.@"selection-background" = .@"cell-foreground";
-        var cval: Color.C = undefined;
-        try testing.expect(!get(&c, .@"selection-background", @ptrCast(&cval)));
-    }
-    {
-        c.@"selection-background" = .{ .color = .{ .r = 1, .g = 2, .b = 3 } };
-        var cval: Color.C = undefined;
-        try testing.expect(get(&c, .@"selection-background", @ptrCast(&cval)));
-        try testing.expectEqual(1, cval.r);
-        try testing.expectEqual(2, cval.g);
-        try testing.expectEqual(3, cval.b);
-    }
-}
-
-test "c_get: palette" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var c = try Config.default(alloc);
-    defer c.deinit();
-    c.palette.value[3] = .{ .r = 9, .g = 8, .b = 7 };
-
-    var cval: Config.Palette.C = undefined;
-    try testing.expect(get(&c, .palette, @ptrCast(&cval)));
-    try testing.expectEqual(9, cval.colors[3].r);
-    try testing.expectEqual(8, cval.colors[3].g);
-    try testing.expectEqual(7, cval.colors[3].b);
 }
 
 test "c_get: background-blur" {

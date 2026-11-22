@@ -1,5 +1,6 @@
 import AppKit
 import CoreText
+import GhosttyKit
 import SwiftUI
 
 /// An opaque sRGB color, 0...1 per channel: what the picker's colors are
@@ -102,20 +103,52 @@ struct PCodePickStyle: Decodable, Equatable {
     }
 }
 
+/// pcode's terminal font, read from its surface as a popup opens, and the
+/// same family smaller for secondary text.
+struct PCodePickFonts: Equatable {
+    static let smallScale = 0.85
+
+    let regular: NSFont
+    let small: NSFont
+    /// One terminal column.
+    let advance: CGFloat
+
+    init(_ font: CTFont) {
+        regular = font as NSFont
+        small = CTFontCreateCopyWithAttributes(font, CTFontGetSize(font) * Self.smallScale, nil, nil) as NSFont
+        advance = ("M" as NSString).size(withAttributes: [.font: regular]).width
+    }
+
+    /// The font `ghostty_surface_quicklook_font` gives for `surface`, if any.
+    static func of(_ surface: ghostty_surface_t?) -> PCodePickFonts? {
+        guard let surface, let raw = ghostty_surface_quicklook_font(surface) else { return nil }
+        // The call hands us a copy we own (+1), so take it retained.
+        return PCodePickFonts(Unmanaged<CTFont>.fromOpaque(raw).takeRetainedValue())
+    }
+
+    static func small(_ fonts: PCodePickFonts?, fallbackSize: CGFloat, weight: Font.Weight = .regular) -> Font {
+        fonts.map { Font($0.small as CTFont).weight(weight) } ?? .system(size: fallbackSize, weight: weight)
+    }
+}
+
 /// The picker's colors and fonts: the terminal's, with pcode's style on top.
-struct PCodePickTheme {
+struct PCodePickTheme: Equatable {
     /// Below this contrast the selected row's text falls back to the terminal's.
     static let minimumContrast = 3.0
+    /// pcode's `selected` must stand out this much from the panel to be used.
+    static let minimumSelectedContrast = 1.15
     static let mutedOpacity = 0.6
-    static let smallScale = 0.85
+    /// Palette entries the picker uses: yellows for the status line, blues
+    /// and cyans for badges, and cyan for the selected row.
+    static let paletteIndexes = [3, 11, 4, 12, 6, 14]
+    static let cyan = 6
 
     /// The terminal's colors, as the config has them.
     struct Base: Equatable {
         var background: PCodeRGB
         var foreground: PCodeRGB
-        var selectionBackground: PCodeRGB?
-        var selectionForeground: PCodeRGB?
-        var palette: [PCodeRGB]?
+        /// Only `paletteIndexes`; empty if the config can't be read.
+        var palette: [Int: PCodeRGB] = [:]
     }
 
     var foreground: Color
@@ -127,31 +160,39 @@ struct PCodePickTheme {
     var status: Color
     /// A row's marker badge.
     var badge: Color
-    /// pcode's terminal font: labels and the search field.
-    var font: NSFont?
-    /// Its family at `smallScale`.
-    var smallFont: NSFont?
+    var fonts: PCodePickFonts?
 
-    init(base: Base, style: PCodePickStyle?, font: CTFont?) {
+    init(base: Base, style: PCodePickStyle?, fonts: PCodePickFonts?) {
         foreground = base.foreground.color
-        muted = style?.dim?.color ?? base.foreground.color.opacity(Self.mutedOpacity)
+        muted = Self.muted(base: base, style: style)
         let selection = Self.selection(base: base, style: style)
         selectedBackground = selection.background
         selectedText = selection.text
         status = Self.pick([3, 11], from: base).map(\.color) ?? .orange
         badge = Self.pick([4, 12, 6, 14], from: base).map(\.color) ?? base.foreground.color.opacity(Self.mutedOpacity)
-        if let font {
-            self.font = font as NSFont
-            smallFont = CTFontCreateCopyWithAttributes(font, CTFontGetSize(font) * Self.smallScale, nil, nil) as NSFont
-        }
+        self.fonts = fonts
     }
 
-    /// The selected row's colors: pcode's, else the config's selection, else a
-    /// tint of the foreground; its text kept readable on its background.
+    /// pcode's `dim` if it reads on the panel, else the faded foreground.
+    static func muted(base: Base, style: PCodePickStyle?) -> Color {
+        if let dim = style?.dim, dim.contrast(with: base.background) >= minimumContrast { return dim.color }
+        return base.foreground.color.opacity(mutedOpacity)
+    }
+
+    /// The selected row's colors, its text kept readable on its background:
+    /// pcode's `selected` if it stands out from the panel; else the terminal
+    /// list's own look (`reverse ansicyan`), palette cyan behind the panel's
+    /// background color; else, without a palette, a tint of the foreground.
     static func selection(base: Base, style: PCodePickStyle?) -> (background: PCodeRGB, text: PCodeRGB) {
-        let background = style?.selected ?? base.selectionBackground
-            ?? base.background.mixed(with: base.foreground, 0.22)
-        let text = style?.accent ?? base.selectionForeground ?? base.foreground
+        let background: PCodeRGB
+        let text: PCodeRGB
+        if let selected = style?.selected, selected.contrast(with: base.background) >= minimumSelectedContrast {
+            (background, text) = (selected, style?.accent ?? base.foreground)
+        } else if let cyan = base.palette[Self.cyan] {
+            (background, text) = (cyan, style?.accent ?? base.background)
+        } else {
+            (background, text) = (base.background.mixed(with: base.foreground, 0.22), style?.accent ?? base.foreground)
+        }
         return (background, readable(text, on: background, base: base))
     }
 
@@ -165,30 +206,25 @@ struct PCodePickTheme {
 
     /// Of the palette's `indexes`, the one that stands out most on the background.
     private static func pick(_ indexes: [Int], from base: Base) -> PCodeRGB? {
-        guard let palette = base.palette else { return nil }
-        return indexes.filter(palette.indices.contains).map { palette[$0] }
+        indexes.compactMap { base.palette[$0] }
             .max { $0.contrast(with: base.background) < $1.contrast(with: base.background) }
     }
 
     func labelFont(fallbackSize: CGFloat) -> Font {
-        font.map { Font($0 as CTFont) } ?? .system(size: fallbackSize)
+        fonts.map { Font($0.regular as CTFont) } ?? .system(size: fallbackSize)
     }
 
     func smallFont(fallbackSize: CGFloat, weight: Font.Weight = .regular) -> Font {
-        smallFont.map { Font($0 as CTFont).weight(weight) } ?? .system(size: fallbackSize, weight: weight)
+        PCodePickFonts.small(fonts, fallbackSize: fallbackSize, weight: weight)
     }
 }
 
 extension PCodePickTheme.Base {
     /// The terminal's colors from `config`.
     init(_ config: Ghostty.Config) {
-        // All 256 or none: a gap would shift the indexes.
-        let palette = config.palette?.compactMap { PCodeRGB($0) }
         self.init(
             background: PCodeRGB(config.backgroundColor) ?? PCodeRGB(red: 0, green: 0, blue: 0),
             foreground: PCodeRGB(config.foregroundColor) ?? PCodeRGB(red: 1, green: 1, blue: 1),
-            selectionBackground: config.selectionBackground.flatMap { PCodeRGB($0) },
-            selectionForeground: config.selectionForeground.flatMap { PCodeRGB($0) },
-            palette: palette?.count == 256 ? palette : nil)
+            palette: (config.palette(PCodePickTheme.paletteIndexes) ?? [:]).compactMapValues { PCodeRGB($0) })
     }
 }
