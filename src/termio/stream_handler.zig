@@ -568,9 +568,20 @@ pub const StreamHandler = struct {
                     .reveal => |*r| {
                         r.at = smooth_now;
                         const screen = self.terminal.screens.active;
-                        if (screen.pages.getTopLeft(.active).down(r.top)) |start_pin| {
+                        const active_top = screen.pages.getTopLeft(.active);
+                        var start_idx: usize = 0;
+                        const start_pin_opt: ?terminal.PageList.Pin = if (r.top >= 0)
+                            active_top.down(@intCast(r.top))
+                        else switch (active_top.upOverflow(@intCast(-r.top))) {
+                            .offset => |p| p,
+                            .overflow => |o| blk: {
+                                start_idx = o.remaining;
+                                break :blk o.end;
+                            },
+                        };
+                        if (start_pin_opt) |start_pin| {
                             var pin: ?terminal.PageList.Pin = start_pin;
-                            for (0..r.count) |row_idx| {
+                            for (start_idx..r.count) |row_idx| {
                                 const p = pin orelse break;
                                 const cells = p.cells(.all);
                                 var first: u16 = 0;

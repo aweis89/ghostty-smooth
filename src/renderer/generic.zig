@@ -1170,6 +1170,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.uniforms.smooth_reveal_region = -1;
             self.uniforms.smooth_reveal_mode = 0;
             self.uniforms.smooth_reveal_active_row = 0;
+            self.uniforms.smooth_reveal_active_end_row = -1;
             self.uniforms.smooth_reveal_end_row = -1;
             self.uniforms.smooth_reveal_pos_px = 0;
             self.uniforms.smooth_reveal_feather_px = 0;
@@ -1189,13 +1190,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.uniforms.smooth_reveal_mode = @intFromEnum(r.mode);
                     const pad_top = self.uniforms.grid_padding[0];
                     const pad_left = self.uniforms.grid_padding[3];
+                    const active_end_row = r.start_row + @as(i32, r.count) - 1 + k_off;
                     switch (r.mode) {
                         .none => {},
                         .sweep => {
                             self.uniforms.smooth_reveal_active_row =
                                 r.start_row + @as(i32, r.active_idx) + k_off;
-                            self.uniforms.smooth_reveal_end_row =
-                                r.start_row + @as(i32, r.count) - 1 + k_off;
+                            self.uniforms.smooth_reveal_active_end_row = active_end_row;
+                            self.uniforms.smooth_reveal_end_row = r.maxEndRow() + k_off;
                             const ox = if (self.uniforms.smooth_offsets_x[i] >= 0)
                                 self.uniforms.smooth_offsets_x[i]
                             else
@@ -1206,8 +1208,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                         .curtain => {
                             self.uniforms.smooth_reveal_active_row = r.start_row + k_off;
-                            self.uniforms.smooth_reveal_end_row =
-                                r.start_row + @as(i32, r.count) - 1 + k_off;
+                            self.uniforms.smooth_reveal_active_end_row = active_end_row;
+                            self.uniforms.smooth_reveal_end_row = r.maxEndRow() + k_off;
                             self.uniforms.smooth_reveal_pos_px = pad_top +
                                 (@as(f32, @floatFromInt(r.start_row + k_off)) + r.pos) * cell_h -
                                 self.uniforms.smooth_offsets[i];

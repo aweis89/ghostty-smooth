@@ -33,6 +33,7 @@ struct Uniforms {
   int smooth_reveal_region;
   uint smooth_reveal_mode;
   int smooth_reveal_active_row;
+  int smooth_reveal_active_end_row;
   int smooth_reveal_end_row;
   float smooth_reveal_pos_px;
   float smooth_reveal_feather_px;
@@ -537,8 +538,12 @@ fragment float4 cell_bg_fragment(
           );
         }
       } else if (uniforms.smooth_reveal_mode == 2u) {
-        if (grid_pos.y >= uniforms.smooth_reveal_active_row &&
+        if (grid_pos.y > uniforms.smooth_reveal_active_end_row &&
             grid_pos.y <= uniforms.smooth_reveal_end_row) {
+          return bg;
+        }
+        if (grid_pos.y >= uniforms.smooth_reveal_active_row &&
+            grid_pos.y <= uniforms.smooth_reveal_active_end_row) {
           reveal_alpha *= 1.0 - smoothstep(
             uniforms.smooth_reveal_pos_px - f,
             uniforms.smooth_reveal_pos_px,
@@ -710,7 +715,9 @@ vertex CellTextVertexOut cell_text_vertex(
           out.reveal_kind = 1;
         }
       } else if (uniforms.smooth_reveal_mode == 2u) {
-        if (gy >= uniforms.smooth_reveal_active_row && gy <= uniforms.smooth_reveal_end_row) {
+        if (gy > uniforms.smooth_reveal_active_end_row && gy <= uniforms.smooth_reveal_end_row) {
+          out.reveal_kind = -1;
+        } else if (gy >= uniforms.smooth_reveal_active_row && gy <= uniforms.smooth_reveal_active_end_row) {
           out.reveal_kind = 2;
         }
       }
