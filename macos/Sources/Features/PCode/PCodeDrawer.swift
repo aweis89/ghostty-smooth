@@ -48,7 +48,9 @@ final class PCodeDrawer: NSObject, ObservableObject {
 
     /// From the viewer in the drawer's own terminal: only asking for the keyboard to go back.
     func handleFromViewer(_ payload: String) {
-        if payload == "focus" { focusTerminal() }
+        // Only while the drawer has the keyboard: anything else that prints
+        // the sequence there must not pull focus from another split.
+        if payload == "focus" && viewerHasFocus { focusTerminal() }
     }
 
     private static func valid(_ value: String, length: ClosedRange<Int>, hex: Bool = false) -> Bool {
@@ -98,7 +100,11 @@ final class PCodeDrawer: NSObject, ObservableObject {
         // No window controller owns this one, so the drawer closes instead.
         closeObserver = NotificationCenter.default.addObserver(
             forName: Ghostty.Notification.ghosttyCloseSurface, object: next, queue: .main
-        ) { [weak self] _ in self?.close() }
+        ) { [weak self] _ in
+            // After the notification, not inside the callback that posted it,
+            // which is still using the surface this frees.
+            DispatchQueue.main.async { self?.close() }
+        }
     }
 
     private func makeViewer(host: String, thread: String) -> Ghostty.SurfaceView? {
@@ -108,6 +114,8 @@ final class PCodeDrawer: NSObject, ObservableObject {
         var config = Ghostty.SurfaceConfiguration(
             from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_SPLIT))
         config.command = Self.viewerCommand(host: host, thread: thread)
+        // Not the pane's directory: nothing from a checkout is near the viewer.
+        config.workingDirectory = NSHomeDirectory()
         config.initialInput = nil
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
@@ -126,8 +134,10 @@ final class PCodeDrawer: NSObject, ObservableObject {
         // The embedded API always runs a surface's command in a shell, as
         // `bash -c "exec -l <command>"` (`embedded.zig`, `Exec.zig`). `-l`
         // puts a dash before argv[0], and a venv's Python finds its venv from
-        // argv[0], so `env` starts it with a plain one. The ids are plain by now.
-        return "/usr/bin/env \(shellQuoted(python)) -m pcode.btw_tail \(host) \(thread)"
+        // argv[0], so `env` starts it with a plain one. `-I` keeps the
+        // directory, user site and PYTHON* variables out of its imports.
+        // The ids are plain by now.
+        return "/usr/bin/env \(shellQuoted(python)) -I -m pcode.btw_tail \(host) \(thread)"
     }
 
     private static func shellQuoted(_ text: String) -> String {
@@ -136,12 +146,19 @@ final class PCodeDrawer: NSObject, ObservableObject {
 
     /// `python` from a host entry this user owns, if it names an executable at a plain path.
     private static func hostPython(_ path: String) -> String? {
+        // Opened without following a link, then checked: what is checked is what is read.
+        let fd = open(path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var info = stat()
-        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
-              let data = FileManager.default.contents(atPath: path),
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
+              info.st_size < 1 << 20,
+              let data = try? handle.readToEnd(),
               let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let python = entry["python"] as? String,
               python.hasPrefix("/"),
+              // `env` would take a word with `=` for a variable to set.
+              !python.contains("="),
               !python.contains(where: { $0.asciiValue.map { $0 < 0x20 } ?? false }),
               FileManager.default.isExecutableFile(atPath: python) else { return nil }
         return python
