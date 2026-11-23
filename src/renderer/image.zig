@@ -109,6 +109,12 @@ pub const State = struct {
         overlay,
     };
 
+    /// A batch glide's row remap (the renderer's `glide_map`): rows
+    /// `0..=bottom` are built from `k` rows higher up, and the region's
+    /// smooth offset includes `k` rows to cancel that. Images are not
+    /// remapped, so they take those `k` rows back.
+    pub const GlideShift = struct { bottom: u16, k: u16 };
+
     /// Draw the given named set of placements.
     ///
     /// Any placements that have non-uploaded images are ignored. Any
@@ -119,6 +125,7 @@ pub const State = struct {
         pipeline: GraphicsAPI.Pipeline,
         pass: *GraphicsAPI.RenderPass,
         placement_type: DrawPlacements,
+        glide: ?GlideShift,
     ) void {
         const placements: []const Placement = switch (placement_type) {
             .kitty_below_bg => self.kitty_placements.items[0..self.kitty_bg_end],
@@ -175,6 +182,10 @@ pub const State = struct {
                     // Kitty images glide with smooth scroll regions like
                     // the text around them; the debug overlay is fixed.
                     .smooth = @intFromBool(placement_type != .overlay),
+                    .glide_rows = if (glide) |g|
+                        (if (p.y >= 0 and p.y <= g.bottom) @floatFromInt(g.k) else 0)
+                    else
+                        0,
                 }},
             ) catch |err| {
                 log.warn("error creating image vertex buffer err={}", .{err});

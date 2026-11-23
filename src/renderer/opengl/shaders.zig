@@ -268,6 +268,7 @@ pub const Image = extern struct {
     /// Nonzero when the image follows smooth scroll regions (Metal only;
     /// the GLSL shaders have no smooth scroll support).
     smooth: u32 align(4) = 0,
+    glide_rows: f32 align(4) = 0,
 };
 
 /// Single parameter for the bg image shader.

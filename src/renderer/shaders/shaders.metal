@@ -954,6 +954,10 @@ struct ImageVertexIn {
   // Nonzero when the image follows smooth scroll regions (Kitty
   // placements); zero for grid-fixed images like the debug overlay.
   uint smooth [[attribute(4)]];
+
+  // Rows of a batch glide's remap shift (included in smooth_offsets) to
+  // undo: text rows are rebuilt that far down to cancel it, images aren't.
+  float glide_rows [[attribute(5)]];
 };
 
 struct ImageVertexOut {
@@ -1011,7 +1015,7 @@ vertex ImageVertexOut image_vertex(
   if (region >= 0) {
     float4 r = float4(uniforms.smooth_rects[region]);
     float ox = uniforms.smooth_offsets_x[region];
-    image_pos.y -= uniforms.smooth_offsets[region];
+    image_pos.y -= uniforms.smooth_offsets[region] - in.glide_rows * uniforms.cell_size.y;
     float right = r.w + 1;
     if (ox >= 0.0) {
       image_pos.x -= ox;

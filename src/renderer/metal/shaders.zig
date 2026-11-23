@@ -331,6 +331,8 @@ pub const Image = extern struct {
     dest_size: [2]f32,
     /// Nonzero when the image follows smooth scroll regions.
     smooth: u32 = 0,
+    /// Rows of a batch glide's remap shift to undo (see image.GlideShift).
+    glide_rows: f32 = 0,
 };
 
 /// Single parameter for the bg image shader.

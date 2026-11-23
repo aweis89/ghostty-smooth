@@ -2166,6 +2166,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }});
                 defer pass.complete();
 
+                // Kitty images undo a batch glide's row remap themselves.
+                const glide: ?ImageState.GlideShift = if (self.glide_map) |m|
+                    .{ .bottom = m.bottom, .k = m.k }
+                else
+                    null;
+
                 // First we draw our background image, if we have one.
                 // The bg image shader also draws the main bg color.
                 //
@@ -2202,6 +2208,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .kitty_below_bg,
+                    glide,
                 );
 
                 // Then we draw any opaque cell backgrounds.
@@ -2218,6 +2225,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .kitty_below_text,
+                    glide,
                 );
 
                 // Text.
@@ -2245,6 +2253,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .kitty_above_text,
+                    glide,
                 );
 
                 // Debug overlay. We do this before any custom shader state
@@ -2254,6 +2263,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .overlay,
+                    null,
                 );
             }
 
