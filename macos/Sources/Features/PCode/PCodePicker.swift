@@ -388,6 +388,12 @@ extension PCodePicker {
         private var fd: Int32 = -1
         private var closed = false
         private let writes = DispatchQueue(label: "pcode.pick.write")
+        /// What we say once connected: a picker's, or a completion list's.
+        private let hello: Data
+
+        init(hello: Data = PCodePicker.hello) {
+            self.hello = hello
+        }
 
         func start(
             path: String,
@@ -474,7 +480,7 @@ extension PCodePicker {
                 return false
             }
             fd = socketFD
-            return Self.writeAll(socketFD, PCodePicker.hello)
+            return Self.writeAll(socketFD, hello)
         }
 
         private func readLines(_ onLine: @escaping (Data) -> Void) {

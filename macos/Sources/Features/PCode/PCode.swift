@@ -133,6 +133,7 @@ protocol PCodeOverlayOwner: AnyObject {
 
 private var pcodeDrawerKey: UInt8 = 0
 private var pcodePopupKey: UInt8 = 0
+private var pcodeCompletionKey: UInt8 = 0
 private var pcodeOwnerKey: UInt8 = 0
 private var pcodeSessionKey: UInt8 = 0
 
@@ -159,6 +160,16 @@ extension Ghostty.SurfaceView {
         let popup = PCodePopup(surfaceView: self)
         objc_setAssociatedObject(self, &pcodePopupKey, popup, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return popup
+    }
+
+    /// This surface's native completion list for pcode, made the first time it is asked for.
+    var pcodeCompletion: PCodeCompletion {
+        if let completion = objc_getAssociatedObject(self, &pcodeCompletionKey) as? PCodeCompletion {
+            return completion
+        }
+        let completion = PCodeCompletion(surfaceView: self)
+        objc_setAssociatedObject(self, &pcodeCompletionKey, completion, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return completion
     }
 
     private var existingPCodePopup: PCodePopup? {
@@ -222,6 +233,8 @@ extension Ghostty.SurfaceView {
             pcodeSession = Self.pcodeResumeInput(id) == nil ? nil : id
         case "popup", "pick", "popup-close":
             pcodePopup.handle(payload)
+        case "complete":
+            pcodeCompletion.handle(payload)
         default:
             pcodeDrawer.handle(payload)
         }

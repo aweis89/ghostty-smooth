@@ -10,8 +10,9 @@ import SwiftUI
 /// keyboard. Or, for a pick list, pcode sends only the list and we draw it
 /// natively (`PCodePicker`). APCs (protocol 2, see `PCode`):
 ///
-/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;2`:
-///   1 was terminal popups only, 2 adds native pick lists.
+/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;3`:
+///   1 was terminal popups only, 2 adds native pick lists, 3 the native
+///   completion list (`PCodeCompletion`).
 /// - `pcode;popup;<token>;<layout>`, from the terminal: open a popup, replacing
 ///   any open one. `token` is 16 lowercase hex digits, `layout` is `sheet` or
 ///   `wide`. Its interpreter is `python` in
