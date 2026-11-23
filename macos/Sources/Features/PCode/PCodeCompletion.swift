@@ -89,15 +89,29 @@ final class PCodeCompletion: ObservableObject {
         }
         // A menu we cannot read (a newer pcode) is hidden rather than half shown.
         menu = try? JSONDecoder().decode(Menu.self, from: line)
+        guard menu != nil else { return }
+        // The cursor is read as the list is laid out, but pcode's frame comes
+        // over the pty, parsed on another thread, and may land just after this
+        // menu: place the list again a frame later.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.replaceDelay) { [weak self] in
+            guard let self, self.menu != nil else { return }
+            self.objectWillChange.send()
+        }
     }
+
+    static let replaceDelay: TimeInterval = 0.03
 
     /// A row was clicked: pcode takes it, as Enter on it would.
     func accept(_ row: Int) {
+        restoreFocus()
         guard let menu, let connection, menu.items.indices.contains(row),
               let data = try? JSONSerialization.data(withJSONObject: ["accept": row, "seq": menu.seq])
         else { return }
         connection.send(data + Data([0x0A]))
-        // The click must not leave the keyboard anywhere but pcode's terminal.
+    }
+
+    /// A click anywhere on the list must leave the keyboard with pcode's terminal.
+    func restoreFocus() {
         if let surfaceView, surfaceView.window?.firstResponder !== surfaceView {
             Ghostty.moveFocus(to: surfaceView)
         }
@@ -146,7 +160,11 @@ struct PCodeCompletionLayer: View {
             if let menu = completion.menu, !menu.items.isEmpty, let cursor = completion.cursorCell() {
                 let fonts = PCodePickFonts.of(completion.surfaceView?.surface)
                 let theme = completion.theme(config: ghostty.config, fonts: fonts)
-                let frame = Self.frame(menu, cursor: cursor, fonts: fonts, in: geometry.size)
+                // The terminal's own size: with the inspector open, the layer is wider.
+                let bounds = completion.surfaceView?.bounds.size ?? geometry.size
+                let size = CGSize(
+                    width: min(geometry.size.width, bounds.width), height: min(geometry.size.height, bounds.height))
+                let frame = Self.frame(menu, cursor: cursor, fonts: fonts, in: size)
                 list(menu, theme: theme, rowHeight: Self.rowHeight(cursor: cursor))
                     .frame(width: frame.width, height: frame.height)
                     .background(ghostty.config.backgroundColor)
@@ -155,6 +173,7 @@ struct PCodeCompletionLayer: View {
                         RoundedRectangle(cornerRadius: Self.cornerRadius)
                             .strokeBorder(ghostty.config.splitDividerColor, lineWidth: 1))
                     .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 4)
+                    .simultaneousGesture(TapGesture().onEnded { completion.restoreFocus() })
                     .environment(\.colorScheme, colorScheme)
                     .offset(x: frame.minX, y: frame.minY)
             }
