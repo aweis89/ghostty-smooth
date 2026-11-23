@@ -606,6 +606,7 @@ struct PCodePickFieldView: NSViewRepresentable {
         field.focusRingType = .none
         field.cell?.usesSingleLineMode = true
         field.cell?.lineBreakMode = .byTruncatingTail
+        field.apply(theme)
         picker.field = field
         return field
     }
@@ -627,8 +628,6 @@ extension PCodePickField {
         let foreground = NSColor(theme.foreground)
         self.font = font
         textColor = foreground
-        placeholderAttributedString = NSAttributedString(
-            string: "Search", attributes: [.font: font, .foregroundColor: NSColor(theme.muted)])
         editor?.insertionPointColor = foreground
         editor?.selectedTextAttributes = [
             .backgroundColor: theme.selectedBackground.nsColor,
@@ -724,7 +723,20 @@ struct PCodePickerView: View {
             }
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(theme.muted)
-                PCodePickFieldView(picker: picker, theme: theme)
+                ZStack(alignment: .leading) {
+                    // Drawn in SwiftUI rather than NSTextField's placeholder so it
+                    // centers with the icon and leaves a space after the caret.
+                    if picker.query.isEmpty {
+                        Text("Search")
+                            .font(theme.labelFont(fallbackSize: 15))
+                            .foregroundStyle(theme.muted)
+                            .padding(.leading, 2 + (theme.fonts?.advance ?? 8))
+                            .allowsHitTesting(false)
+                    }
+                    PCodePickFieldView(picker: picker, theme: theme)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
