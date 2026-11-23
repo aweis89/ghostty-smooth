@@ -38,9 +38,10 @@ extension Ghostty {
                     })
                 }
             }
-            // pcode's completion list over the terminal, and its popup over all of it,
-            // with or without the inspector.
+            // pcode's completion list and toast over the terminal, and its popup
+            // over all of it, with or without the inspector.
             .overlay { PCodeCompletionLayer(completion: surfaceView.pcodeCompletion) }
+            .overlay { PCodeToastLayer(toast: surfaceView.pcodeToast) }
             .overlay { PCodePopupLayer(popup: surfaceView.pcodePopup) }
             .onReceive(pubInspector) { onControlInspector($0) }
             .onChange(of: surfaceView.inspectorVisible) { inspectorVisible in

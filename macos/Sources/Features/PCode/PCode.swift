@@ -135,6 +135,7 @@ protocol PCodeOverlayOwner: AnyObject {
 private var pcodeDrawerKey: UInt8 = 0
 private var pcodePopupKey: UInt8 = 0
 private var pcodeCompletionKey: UInt8 = 0
+private var pcodeToastKey: UInt8 = 0
 private var pcodeOwnerKey: UInt8 = 0
 private var pcodeSessionKey: UInt8 = 0
 
@@ -171,6 +172,16 @@ extension Ghostty.SurfaceView {
         let completion = PCodeCompletion(surfaceView: self)
         objc_setAssociatedObject(self, &pcodeCompletionKey, completion, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return completion
+    }
+
+    /// This surface's toast for pcode's confirmations, made the first time it is asked for.
+    var pcodeToast: PCodeToast {
+        if let toast = objc_getAssociatedObject(self, &pcodeToastKey) as? PCodeToast {
+            return toast
+        }
+        let toast = PCodeToast(surfaceView: self)
+        objc_setAssociatedObject(self, &pcodeToastKey, toast, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return toast
     }
 
     private var existingPCodePopup: PCodePopup? {
@@ -236,6 +247,8 @@ extension Ghostty.SurfaceView {
             pcodePopup.handle(payload)
         case "complete":
             pcodeCompletion.handle(payload)
+        case "toast":
+            pcodeToast.handle(payload)
         default:
             pcodeDrawer.handle(payload)
         }

@@ -541,9 +541,10 @@ pub const StreamHandler = struct {
                     // tell a drawer-only build from one with popups: 1 has
                     // terminal popups, 2 native pick lists too, 3 a native
                     // completion list for the editor as well, 4 native key
-                    // hint footers below popups and the drawer.
+                    // hint footers below popups and the drawer, 5 toasts for
+                    // pcode's brief confirmations (`PCodeToast`).
                     if (std.mem.eql(u8, payload, "popup?")) {
-                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;4\x1b\\" });
+                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;5\x1b\\" });
                         return;
                     }
                     if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {
