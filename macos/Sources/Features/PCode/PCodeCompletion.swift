@@ -128,15 +128,7 @@ final class PCodeCompletion: ObservableObject {
     }
 
     /// The cursor's cell in the terminal view, top-left origin, in points.
-    func cursorCell() -> CGRect? {
-        guard let surfaceView, let surface = surfaceView.surface else { return nil }
-        let cell = surfaceView.cellSize
-        guard cell.width > 0, cell.height > 0 else { return nil }
-        var x: Double = 0, y: Double = 0, width: Double = 0, height: Double = 0
-        ghostty_surface_ime_point(surface, &x, &y, &width, &height)
-        // `x` is the cell's middle and `y` its bottom.
-        return CGRect(x: x - cell.width / 2, y: y - cell.height, width: cell.width, height: cell.height)
-    }
+    func cursorCell() -> CGRect? { surfaceView?.pcodeCursorCell }
 }
 
 /// The completion list, hung over pcode's editor box from where the word

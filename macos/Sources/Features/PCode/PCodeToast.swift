@@ -10,7 +10,8 @@ import SwiftUI
 /// - `pcode;toast;<dy>;<ms>;<base64 utf-8>`: show the text for `ms`
 ///   milliseconds, centered over the pane just above the editor's box, which
 ///   starts `dy` rows above the cursor's row. A newer toast replaces the one
-///   on show. Display only: it never takes the mouse or the keyboard.
+///   on show, and empty text hides it. Display only: it never takes the
+///   mouse or the keyboard.
 final class PCodeToast: ObservableObject {
     struct Shown: Equatable {
         let id: Int
@@ -37,11 +38,16 @@ final class PCodeToast: ObservableObject {
     func handle(_ payload: String) {
         let parts = payload.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 4, parts[0] == "toast",
-              let rows = Int(parts[1]), (0...Self.maxRows).contains(rows),
+              let rows = Int(parts[1]), rows >= 0,
               let ms = Int(parts[2]), ms >= 0 else { return }
         let text = PCodePopup.title(fromBase64: parts[3])
-        guard !text.isEmpty else { return }
-        show(text, rowsAbove: rows, for: min(TimeInterval(ms) / 1000, Self.maxDuration))
+        guard !text.isEmpty else {
+            // pcode cleared the notice early (a job's progress that ended).
+            hide?.cancel()
+            shown = nil
+            return
+        }
+        show(text, rowsAbove: min(rows, Self.maxRows), for: min(TimeInterval(ms) / 1000, Self.maxDuration))
     }
 
     private func show(_ text: String, rowsAbove: Int, for duration: TimeInterval) {
@@ -58,15 +64,7 @@ final class PCodeToast: ObservableObject {
     }
 
     /// The cursor's cell in the terminal view, top-left origin, in points.
-    func cursorCell() -> CGRect? {
-        guard let surfaceView, let surface = surfaceView.surface else { return nil }
-        let cell = surfaceView.cellSize
-        guard cell.width > 0, cell.height > 0 else { return nil }
-        var x: Double = 0, y: Double = 0, width: Double = 0, height: Double = 0
-        ghostty_surface_ime_point(surface, &x, &y, &width, &height)
-        // `x` is the cell's middle and `y` its bottom.
-        return CGRect(x: x - cell.width / 2, y: y - cell.height, width: cell.width, height: cell.height)
-    }
+    func cursorCell() -> CGRect? { surfaceView?.pcodeCursorCell }
 }
 
 /// The toast, centered over the pane just above pcode's editor box, or near

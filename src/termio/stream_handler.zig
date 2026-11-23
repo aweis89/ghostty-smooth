@@ -68,8 +68,8 @@ pub const StreamHandler = struct {
     /// the kitty graphics protocol.
     ///
     /// Unknown APCs longer than this are dropped whole. pcode's carry base64
-    /// payloads: a popup title (up to 200 characters) or a key hint list
-    /// (`pcode;hints;…`, about 1 KiB), so 128 bytes silently lost them.
+    /// payloads: a popup title (up to 200 characters), a toast, or a key hint
+    /// list (`pcode;hints;…`, about 1 KiB), so 128 bytes silently lost them.
     apc: terminal.apc.Handler = .{ .unknown_max_bytes = 4096 },
 
     /// The DCS handler maintains DCS state. DCS is like CSI or OSC,

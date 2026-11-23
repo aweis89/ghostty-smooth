@@ -219,6 +219,18 @@ extension Ghostty.SurfaceView {
         return "pcode -c \(session)\n"
     }
 
+    /// The cursor's cell in this terminal's view, top-left origin, in points:
+    /// where pcode's completion list and toast hang from its editor.
+    var pcodeCursorCell: CGRect? {
+        guard let surface else { return nil }
+        let cell = cellSize
+        guard cell.width > 0, cell.height > 0 else { return nil }
+        var x: Double = 0, y: Double = 0, width: Double = 0, height: Double = 0
+        ghostty_surface_ime_point(surface, &x, &y, &width, &height)
+        // `x` is the cell's middle and `y` its bottom.
+        return CGRect(x: x - cell.width / 2, y: y - cell.height, width: cell.width, height: cell.height)
+    }
+
     /// True if this surface is a pcode drawer's or popup's overlay terminal, even a dropped one.
     var isPCodeOverlay: Bool { pcodeOwnerBox != nil }
 
