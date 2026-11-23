@@ -13,6 +13,9 @@ import SwiftUI
 /// - `pcode;show`: show it again, if it has a viewer.
 /// - `pcode;focus`, from the viewer's own terminal while it has the keyboard:
 ///   give the keyboard back to the terminal.
+/// - `pcode;hints;<base64 JSON>`, from the viewer's own terminal: the keys
+///   pcode's editor answers the thread with, in a footer pinned below it
+///   (`PCodeHint`; hidden while empty).
 ///
 /// `pcode;?` is answered in Zig (`stream_handler.zig`) with `pcode;ok;1`.
 /// Popups (`pcode;popup;...`) are `PCodePopup`'s.
@@ -26,6 +29,10 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published var visible = false
     /// The drawer's terminal while it is open; dropping it ends the viewer.
     @Published private(set) var viewer: Ghostty.SurfaceView?
+    /// The viewer's key hints: empty for none.
+    @Published private(set) var hints: [PCodeHint] = []
+    /// pcode's terminal font as the viewer started, for the footer.
+    private(set) var fonts: PCodePickFonts?
 
     weak var surfaceView: Ghostty.SurfaceView?
     private var shown: (host: String, thread: String)?
@@ -64,11 +71,18 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
         }
     }
 
-    /// From the viewer in the drawer's own terminal: only asking for the keyboard to go back.
+    /// From the viewer in the drawer's own terminal: its footer, or asking for the keyboard to go back.
     func handleFromOverlay(_ payload: String, from overlay: Ghostty.SurfaceView) {
+        guard overlay === viewer else { return }
+        if payload.hasPrefix("hints;") {
+            if let decoded = PCodeHint.list(fromBase64: String(payload.dropFirst("hints;".count))),
+               decoded != hints {
+                hints = decoded
+            }
+            return
+        }
         // Only while the drawer has the keyboard: anything else that prints
         // the sequence there must not pull focus from another split.
-        guard overlay === viewer else { return }
         if payload == "focus" && viewerHasFocus { focusTerminal() }
     }
 
@@ -106,6 +120,11 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
         if let viewer, viewer !== next { PCode.retire(viewer) }
+        if viewer !== next {
+            // A new viewer sends its own.
+            hints = []
+            fonts = PCodePickFonts.of(surfaceView?.surface)
+        }
         viewer = next
         guard let next else { return }
         // Cmd+W in the drawer, or the viewer exiting, asks to close its surface.
@@ -246,8 +265,18 @@ struct PCodeDrawerSurface: View {
                             )
                     )
                     .zIndex(1)
-                Ghostty.SurfaceWrapper(surfaceView: viewer, isSplit: false)
-                    .id(ObjectIdentifier(viewer))
+                VStack(spacing: 0) {
+                    Ghostty.SurfaceWrapper(surfaceView: viewer, isSplit: false)
+                        .id(ObjectIdentifier(viewer))
+                    if !drawer.hints.isEmpty {
+                        PCodeHintBar(
+                            hints: drawer.hints,
+                            fonts: drawer.fonts,
+                            muted: ghostty.config.foregroundColor.opacity(PCodePickTheme.mutedOpacity))
+                        .padding(.bottom, 6)
+                        .environment(\.colorScheme, colorScheme)
+                    }
+                }
             }
             // Bottom edge above the uncovered editor rows.
             Rectangle()
@@ -257,6 +286,11 @@ struct PCodeDrawerSurface: View {
         .frame(width: width, height: height)
         .background(ghostty.config.backgroundColor)
         .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 2)
+    }
+
+    /// The drawer's own scheme: its background is the terminal's, not the system's.
+    private var colorScheme: ColorScheme {
+        NSColor(ghostty.config.backgroundColor).isLightColor ? .light : .dark
     }
 }
 

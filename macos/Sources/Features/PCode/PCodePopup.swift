@@ -10,9 +10,9 @@ import SwiftUI
 /// keyboard. Or, for a pick list, pcode sends only the list and we draw it
 /// natively (`PCodePicker`). APCs (protocol 2, see `PCode`):
 ///
-/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;3`:
+/// - `pcode;popup?` is answered in Zig (`stream_handler.zig`) with `pcode;popup;4`:
 ///   1 was terminal popups only, 2 adds native pick lists, 3 the native
-///   completion list (`PCodeCompletion`).
+///   completion list (`PCodeCompletion`), 4 native key hint footers (`PCodeHint`).
 /// - `pcode;popup;<token>;<layout>`, from the terminal: open a popup, replacing
 ///   any open one. `token` is 16 lowercase hex digits, `layout` is `sheet` or
 ///   `wide`. Its interpreter is `python` in
@@ -26,6 +26,8 @@ import SwiftUI
 /// - `pcode;title;<base64 utf-8>`, from the popup's own terminal: the
 ///   popup's title, shown in a slim header above its terminal (hidden while
 ///   empty). Cut to `titleLimit` characters, with control characters dropped.
+/// - `pcode;hints;<base64 JSON>`, from the popup's own terminal: its key hints,
+///   shown in a footer below its terminal (`PCodeHint`; hidden while empty).
 /// - `pcode;done`, from the popup's own terminal: close the popup.
 /// - `pcode;pick;<token>;<layout>`, from the terminal: open a native pick list
 ///   instead, replacing any open popup. We connect to pcode's socket for the
@@ -74,6 +76,9 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published private(set) var ready = false
     /// The popup's title, from pcode in its terminal: empty for none.
     @Published private(set) var title = ""
+    /// The popup's key hints, from pcode in its terminal: empty for none.
+    /// A picker's are in its own payload.
+    @Published private(set) var hints: [PCodeHint] = []
 
     static let titleLimit = 200
 
@@ -123,6 +128,13 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
             if decoded != title { title = decoded }
             return
         }
+        if payload.hasPrefix("hints;") {
+            if let decoded = PCodeHint.list(fromBase64: String(payload.dropFirst("hints;".count))),
+               decoded != hints {
+                hints = decoded
+            }
+            return
+        }
         switch payload {
         case "ready":
             guard !ready else { return }
@@ -146,6 +158,7 @@ final class PCodePopup: NSObject, ObservableObject, PCodeOverlayOwner {
         closeObserver = nil
         ready = false
         title = ""
+        hints = []
         self.slot = nil
         // Hung up now, whatever still holds the view: pcode's cancel.
         switch slot.content {
@@ -286,6 +299,14 @@ struct PCodePopupLayer: View {
                             Ghostty.SurfaceWrapper(surfaceView: surface, isSplit: false)
                                 .id(ObjectIdentifier(surface))
                                 .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
+                            if !popup.hints.isEmpty {
+                                PCodeHintBar(
+                                    hints: popup.hints,
+                                    fonts: slot.fonts,
+                                    muted: ghostty.config.foregroundColor.opacity(PCodePickTheme.mutedOpacity))
+                                .padding(.bottom, 6)
+                                .environment(\.colorScheme, colorScheme)
+                            }
                         case .picker(let picker):
                             // Mounted once pcode sent its list, so its field takes the keyboard then.
                             if popup.ready {

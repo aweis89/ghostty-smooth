@@ -9,7 +9,7 @@ import SwiftUI
 /// (typing, arrows, Tab, Enter, Escape) and runs its completers itself; it
 /// only tells us what its menu holds after each redraw. APCs (protocol 3):
 ///
-/// - `pcode;popup?` is answered `pcode;popup;3` in Zig (`stream_handler.zig`).
+/// - `pcode;popup?` is answered `pcode;popup;4` in Zig (`stream_handler.zig`).
 /// - `pcode;complete;<token>`, from the terminal: connect to
 ///   `~/.local/state/pcode/popups/<token>.sock` and say `pcode-complete 1\n`.
 ///   One per pcode session; a new one replaces it.

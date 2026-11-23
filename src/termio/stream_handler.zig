@@ -66,7 +66,11 @@ pub const StreamHandler = struct {
     /// CSI or OSC, but it is a private escape sequence that is used
     /// to send commands to the terminal emulator. This is used by
     /// the kitty graphics protocol.
-    apc: terminal.apc.Handler = .{ .unknown_max_bytes = 128 },
+    ///
+    /// Unknown APCs longer than this are dropped whole. pcode's carry base64
+    /// payloads: a popup title (up to 200 characters) or a key hint list
+    /// (`pcode;hints;…`, about 1 KiB), so 128 bytes silently lost them.
+    apc: terminal.apc.Handler = .{ .unknown_max_bytes = 4096 },
 
     /// The DCS handler maintains DCS state. DCS is like CSI or OSC,
     /// but requires more stateful parsing. This is used by functionality
@@ -536,9 +540,10 @@ pub const StreamHandler = struct {
                     // Overlay popups have their own version, so pcode can
                     // tell a drawer-only build from one with popups: 1 has
                     // terminal popups, 2 native pick lists too, 3 a native
-                    // completion list for the editor as well.
+                    // completion list for the editor as well, 4 native key
+                    // hint footers below popups and the drawer.
                     if (std.mem.eql(u8, payload, "popup?")) {
-                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;3\x1b\\" });
+                        self.messageWriter(.{ .write_stable = "\x1b_pcode;popup;4\x1b\\" });
                         return;
                     }
                     if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {

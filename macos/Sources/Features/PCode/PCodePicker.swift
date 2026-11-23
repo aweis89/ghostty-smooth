@@ -56,10 +56,24 @@ final class PCodePicker: ObservableObject {
         let cancelKeys: [String]?
         /// pcode's colors over the terminal's; older pcode sends none.
         let style: PCodePickStyle?
+        /// The footer's key hints (`PCodeHint`); older pcode sends none.
+        let hints: [PCodeHint]?
 
         enum CodingKeys: String, CodingKey {
-            case title, header, empty, selected, query, match, custom, items, actions, style
+            case title, header, empty, selected, query, match, custom, items, actions, style, hints
             case cancelKeys = "cancel_keys"
+        }
+
+        /// The footer: pcode's hints, else the ones an older pcode left to us.
+        var footer: [PCodeHint] {
+            if let hints { return Array(hints.prefix(PCodeHint.maxCount)) }
+            var result = [PCodeHint(key: "↩", label: "Choose", keep: true)]
+            for action in actions {
+                result.append(PCodeHint(key: PCodePicker.keyLabel(action.key), label: action.label, keep: false))
+                if action.delete { result.append(PCodeHint(key: "⌦", label: action.label, keep: false)) }
+            }
+            result.append(PCodeHint(key: "esc", label: "Cancel", keep: true))
+            return result
         }
     }
 
@@ -846,30 +860,6 @@ struct PCodePickerView: View {
     }
 
     private func footer(_ theme: PCodePickTheme) -> some View {
-        HStack(spacing: 14) {
-            hint("↩", "Choose", theme)
-            ForEach(picker.payload?.actions ?? [], id: \.key) { action in
-                hint(PCodePicker.keyLabel(action.key), action.label, theme)
-                if action.delete {
-                    hint("⌦", action.label, theme)
-                }
-            }
-            hint("esc", "Cancel", theme)
-            Spacer()
-        }
-        .font(theme.smallFont(fallbackSize: 11))
-        .foregroundStyle(theme.muted)
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-    }
-
-    private func hint(_ key: String, _ label: String, _ theme: PCodePickTheme) -> some View {
-        HStack(spacing: 4) {
-            Text(key)
-                .font(theme.smallFont(fallbackSize: 11, weight: .semibold))
-                .padding(.horizontal, 4)
-                .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08)))
-            Text(label)
-        }
+        PCodeHintBar(hints: picker.payload?.footer ?? [], fonts: theme.fonts, muted: theme.muted)
     }
 }
