@@ -3064,6 +3064,11 @@ fn maybeHandleBinding(
                 const rev_i: usize = table_items.len - 1 - i;
                 const table = table_items[rev_i];
                 if (table.set.getEvent(event)) |v| {
+                    // Fork: an unconsumed catch_all lets keys through, so a
+                    // shortcut held with ctrl, alt or super goes on to the
+                    // outer tables and the root set rather than the pty.
+                    if (passesThrough(v, event)) continue;
+
                     // If this is a one-shot activation AND its the currently
                     // active table, then we deactivate it after this.
                     // Note: we may want to change the semantics here to
@@ -3259,6 +3264,19 @@ fn deactivateAllKeyTables(self: *Surface) !bool {
     };
 
     return true;
+}
+
+/// Whether a table's match is an unconsumed catch_all for a key held with
+/// ctrl, alt or super, which should reach the bindings outside the table.
+fn passesThrough(entry: input.Binding.Set.Entry, event: input.KeyEvent) bool {
+    if (entry.key_ptr.key != .catch_all) return false;
+    const leaf = switch (entry.value_ptr.*) {
+        .leaf => |leaf| leaf,
+        else => return false,
+    };
+    if (leaf.flags.consumed) return false;
+    const mods = event.mods.binding();
+    return mods.ctrl or mods.alt or mods.super;
 }
 
 /// This checks if the current keybinding sets have a catch_all binding
@@ -3853,7 +3871,7 @@ fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
             .by => |rows| glide.scrollBy(t, rows),
             .top => glide.scrollToEnd(t, .top),
             .bottom => glide.scrollToEnd(t, .bottom),
-            .cruise => glide.toggleCruise(1),
+            .cruise => glide.toggleCruise(t, 1),
             .cruise_speed => |steps| glide.adjustCruise(steps),
         }
     }
@@ -3867,6 +3885,7 @@ fn stopViewportGlide(self: *Surface) void {
     if (!glide.isActive()) return;
     glide.cancel(&self.io.terminal);
     self.renderer_state.scroll_offset_px = 0;
+    self.renderer_state.publishHit();
 }
 
 /// This is called when the content scale of the surface changes. The surface
@@ -6859,4 +6878,19 @@ test "promptClickRelativeRow" {
         );
         try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
     }
+}
+
+test "passesThrough: unconsumed catch_all lets modified shortcuts out" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s: input.Binding.Set = .{};
+    defer s.deinit(alloc);
+    try s.parseAndPut(alloc, "unconsumed:catch_all=deactivate_key_table");
+
+    const cmd_t = s.getEvent(.{ .key = .key_t, .mods = .{ .super = true } }).?;
+    try testing.expect(passesThrough(cmd_t, .{ .key = .key_t, .mods = .{ .super = true } }));
+
+    const shift_x = s.getEvent(.{ .key = .key_x, .mods = .{ .shift = true } }).?;
+    try testing.expect(!passesThrough(shift_x, .{ .key = .key_x, .mods = .{ .shift = true } }));
 }

@@ -7458,8 +7458,11 @@ pub const Keybinds = struct {
     }
 
     /// The default `reader` key table: vim and less keys, all glided.
-    /// Any other key leaves it and goes on to the program, which snaps
-    /// the viewport back to the bottom.
+    /// Any other key leaves it and goes on to the program (and with the
+    /// default `scroll-to-bottom`, back to the bottom). Shortcuts held with
+    /// ctrl, alt or super still reach their usual bindings.
+    /// `g` alone, as in `less`: `g>g` would type `g` into the program
+    /// whenever the next key is not `g`.
     const reader_keybinds = [_][]const u8{
         "j=scroll_page_lines:1",
         "k=scroll_page_lines:-1",
@@ -7475,7 +7478,7 @@ pub const Keybinds = struct {
         "ctrl+d=scroll_page_fractional:0.5",
         "u=scroll_page_fractional:-0.5",
         "ctrl+u=scroll_page_fractional:-0.5",
-        "g>g=scroll_to_top",
+        "g=scroll_to_top",
         "shift+g=scroll_to_bottom",
         "c=smooth_cruise",
         "equal=smooth_cruise_speed:1",
@@ -7487,7 +7490,6 @@ pub const Keybinds = struct {
         "chain=scroll_to_bottom",
         "i=deactivate_key_table",
         "chain=scroll_to_bottom",
-        "super+c=copy_to_clipboard",
         "unconsumed:catch_all=deactivate_key_table",
     };
 

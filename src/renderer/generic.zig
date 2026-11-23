@@ -1592,6 +1592,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (state.viewport_glide.isActive()) {
                         state.viewport_glide.cancel(state.terminal);
                         state.scroll_offset_px = 0;
+                        state.publishHit();
                     }
                     state.terminal.scrollViewport(.bottom);
                 }
@@ -1609,8 +1610,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // sub-row offset, so before anything below reads them.
                     if (state.viewport_glide.isActive()) {
                         const since = self.viewport_glide_clock orelse now;
-                        const dt: f32 = @as(f32, @floatFromInt(@max(since.durationTo(now).nanoseconds, 0))) /
-                            std.time.ns_per_s;
+                        // Capped: after synchronized output or a hidden
+                        // window, carry on rather than leaping.
+                        const dt: f32 = @min(@as(f32, @floatFromInt(@max(since.durationTo(now).nanoseconds, 0))) /
+                            std.time.ns_per_s, 0.05);
                         state.scroll_offset_px = state.viewport_glide.step(state.terminal, dt) * cell_h;
                         state.publishHit();
                     }

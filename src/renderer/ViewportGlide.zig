@@ -45,6 +45,14 @@ lag: f32 = 0,
 cruise_dir: f32 = 0,
 /// Cruise speed, rows/s; kept between cruises.
 cruise_speed: f32 = default_cruise,
+/// Where the glide left the viewport, so a move by anything else (a clear,
+/// a jump to a prompt, the alternate screen) stops it rather than gliding
+/// on from the new place.
+left: struct {
+    screen: terminalpkg.ScreenSet.Key = .primary,
+    active: bool = true,
+    offset: usize = 0,
+} = .{},
 
 pub fn isActive(self: *const ViewportGlide) bool {
     return self.remaining != 0 or self.velocity != 0 or self.cruise_dir != 0 or self.lag != 0;
@@ -53,11 +61,34 @@ pub fn isActive(self: *const ViewportGlide) bool {
 /// Stop where the viewport is now. Rounds to the nearest row so a glide
 /// interrupted mid-row does not leave a half-row offset behind.
 pub fn cancel(self: *ViewportGlide, term: *Terminal) void {
-    if (self.lag >= 0.5) term.scrollViewport(.{ .delta = -1 });
+    if (self.lag >= 0.5 and !self.movedElsewhere(term)) term.scrollViewport(.{ .delta = -1 });
+    self.reset();
+}
+
+fn reset(self: *ViewportGlide) void {
     self.remaining = 0;
     self.velocity = 0;
     self.lag = 0;
     self.cruise_dir = 0;
+}
+
+fn remember(self: *ViewportGlide, term: *Terminal) void {
+    const pages = &term.screens.active.pages;
+    self.left = .{
+        .screen = term.screens.active_key,
+        .active = pages.viewport == .active,
+        .offset = pages.scrollbar().offset,
+    };
+}
+
+/// Whether something other than the glide moved the viewport since it
+/// last did. Output growing under a viewport at the bottom is not a move.
+fn movedElsewhere(self: *const ViewportGlide, term: *Terminal) bool {
+    if (term.screens.active_key != self.left.screen) return true;
+    const pages = &term.screens.active.pages;
+    const active = pages.viewport == .active;
+    if (active != self.left.active) return true;
+    return !active and pages.scrollbar().offset != self.left.offset;
 }
 
 /// The viewport's visual row offset from the top of the scrollable area,
@@ -71,6 +102,7 @@ fn position(self: *const ViewportGlide, term: *Terminal) struct { v: f32, max: f
 
 /// Glide `rows` further (negative: up), clamped to the scrollback.
 pub fn scrollBy(self: *ViewportGlide, term: *Terminal, rows: f32) void {
+    if (self.isActive() and self.movedElsewhere(term)) self.reset();
     const p = self.position(term);
     const target = std.math.clamp(p.v + self.remaining + rows, 0, p.max);
     self.setRemaining(term, target - p.v);
@@ -78,6 +110,7 @@ pub fn scrollBy(self: *ViewportGlide, term: *Terminal, rows: f32) void {
 
 /// Glide to the top (`.top`) or bottom (`.bottom`) of the scrollback.
 pub fn scrollToEnd(self: *ViewportGlide, term: *Terminal, end: enum { top, bottom }) void {
+    if (self.isActive() and self.movedElsewhere(term)) self.reset();
     const p = self.position(term);
     self.cruise_dir = 0;
     self.setRemaining(term, switch (end) {
@@ -96,13 +129,24 @@ fn setRemaining(self: *ViewportGlide, term: *Terminal, remaining: f32) void {
         r -= jump;
     }
     self.remaining = r;
-    if (r == 0 and self.lag == 0) self.velocity = 0;
+    // Turning back: drop the speed away from the new target, or a
+    // reversal near an edge would carry on into it and be lost.
+    if (r * self.velocity > 0 or (r == 0 and self.lag == 0)) self.velocity = 0;
+    self.remember(term);
 }
 
 /// Start cruising in `dir` (1 down, -1 up), or stop if already cruising
 /// that way.
-pub fn toggleCruise(self: *ViewportGlide, dir: f32) void {
-    self.cruise_dir = if (self.cruise_dir == dir) 0 else dir;
+pub fn toggleCruise(self: *ViewportGlide, term: *Terminal, dir: f32) void {
+    if (self.isActive() and self.movedElsewhere(term)) self.reset();
+    if (self.cruise_dir != dir) {
+        self.cruise_dir = dir;
+        self.remember(term);
+        return;
+    }
+    // Stop: glide to the nearest row rather than snapping to it.
+    self.cruise_dir = 0;
+    if (self.remaining == 0) self.remaining = if (self.lag >= 0.5) self.lag - 1 else self.lag;
 }
 
 /// Change the cruise speed by `steps` factors of `cruise_step`.
@@ -117,7 +161,12 @@ pub fn adjustCruise(self: *ViewportGlide, steps: f32) void {
 /// Advance by `dt` seconds: scroll the viewport and return the sub-row
 /// offset to draw it at, in rows (multiply by the cell height).
 pub fn step(self: *ViewportGlide, term: *Terminal, dt: f32) f32 {
-    if (!self.isActive() or dt <= 0) return self.lag;
+    if (!self.isActive()) return self.lag;
+    if (self.movedElsewhere(term)) {
+        self.reset();
+        return 0;
+    }
+    if (dt <= 0) return self.lag;
 
     // Spring: closed-form critically damped step of `remaining`.
     var moved: f32 = 0;
@@ -164,6 +213,7 @@ pub fn step(self: *ViewportGlide, term: *Terminal, dt: f32) f32 {
         lag = 0;
     }
     self.lag = lag;
+    self.remember(term);
     return lag;
 }
 
@@ -241,7 +291,7 @@ test "viewport glide: cruise runs at its speed and stops at the bottom" {
     g.scrollToEnd(&term, .top);
     try settle(&g, &term);
 
-    g.toggleCruise(1);
+    g.toggleCruise(&term, 1);
     for (0..240) |_| _ = g.step(&term, 1.0 / 120.0);
     // Two seconds at the default speed: four rows, give or take the
     // row the viewport rounds to.
@@ -267,4 +317,35 @@ test "viewport glide: cancel rounds to the nearest row" {
     g.cancel(&term);
     try testing.expect(!g.isActive());
     try testing.expect(viewportOffset(&term) < start);
+}
+
+test "viewport glide: a move by anything else stops it" {
+    const testing = std.testing;
+    var term = try testTerminal(100);
+    defer term.deinit(testing.allocator);
+
+    var g: ViewportGlide = .{};
+    g.scrollBy(&term, -30);
+    _ = g.step(&term, 0.05);
+    // A clear snaps to the bottom; the glide must not carry on up.
+    term.scrollViewport(.bottom);
+    try testing.expectEqual(@as(f32, 0), g.step(&term, 0.05));
+    try testing.expect(!g.isActive());
+    try testing.expect(term.screens.active.pages.viewport == .active);
+}
+
+test "viewport glide: turning back near the bottom is not lost" {
+    const testing = std.testing;
+    var term = try testTerminal(100);
+    defer term.deinit(testing.allocator);
+    const bottom = viewportOffset(&term);
+
+    var g: ViewportGlide = .{};
+    g.scrollBy(&term, -4);
+    try settle(&g, &term);
+    g.scrollBy(&term, 4);
+    _ = g.step(&term, 0.02);
+    g.scrollBy(&term, -6);
+    try settle(&g, &term);
+    try testing.expectEqual(bottom - 6, viewportOffset(&term));
 }
