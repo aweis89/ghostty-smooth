@@ -1765,7 +1765,7 @@ const ReflowCursor = struct {
 
             // If the row has a semantic prompt then the blank row is meaningful
             // so we just consider pretend the first cell of the row isn't empty.
-            if (cols_len == 0 and src_row.semantic_prompt != .none) cols_len = 1;
+            if (cols_len == 0 and (src_row.semantic_prompt != .none or src_row.smooth_mark != 0)) cols_len = 1;
         }
 
         // Handle tracked pin adjustments. We also note whether any
@@ -1867,6 +1867,8 @@ const ReflowCursor = struct {
                 self.page_row.wrap = true;
                 try self.cursorScrollOrNewPage(list, cap);
                 self.copyRowMetadata(src_row);
+                // A mark belongs to the row's first line only.
+                self.page_row.smooth_mark = 0;
                 self.page_row.wrap_continuation = true;
 
                 // This row continues the source row, so it can't be a
@@ -1998,7 +2000,7 @@ const ReflowCursor = struct {
         // written. A prompt row is kept even though it's blank, the
         // same as in reflowRow.
         keep: {
-            if (src_row.semantic_prompt != .none) break :keep;
+            if (src_row.semantic_prompt != .none or src_row.smooth_mark != 0) break :keep;
             for (list.tracked_pins.keys()) |p| {
                 if (p.node == row.node and p.y == row.y) break :keep;
             }
@@ -2960,13 +2962,14 @@ const ReflowCursor = struct {
 
         // If the row has a semantic prompt then the blank row is meaningful
         // so we always return all but one so that the row is drawn.
-        if (self.page_row.semantic_prompt != .none) return len - 1;
+        if (self.page_row.semantic_prompt != .none or self.page_row.smooth_mark != 0) return len - 1;
 
         return len;
     }
 
     fn copyRowMetadata(self: *ReflowCursor, other: *const Row) void {
         self.page_row.semantic_prompt = other.semantic_prompt;
+        self.page_row.smooth_mark = other.smooth_mark;
     }
 };
 
@@ -18759,6 +18762,41 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt" {
             try testing.expect(rac.row.semantic_prompt == .prompt_continuation);
         }
     }
+}
+
+test "PageList resize reflow keeps a smooth mark on the first line only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 4, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+    {
+        const page = s.pages.first.?.page();
+        page.getRowAndCell(0, 1).row.smooth_mark = 2;
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, 1);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'a' + @as(u21, @intCast(x)) } },
+            };
+        }
+        // A marked blank row survives too.
+        page.getRowAndCell(0, 3).row.smooth_mark = 1;
+    }
+
+    try s.resize(.{ .cols = 2, .reflow = true });
+    var marks: [8]u2 = @splat(0);
+    var n: usize = 0;
+    var it = s.rowIterator(.right_down, .{ .screen = .{} }, null);
+    while (it.next()) |p| : (n += 1) marks[n] = p.rowAndCell().row.smooth_mark;
+    // Row 1 split in two: only its first line is marked.
+    try testing.expectEqual(@as(u2, 2), marks[1]);
+    try testing.expectEqual(@as(u2, 0), marks[2]);
+    var turns: usize = 0;
+    for (marks[0..n]) |m| {
+        if (m == 1) turns += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), turns);
 }
 
 test "PageList resize reflow semantic prompt marks" {

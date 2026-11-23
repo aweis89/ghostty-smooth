@@ -555,9 +555,29 @@ pub const StreamHandler = struct {
                     self.messageWriter(.{ .write_stable = renderer.State.Smooth.query_reply });
                     return;
                 }
-                var cmd = renderer.State.Smooth.parse(
-                    unknown.content[prefix.len..],
-                ) catch {
+                const body = unknown.content[prefix.len..];
+                // Protocol 10: row marks and park. They act on the terminal,
+                // so they are handled here rather than parsed as region
+                // commands.
+                if (std.mem.startsWith(u8, body, "mark;")) {
+                    const kind = std.fmt.parseInt(u2, body["mark;".len..], 10) catch {
+                        log.warn("invalid smooth APC: {s}", .{unknown.content});
+                        return;
+                    };
+                    self.terminal.screens.active.cursor.page_row.smooth_mark = kind;
+                    if (kind == @intFromEnum(renderer.State.ViewportGlide.Mark.turn) and
+                        self.renderer_state.park == .armed)
+                    {
+                        self.renderer_state.park = .bound;
+                        try self.queueRender();
+                    }
+                    return;
+                }
+                if (std.mem.eql(u8, body, "park")) {
+                    self.renderer_state.park = .armed;
+                    return;
+                }
+                var cmd = renderer.State.Smooth.parse(body) catch {
                     log.warn("invalid smooth APC: {s}", .{unknown.content});
                     return;
                 };

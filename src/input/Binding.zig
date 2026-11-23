@@ -485,6 +485,16 @@ pub const Action = union(enum) {
     /// one line. Positive values scroll down, negative values up.
     smooth_hold: f32,
 
+    /// Scroll to the next (positive) or previous (negative) turn an app
+    /// marked (`ESC _ smooth;mark;1 ESC \`), putting it at the top of the
+    /// screen. Previous lands on the current turn first. Past the newest
+    /// turn is the bottom.
+    smooth_jump_turn: i8,
+
+    /// Like `smooth_jump_turn`, for the blocks an app marked
+    /// (`ESC _ smooth;mark;2 ESC \`), such as code blocks and diffs.
+    smooth_jump_block: i8,
+
     /// Change the speed of `smooth_cruise` by the given number of steps of
     /// a quarter faster each. Negative values slow it down. The speed is
     /// kept for the next cruise.
@@ -1459,6 +1469,8 @@ pub const Action = union(enum) {
             .smooth_cruise,
             .smooth_cruise_speed,
             .smooth_hold,
+            .smooth_jump_turn,
+            .smooth_jump_block,
             .adjust_selection,
             .jump_to_prompt,
             .write_scrollback_file,

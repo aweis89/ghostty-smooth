@@ -1173,6 +1173,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
+        .reader_park => _ = try self.performBindingAction(.{ .activate_key_table = "reader" }),
+
         .present_surface => try self.presentSurface(),
 
         .password_input => |v| try self.passwordInput(v),
@@ -2989,6 +2991,8 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
+        // Typing a follow-up: don't park the answer from under it.
+        self.renderer_state.park = .off;
         if (self.config.scroll_to_bottom.keystroke) {
             self.stopViewportGlide();
             self.io.terminal.scrollViewport(.bottom);
@@ -3866,6 +3870,7 @@ const ViewportMotion = union(enum) {
     cruise_speed: f32,
     hold: f32,
     end_hold,
+    jump: struct { kind: rendererpkg.State.ViewportGlide.Mark, dir: i8 },
 };
 
 fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
@@ -3882,6 +3887,9 @@ fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
             .cruise_speed => |steps| glide.adjustCruise(steps),
             .hold => |dir| glide.startHold(t, dir),
             .end_hold => glide.endHold(t),
+            // Past the newest turn is the live bottom.
+            .jump => |j| if (!glide.jumpToMark(t, j.kind, j.dir) and
+                j.kind == .turn and j.dir > 0) glide.scrollToEnd(t, .bottom),
         }
     }
     try self.queueRender();
@@ -5571,6 +5579,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .smooth_cruise_speed => |steps| try self.glideViewport(.{ .cruise_speed = steps }),
 
         .smooth_hold => |dir| try self.glideViewport(.{ .hold = std.math.sign(dir) }),
+
+        .smooth_jump_turn => |dir| try self.glideViewport(.{ .jump = .{ .kind = .turn, .dir = dir } }),
+
+        .smooth_jump_block => |dir| try self.glideViewport(.{ .jump = .{ .kind = .block, .dir = dir } }),
 
         .jump_to_prompt => |delta| {
             self.queueIo(.{

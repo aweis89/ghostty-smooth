@@ -48,6 +48,13 @@ scroll_offset_px: f32 = 0,
 /// viewport and `scroll_offset_px` while active. See `ViewportGlide`.
 viewport_glide: ViewportGlide = .{},
 
+/// Fork: `ESC _ smooth;park ESC \` arms a park, and the next turn mark
+/// (`smooth;mark;1`) binds it. Once that row scrolls above the top while
+/// the viewport follows the bottom, the renderer pins the viewport there
+/// and the surface enters its `reader` key table. Anything that takes the
+/// viewport elsewhere first, or a keystroke, drops it.
+park: enum { off, armed, bound } = .off,
+
 /// Experimental app-declared smooth scroll regions, keyed by id. See
 /// `Smooth` for the escape sequence.
 smooth: [Smooth.max_regions]?Smooth = @splat(null),
@@ -295,7 +302,14 @@ test "preedit range shifts left at right edge" {
 ///                                                         FIFO; flags 0: 120 Hz
 ///                                                         soft ink sweep; flags 1:
 ///                                                         vertical curtain)
-///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;9
+///   ESC _ smooth;mark;K ESC \                             protocol 10: mark the
+///                                                         cursor's row: 1 turn,
+///                                                         2 block (see
+///                                                         `ViewportGlide.Mark`)
+///   ESC _ smooth;park ESC \                               protocol 10: park at
+///                                                         the next turn mark
+///                                                         (see `State.park`)
+///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;10
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
 /// as by writing new lines above a pinned editor: sent in the same
@@ -324,7 +338,7 @@ pub const Smooth = struct {
 
     /// Reply to the capability query `ESC _ smooth;? ESC \`: the protocol
     /// version this terminal implements.
-    pub const query_reply = "\x1b_smooth;ok;9\x1b\\";
+    pub const query_reply = "\x1b_smooth;ok;10\x1b\\";
 
     /// Rows of glide kept at most for legacy/spring glides; a bigger backlog jumps the excess.
     pub const max_glide: f32 = 3;
@@ -1302,6 +1316,61 @@ pub fn stepGlides(self: *State, now: std.Io.Timestamp) bool {
         }
     }
     return moving;
+}
+
+/// Pin the viewport at the bound park's turn if it has scrolled past the
+/// top; true when it just did (see `park`). Caller must hold the mutex.
+pub fn parkIfDue(self: *State) bool {
+    if (self.park != .bound) return false;
+    const t = self.terminal;
+    // A full-screen app has the screen: wait for the conversation.
+    if (t.screens.active_key != .primary) return false;
+    const pages = &t.screens.active.pages;
+    if (pages.viewport != .active) {
+        self.park = .off;
+        return false;
+    }
+    const sb = pages.scrollbar();
+    const top = sb.total -| sb.len;
+    const row = ViewportGlide.findMark(t, .turn, sb.total -| 1, -1) orelse return false;
+    if (row >= top) return false;
+    t.scrollViewport(.{ .row = row });
+    self.park = .off;
+    return true;
+}
+
+test "park: pins the viewport once the turn scrolls past the top" {
+    const testing = std.testing;
+    var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10 });
+    defer term.deinit(testing.allocator);
+    var state: State = .{ .mutex = undefined, .terminal = &term };
+
+    try term.printString("a\r\nb\r\n");
+    term.screens.active.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    const turn_row = term.screens.active.cursor.y;
+    state.park = .bound;
+    // Still on screen: nothing yet.
+    try term.printString("prompt\r\n");
+    try testing.expect(!state.parkIfDue());
+    try testing.expect(state.park == .bound);
+
+    // The answer pushes it past the top: parked with the turn at the top.
+    for (0..30) |_| try term.printString("answer\r\n");
+    try testing.expect(state.parkIfDue());
+    try testing.expect(state.park == .off);
+    try testing.expectEqual(@as(usize, turn_row), term.screens.active.pages.scrollbar().offset);
+}
+
+test "park: dropped when the viewport is already in history" {
+    const testing = std.testing;
+    var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10 });
+    defer term.deinit(testing.allocator);
+    var state: State = .{ .mutex = undefined, .terminal = &term };
+    for (0..30) |_| try term.printString("line\r\n");
+    term.scrollViewport(.{ .delta = -5 });
+    state.park = .bound;
+    try testing.expect(!state.parkIfDue());
+    try testing.expect(state.park == .off);
 }
 
 /// The smooth scroll region containing viewport cell (x, y), if any; where

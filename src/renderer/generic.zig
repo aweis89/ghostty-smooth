@@ -1606,6 +1606,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Bring the glides up to now, then snapshot them.
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
                     _ = state.stepGlides(now);
+                    // Park: once the bound turn scrolls past the top while
+                    // the viewport follows the bottom, pin it there.
+                    if (state.parkIfDue()) _ = self.surface_mailbox.push(.reader_park, .instant);
                     // Glided viewport scroll moves the viewport and its
                     // sub-row offset, so before anything below reads them.
                     if (state.viewport_glide.isActive()) {

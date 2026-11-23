@@ -7479,6 +7479,15 @@ pub const Keybinds = struct {
         "u=scroll_page_fractional:-0.5",
         "ctrl+u=scroll_page_fractional:-0.5",
         "g=scroll_to_top",
+        "bracket_left=smooth_jump_turn:-1",
+        "bracket_right=smooth_jump_turn:1",
+        "shift+bracket_left=smooth_jump_block:-1",
+        "shift+bracket_right=smooth_jump_block:1",
+        // F20: pcode's response and snippet copy chooser, which needs the
+        // editor in view.
+        "y=csi:34~",
+        "chain=deactivate_key_table",
+        "chain=scroll_to_bottom",
         "shift+g=scroll_to_bottom",
         "c=smooth_cruise",
         "equal=smooth_cruise_speed:1",
@@ -10817,6 +10826,16 @@ test "default reader key table" {
     const actions = q.value_ptr.leaf_chained.actions.items;
     try testing.expect(actions[0] == .deactivate_key_table);
     try testing.expect(actions[1] == .scroll_to_bottom);
+
+    // `[` goes back a turn.
+    const bracket = reader.getEvent(.{ .key = .bracket_left, .utf8 = "[", .unshifted_codepoint = '[' }).?;
+    try testing.expectEqual(@as(i8, -1), bracket.value_ptr.leaf.action.smooth_jump_turn);
+
+    // `y` sends F20 to the program, then leaves for the bottom.
+    const y = reader.getEvent(.{ .key = .key_y, .utf8 = "y", .unshifted_codepoint = 'y' }).?;
+    const y_actions = y.value_ptr.leaf_chained.actions.items;
+    try testing.expectEqualStrings("34~", y_actions[0].csi);
+    try testing.expect(y_actions[1] == .deactivate_key_table);
 
     // Any other key leaves the table and still reaches the program.
     const x = reader.getEvent(.{ .key = .key_x, .utf8 = "x", .unshifted_codepoint = 'x' }).?;

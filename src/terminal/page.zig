@@ -2337,7 +2337,12 @@ pub const Row = packed struct(u64) {
     /// `PageList.trimTrailingBlankRows` don't read them.
     blank: bool = false,
 
-    _padding: u22 = 0,
+    /// Fork: an app's mark on this row (`ESC _ smooth;mark;K ESC \`), for
+    /// jumping between turns (1) and blocks (2). 0 is unmarked. Kept with
+    /// the row through reflow and eviction like `semantic_prompt`.
+    smooth_mark: u2 = 0,
+
+    _padding: u20 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {

@@ -154,6 +154,10 @@ pub const Message = union(enum) {
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 
+    /// Fork: the viewport just parked at a turn (`renderer.State.park`);
+    /// enter the `reader` key table.
+    reader_park: void,
+
     /// Search progress update
     search_total: ?usize,
 

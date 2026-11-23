@@ -185,6 +185,43 @@ pub fn endHold(self: *ViewportGlide, term: *Terminal) void {
     self.remaining = std.math.clamp(dest, 0, p.max) - p.v;
 }
 
+/// Row marks an app sets (`ESC _ smooth;mark;K ESC \`).
+pub const Mark = enum(u2) { turn = 1, block = 2 };
+
+/// Glide to the next (`dir` > 0) or previous mark of `kind`, measured from
+/// where the glide is headed, so repeated presses step on. The previous one
+/// is the nearest strictly above the top row, so the first press lands on
+/// the current turn's start. Returns false when there is none that way.
+pub fn jumpToMark(self: *ViewportGlide, term: *Terminal, kind: Mark, dir: i8) bool {
+    if (self.isActive() and self.movedElsewhere(term)) self.reset();
+    const p = self.position(term);
+    const from: usize = @intFromFloat(@max(0, @round(p.v + self.remaining)));
+    const row = findMark(term, kind, from, dir) orelse return false;
+    self.cruise_dir = 0;
+    const target = @min(@as(f32, @floatFromInt(row)), p.max);
+    self.setRemaining(term, target - p.v);
+    return true;
+}
+
+/// The screen row (from the top of scrollback) of the nearest row marked
+/// `kind` above (`dir` < 0) or below (`dir` > 0) screen row `from`.
+pub fn findMark(term: *Terminal, kind: Mark, from: usize, dir: i8) ?usize {
+    const pages = &term.screens.active.pages;
+    var pin = pages.pin(.{ .screen = .{ .y = @intCast(from) } }) orelse return null;
+    var row = from;
+    while (true) {
+        if (dir < 0) {
+            if (row == 0) return null;
+            pin = pin.up(1) orelse return null;
+            row -= 1;
+        } else {
+            pin = pin.down(1) orelse return null;
+            row += 1;
+        }
+        if (pin.rowAndCell().row.smooth_mark == @intFromEnum(kind)) return row;
+    }
+}
+
 /// Change the cruise speed by `steps` factors of `cruise_step`.
 pub fn adjustCruise(self: *ViewportGlide, steps: f32) void {
     self.cruise_speed = std.math.clamp(
@@ -416,4 +453,36 @@ test "viewport glide: a held key scrolls steadily and a tap moves one row" {
     try settle(&g, &term);
     const held = start - 1 - viewportOffset(&term);
     try std.testing.expect(held >= 10 and held <= 13);
+}
+
+fn markRow(term: *Terminal, screen_y: usize, kind: Mark) void {
+    const p = term.screens.active.pages.pin(.{ .screen = .{ .y = @intCast(screen_y) } }).?;
+    p.rowAndCell().row.smooth_mark = @intFromEnum(kind);
+}
+
+test "viewport glide: jumps between marks, landing on the current one first" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    const bottom = viewportOffset(&term);
+    markRow(&term, 20, .turn);
+    markRow(&term, 120, .turn);
+    markRow(&term, 150, .block);
+
+    var g: ViewportGlide = .{};
+    // The current turn starts above the screen: the first press goes there.
+    try testing.expect(g.jumpToMark(&term, .turn, -1));
+    try settle(&g, &term);
+    try testing.expectEqual(@as(usize, 120), viewportOffset(&term));
+    // Again: the turn before.
+    try testing.expect(g.jumpToMark(&term, .turn, -1));
+    // Pressed again mid-glide, it counts from where the glide is headed:
+    // nothing above the first turn.
+    try testing.expect(!g.jumpToMark(&term, .turn, -1));
+    try settle(&g, &term);
+    try testing.expectEqual(@as(usize, 20), viewportOffset(&term));
+    // Blocks are their own kind; forward finds the next one.
+    try testing.expect(g.jumpToMark(&term, .block, 1));
+    try settle(&g, &term);
+    try testing.expectEqual(@min(@as(usize, 150), bottom), viewportOffset(&term));
 }
