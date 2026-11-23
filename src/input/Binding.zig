@@ -480,6 +480,11 @@ pub const Action = union(enum) {
     /// stop. Any other scroll action adds to the motion.
     smooth_cruise,
 
+    /// Scroll the screen at a steady speed while the key is held, then
+    /// glide on to the next whole line when it is released. A tap scrolls
+    /// one line. Positive values scroll down, negative values up.
+    smooth_hold: f32,
+
     /// Change the speed of `smooth_cruise` by the given number of steps of
     /// a quarter faster each. Negative values slow it down. The speed is
     /// kept for the next cruise.
@@ -1453,6 +1458,7 @@ pub const Action = union(enum) {
             .scroll_page_lines,
             .smooth_cruise,
             .smooth_cruise_speed,
+            .smooth_hold,
             .adjust_selection,
             .jump_to_prompt,
             .write_scrollback_file,

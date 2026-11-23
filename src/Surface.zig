@@ -3014,6 +3014,8 @@ fn maybeHandleBinding(
         .release => {
             if (self.keyboard.last_trigger) |last| {
                 if (last == event.bindingHash()) {
+                    // Letting go of a `smooth_hold` key ends the hold.
+                    try self.glideViewport(.end_hold);
                     // We don't reset the last trigger on release because
                     // an apprt may send multiple release events for a single
                     // press event.
@@ -3513,6 +3515,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
+    // A held scroll key's release goes to whatever took focus.
+    if (!focused) try self.glideViewport(.end_hold);
+
     // Notify our render thread of the new state
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .focus = focused,
@@ -3859,6 +3864,8 @@ const ViewportMotion = union(enum) {
     bottom,
     cruise,
     cruise_speed: f32,
+    hold: f32,
+    end_hold,
 };
 
 fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
@@ -3873,6 +3880,8 @@ fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
             .bottom => glide.scrollToEnd(t, .bottom),
             .cruise => glide.toggleCruise(t, 1),
             .cruise_speed => |steps| glide.adjustCruise(steps),
+            .hold => |dir| glide.startHold(t, dir),
+            .end_hold => glide.endHold(t),
         }
     }
     try self.queueRender();
@@ -5560,6 +5569,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .smooth_cruise => try self.glideViewport(.cruise),
 
         .smooth_cruise_speed => |steps| try self.glideViewport(.{ .cruise_speed = steps }),
+
+        .smooth_hold => |dir| try self.glideViewport(.{ .hold = std.math.sign(dir) }),
 
         .jump_to_prompt => |delta| {
             self.queueIo(.{

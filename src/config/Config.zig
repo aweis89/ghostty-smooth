@@ -7464,10 +7464,10 @@ pub const Keybinds = struct {
     /// `g` alone, as in `less`: `g>g` would type `g` into the program
     /// whenever the next key is not `g`.
     const reader_keybinds = [_][]const u8{
-        "j=scroll_page_lines:1",
-        "k=scroll_page_lines:-1",
-        "arrow_down=scroll_page_lines:1",
-        "arrow_up=scroll_page_lines:-1",
+        "j=smooth_hold:1",
+        "k=smooth_hold:-1",
+        "arrow_down=smooth_hold:1",
+        "arrow_up=smooth_hold:-1",
         "space=scroll_page_fractional:0.9",
         "f=scroll_page_fractional:0.9",
         "page_down=scroll_page_fractional:0.9",
@@ -10808,9 +10808,9 @@ test "default reader key table" {
     defer config.deinit();
     const reader = config.keybind.tables.get("reader").?;
 
-    // `j` glides a row.
+    // `j` scrolls down while held.
     const j = reader.getEvent(.{ .key = .key_j, .utf8 = "j", .unshifted_codepoint = 'j' }).?;
-    try testing.expectEqual(@as(i16, 1), j.value_ptr.leaf.action.scroll_page_lines);
+    try testing.expectEqual(@as(f32, 1), j.value_ptr.leaf.action.smooth_hold);
 
     // `q` leaves the table and goes back to the bottom.
     const q = reader.getEvent(.{ .key = .key_q, .utf8 = "q", .unshifted_codepoint = 'q' }).?;

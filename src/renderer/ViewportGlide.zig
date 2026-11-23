@@ -22,8 +22,8 @@ const std = @import("std");
 const terminalpkg = @import("../terminal/main.zig");
 const Terminal = terminalpkg.Terminal;
 
-/// Spring stiffness; settles a page in about a quarter of a second.
-pub const stiffness: f32 = 400;
+/// Spring stiffness; settles a page in about a third of a second.
+pub const stiffness: f32 = 160;
 /// Rows of spring kept at most: a longer jump (`gg` through a long
 /// history) jumps the excess at once and glides the last stretch.
 pub const max_spring_rows: f32 = 96;
@@ -31,6 +31,10 @@ pub const max_spring_rows: f32 = 96;
 pub const min_cruise: f32 = 0.25;
 pub const max_cruise: f32 = 60;
 pub const default_cruise: f32 = 2;
+/// Speed while a key is held (`startHold`), rows/s, reached over
+/// `hold_ramp` seconds so a press does not jolt.
+pub const hold_speed: f32 = 12;
+pub const hold_ramp: f32 = 0.15;
 /// Speed factor per `cruise_speed` step.
 pub const cruise_step: f32 = 1.25;
 
@@ -43,6 +47,11 @@ velocity: f32 = 0,
 lag: f32 = 0,
 /// Cruise direction: 1 down, -1 up, 0 off.
 cruise_dir: f32 = 0,
+/// Held-key motion: direction (1 down, -1 up, 0 off), seconds held, and
+/// the visual position it started from.
+hold_dir: f32 = 0,
+hold_t: f32 = 0,
+hold_from: f32 = 0,
 /// Cruise speed, rows/s; kept between cruises.
 cruise_speed: f32 = default_cruise,
 /// Where the glide left the viewport, so a move by anything else (a clear,
@@ -55,7 +64,8 @@ left: struct {
 } = .{},
 
 pub fn isActive(self: *const ViewportGlide) bool {
-    return self.remaining != 0 or self.velocity != 0 or self.cruise_dir != 0 or self.lag != 0;
+    return self.remaining != 0 or self.velocity != 0 or self.cruise_dir != 0 or
+        self.hold_dir != 0 or self.lag != 0;
 }
 
 /// Stop where the viewport is now. Rounds to the nearest row so a glide
@@ -70,6 +80,7 @@ fn reset(self: *ViewportGlide) void {
     self.velocity = 0;
     self.lag = 0;
     self.cruise_dir = 0;
+    self.hold_dir = 0;
 }
 
 fn remember(self: *ViewportGlide, term: *Terminal) void {
@@ -149,6 +160,31 @@ pub fn toggleCruise(self: *ViewportGlide, term: *Terminal, dir: f32) void {
     if (self.remaining == 0) self.remaining = if (self.lag >= 0.5) self.lag - 1 else self.lag;
 }
 
+/// Scroll at a steady speed in `dir` while a key is held, until
+/// `endHold`. Repeats of the same key change nothing.
+pub fn startHold(self: *ViewportGlide, term: *Terminal, dir: f32) void {
+    if (self.isActive() and self.movedElsewhere(term)) self.reset();
+    if (self.hold_dir == dir) return;
+    self.hold_dir = dir;
+    self.hold_t = 0;
+    self.hold_from = self.position(term).v + self.remaining;
+    self.remember(term);
+}
+
+/// The held key was let go: glide on to the next whole row in the
+/// direction of travel, and at least one row, so a tap moves exactly one.
+pub fn endHold(self: *ViewportGlide, term: *Terminal) void {
+    if (self.hold_dir == 0) return;
+    const dir = self.hold_dir;
+    self.hold_dir = 0;
+    if (self.movedElsewhere(term)) return self.reset();
+    const p = self.position(term);
+    const at = p.v + self.remaining;
+    var dest = if (dir > 0) @ceil(at) else @floor(at);
+    if (@abs(dest - self.hold_from) < 1) dest = self.hold_from + dir;
+    self.remaining = std.math.clamp(dest, 0, p.max) - p.v;
+}
+
 /// Change the cruise speed by `steps` factors of `cruise_step`.
 pub fn adjustCruise(self: *ViewportGlide, steps: f32) void {
     self.cruise_speed = std.math.clamp(
@@ -187,6 +223,10 @@ pub fn step(self: *ViewportGlide, term: *Terminal, dt: f32) f32 {
         self.velocity = nv;
     }
     moved += self.cruise_dir * self.cruise_speed * dt;
+    if (self.hold_dir != 0) {
+        self.hold_t += dt;
+        moved += self.hold_dir * hold_speed * @min(1, self.hold_t / hold_ramp) * dt;
+    }
 
     // The viewport sits at the row at or below the visual position:
     // `lag` in [0, 1).
@@ -204,11 +244,12 @@ pub fn step(self: *ViewportGlide, term: *Terminal, dt: f32) f32 {
             self.remaining = 0;
             self.velocity = 0;
             self.cruise_dir = 0;
+            self.hold_dir = 0;
             lag = 0;
         }
     }
     // A finished spring with no cruise lands exactly on a row.
-    if (self.remaining == 0 and self.velocity == 0 and self.cruise_dir == 0) {
+    if (self.remaining == 0 and self.velocity == 0 and self.cruise_dir == 0 and self.hold_dir == 0) {
         if (lag >= 0.5) term.scrollViewport(.{ .delta = -1 });
         lag = 0;
     }
@@ -348,4 +389,31 @@ test "viewport glide: turning back near the bottom is not lost" {
     g.scrollBy(&term, -6);
     try settle(&g, &term);
     try testing.expectEqual(bottom - 6, viewportOffset(&term));
+}
+
+test "viewport glide: a held key scrolls steadily and a tap moves one row" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    const start = viewportOffset(&term);
+
+    var g: ViewportGlide = .{};
+    // Tap: press and release within a frame.
+    g.startHold(&term, -1);
+    _ = g.step(&term, 1.0 / 120.0);
+    g.endHold(&term);
+    try settle(&g, &term);
+    try testing.expectEqual(start - 1, viewportOffset(&term));
+
+    // Hold for a second: about `hold_speed` rows, landing on a row.
+    g.startHold(&term, -1);
+    for (0..120) |_| {
+        // Repeats of the held key change nothing.
+        g.startHold(&term, -1);
+        _ = g.step(&term, 1.0 / 120.0);
+    }
+    g.endHold(&term);
+    try settle(&g, &term);
+    const held = start - 1 - viewportOffset(&term);
+    try std.testing.expect(held >= 10 and held <= 13);
 }
