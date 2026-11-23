@@ -182,9 +182,9 @@ struct PCodeCompletionLayer: View {
         }
     }
 
+    /// Keep the selected row in view; with none (a fresh or refiltered list), show the top.
     private func scroll(_ proxy: ScrollViewProxy, to row: Int?) {
-        guard let row else { return }
-        proxy.scrollTo(row)
+        proxy.scrollTo(row ?? 0)
     }
 
     private func row(
