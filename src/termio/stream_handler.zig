@@ -589,10 +589,7 @@ pub const StreamHandler = struct {
                 // The app's turn is all written: drop a park that never
                 // fired, unless those last rows just made it due.
                 if (std.mem.eql(u8, body, "park;off")) {
-                    if (self.renderer_state.parkIfDue()) {
-                        self.surfaceMessageWriter(.reader_park);
-                        try self.queueRender();
-                    }
+                    if (self.renderer_state.parkIfDue()) try self.queueRender();
                     self.renderer_state.dropPark();
                     return;
                 }

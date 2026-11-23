@@ -1173,16 +1173,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
-        .reader_park => reader: {
-            // Back at the bottom already (typed meanwhile): not reading.
-            {
-                self.renderer_state.mutex.lockUncancelable(global.io());
-                defer self.renderer_state.mutex.unlock(global.io());
-                if (self.io.terminal.screens.active.pages.viewport == .active) break :reader;
-            }
-            _ = try self.performBindingAction(.{ .activate_key_table = "reader" });
-        },
-
         .present_surface => try self.presentSurface(),
 
         .password_input => |v| try self.passwordInput(v),

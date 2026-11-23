@@ -50,9 +50,11 @@ viewport_glide: ViewportGlide = .{},
 
 /// Fork: `ESC _ smooth;park ESC \` arms a park, and the next turn mark
 /// (`smooth;mark;1`) binds it. Once that row scrolls above the top while
-/// the viewport follows the bottom, the renderer pins the viewport there
-/// and the surface enters its `reader` key table. Anything that takes the
-/// viewport elsewhere first, or a keystroke, drops it.
+/// the viewport follows the bottom, the renderer pins the viewport there.
+/// A park only moves the viewport, never a key table: typing still reaches
+/// the app (and `scroll-to-bottom = keystroke` snaps back), and reader mode
+/// stays an explicit binding. Anything that takes the viewport elsewhere
+/// first, or a keystroke, drops it.
 park: enum { off, armed, bound } = .off,
 /// The bound turn's row, tracked on `park_pages` (the primary screen's).
 park_pin: ?*terminalpkg.PageList.Pin = null,
