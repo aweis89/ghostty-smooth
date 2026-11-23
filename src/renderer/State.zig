@@ -10,6 +10,11 @@ const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const log = std.log.scoped(.renderer_state);
+pub const ViewportGlide = @import("ViewportGlide.zig");
+
+test {
+    _ = ViewportGlide;
+}
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -38,6 +43,10 @@ mouse: Mouse = .{},
 /// scrolling. Positive shifts content down (toward scrollback). Always
 /// strictly less than one cell height in magnitude.
 scroll_offset_px: f32 = 0,
+
+/// Glided scrolling for keybound scroll actions and cruise; it drives the
+/// viewport and `scroll_offset_px` while active. See `ViewportGlide`.
+viewport_glide: ViewportGlide = .{},
 
 /// Experimental app-declared smooth scroll regions, keyed by id. See
 /// `Smooth` for the escape sequence.

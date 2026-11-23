@@ -7436,7 +7436,60 @@ pub const Keybinds = struct {
                 .{ .esc = "f" },
             );
         }
+
+        // Fork: the `reader` key table, for reading back through scrollback
+        // with glided motion. Cmd+R (Linux: Ctrl+Shift+R) enters it.
+        // (Not `parseCLI`: it calls `init`, a dependency loop.)
+        try putDefault(&self.set, alloc, if (comptime builtin.target.os.tag.isDarwin())
+            "super+r=activate_key_table:reader"
+        else
+            "ctrl+shift+r=activate_key_table:reader");
+        var reader: inputpkg.Binding.Set = .{};
+        for (reader_keybinds) |line| try putDefault(&reader, alloc, line);
+        try self.tables.put(alloc, "reader", reader);
     }
+
+    /// Add a built-in binding; only running out of memory can fail it.
+    fn putDefault(set: *inputpkg.Binding.Set, alloc: Allocator, line: []const u8) Allocator.Error!void {
+        set.parseAndPut(alloc, line) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => std.debug.panic("bad built-in keybind {s}: {}", .{ line, err }),
+        };
+    }
+
+    /// The default `reader` key table: vim and less keys, all glided.
+    /// Any other key leaves it and goes on to the program, which snaps
+    /// the viewport back to the bottom.
+    const reader_keybinds = [_][]const u8{
+        "j=scroll_page_lines:1",
+        "k=scroll_page_lines:-1",
+        "arrow_down=scroll_page_lines:1",
+        "arrow_up=scroll_page_lines:-1",
+        "space=scroll_page_fractional:0.9",
+        "f=scroll_page_fractional:0.9",
+        "page_down=scroll_page_fractional:0.9",
+        "b=scroll_page_fractional:-0.9",
+        "shift+space=scroll_page_fractional:-0.9",
+        "page_up=scroll_page_fractional:-0.9",
+        "d=scroll_page_fractional:0.5",
+        "ctrl+d=scroll_page_fractional:0.5",
+        "u=scroll_page_fractional:-0.5",
+        "ctrl+u=scroll_page_fractional:-0.5",
+        "g>g=scroll_to_top",
+        "shift+g=scroll_to_bottom",
+        "c=smooth_cruise",
+        "equal=smooth_cruise_speed:1",
+        "shift+equal=smooth_cruise_speed:1",
+        "minus=smooth_cruise_speed:-1",
+        "q=deactivate_key_table",
+        "chain=scroll_to_bottom",
+        "escape=deactivate_key_table",
+        "chain=scroll_to_bottom",
+        "i=deactivate_key_table",
+        "chain=scroll_to_bottom",
+        "super+c=copy_to_clipboard",
+        "unconsumed:catch_all=deactivate_key_table",
+    };
 
     pub fn parseCLI(self: *Keybinds, alloc: Allocator, input: ?[]const u8) !void {
         var copy: ?[]u8 = null;
@@ -8204,8 +8257,10 @@ pub const Keybinds = struct {
         // Reset to defaults (empty value)
         try keybinds.parseCLI(alloc, "");
 
-        // Tables should be cleared, root set has defaults
-        try testing.expectEqual(0, keybinds.tables.count());
+        // Tables should be cleared back to the default `reader` table,
+        // root set has defaults
+        try testing.expectEqual(1, keybinds.tables.count());
+        try testing.expect(keybinds.tables.get("reader") != null);
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };
@@ -10741,6 +10796,30 @@ test "clone default" {
 
     // I want to do this but this doesn't work (the API doesn't work)
     // try testing.expectEqualDeep(dest, source);
+}
+
+test "default reader key table" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try Config.default(alloc);
+    defer config.deinit();
+    const reader = config.keybind.tables.get("reader").?;
+
+    // `j` glides a row.
+    const j = reader.getEvent(.{ .key = .key_j, .utf8 = "j", .unshifted_codepoint = 'j' }).?;
+    try testing.expectEqual(@as(i16, 1), j.value_ptr.leaf.action.scroll_page_lines);
+
+    // `q` leaves the table and goes back to the bottom.
+    const q = reader.getEvent(.{ .key = .key_q, .utf8 = "q", .unshifted_codepoint = 'q' }).?;
+    const actions = q.value_ptr.leaf_chained.actions.items;
+    try testing.expect(actions[0] == .deactivate_key_table);
+    try testing.expect(actions[1] == .scroll_to_bottom);
+
+    // Any other key leaves the table and still reaches the program.
+    const x = reader.getEvent(.{ .key = .key_x, .utf8 = "x", .unshifted_codepoint = 'x' }).?;
+    try testing.expect(x.value_ptr.leaf.action == .deactivate_key_table);
+    try testing.expect(!x.value_ptr.leaf.flags.consumed);
 }
 
 test "clone preserves conditional state" {

@@ -2989,7 +2989,10 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) {
+            self.stopViewportGlide();
+            self.io.terminal.scrollViewport(.bottom);
+        }
 
         try self.queueRender();
     }
@@ -3700,6 +3703,8 @@ pub fn scrollCallback(
         defer self.renderer_state.publishHit();
 
         // Smooth scroll: only the plain viewport-scroll path below sets this.
+        // A trackpad scroll takes over from a glided one.
+        self.stopViewportGlide();
         self.renderer_state.scroll_offset_px = 0;
 
         // App-declared smooth scroll region: precision scrolls over it
@@ -3827,6 +3832,41 @@ pub fn scrollCallback(
     }
 
     try self.queueRender();
+}
+
+/// A keybound viewport motion, glided (see `renderer.State.ViewportGlide`).
+const ViewportMotion = union(enum) {
+    by: f32,
+    top,
+    bottom,
+    cruise,
+    cruise_speed: f32,
+};
+
+fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const glide = &self.renderer_state.viewport_glide;
+        const t = &self.io.terminal;
+        switch (motion) {
+            .by => |rows| glide.scrollBy(t, rows),
+            .top => glide.scrollToEnd(t, .top),
+            .bottom => glide.scrollToEnd(t, .bottom),
+            .cruise => glide.toggleCruise(1),
+            .cruise_speed => |steps| glide.adjustCruise(steps),
+        }
+    }
+    try self.queueRender();
+}
+
+/// Stop a glided viewport scroll where it is. Caller holds the renderer
+/// state mutex.
+fn stopViewportGlide(self: *Surface) void {
+    const glide = &self.renderer_state.viewport_glide;
+    if (!glide.isActive()) return;
+    glide.cancel(&self.io.terminal);
+    self.renderer_state.scroll_offset_px = 0;
 }
 
 /// This is called when the content scale of the surface changes. The surface
@@ -5454,17 +5494,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
-        .scroll_to_top => {
-            self.queueIo(.{
-                .scroll_viewport = .{ .top = {} },
-            }, .unlocked);
-        },
+        .scroll_to_top => try self.glideViewport(.top),
 
-        .scroll_to_bottom => {
-            self.queueIo(.{
-                .scroll_viewport = .{ .bottom = {} },
-            }, .unlocked);
-        },
+        .scroll_to_bottom => try self.glideViewport(.bottom),
 
         .scroll_to_row => |n| {
             {
@@ -5490,32 +5522,25 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .scroll_page_up => {
-            const rows: isize = @intCast(self.size.grid().rows);
-            self.queueIo(.{
-                .scroll_viewport = .{ .delta = -1 * rows },
-            }, .unlocked);
+            const rows: f32 = @floatFromInt(self.size.grid().rows);
+            try self.glideViewport(.{ .by = -rows });
         },
 
         .scroll_page_down => {
-            const rows: isize = @intCast(self.size.grid().rows);
-            self.queueIo(.{
-                .scroll_viewport = .{ .delta = rows },
-            }, .unlocked);
+            const rows: f32 = @floatFromInt(self.size.grid().rows);
+            try self.glideViewport(.{ .by = rows });
         },
 
         .scroll_page_fractional => |fraction| {
             const rows: f32 = @floatFromInt(self.size.grid().rows);
-            const delta: isize = @intFromFloat(@trunc(fraction * rows));
-            self.queueIo(.{
-                .scroll_viewport = .{ .delta = delta },
-            }, .unlocked);
+            try self.glideViewport(.{ .by = @trunc(fraction * rows) });
         },
 
-        .scroll_page_lines => |lines| {
-            self.queueIo(.{
-                .scroll_viewport = .{ .delta = lines },
-            }, .unlocked);
-        },
+        .scroll_page_lines => |lines| try self.glideViewport(.{ .by = @floatFromInt(lines) }),
+
+        .smooth_cruise => try self.glideViewport(.cruise),
+
+        .smooth_cruise_speed => |steps| try self.glideViewport(.{ .cruise_speed = steps }),
 
         .jump_to_prompt => |delta| {
             self.queueIo(.{

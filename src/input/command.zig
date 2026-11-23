@@ -747,6 +747,8 @@ fn actionCommands(action: Action.Key) []const Command {
         .scroll_to_row,
         .scroll_page_fractional,
         .scroll_page_lines,
+        .smooth_cruise,
+        .smooth_cruise_speed,
         .adjust_selection,
         .jump_to_prompt,
         .write_scrollback_file,

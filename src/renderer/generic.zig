@@ -205,6 +205,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         smooth_overscan_flags: [8]bool = @splat(true),
         glide_clock: ?std.Io.Timestamp = null,
         glide_active: bool = false,
+        /// A glided viewport scroll (`State.viewport_glide`) is running, and
+        /// when it was last stepped.
+        viewport_gliding: bool = false,
+        viewport_glide_clock: ?std.Io.Timestamp = null,
         /// Draw-to-draw gaps while a glide animates (`GHOSTTY_SMOOTH_FRAME_LOG`).
         frame_log: FrameLog = .{},
 
@@ -1300,6 +1304,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Not immediate: an update skipped during synchronized output
             // leaves this set, and must not spin.
             if (self.glide_map_stale) return .{ .delay_ms = draw_interval_ms, .kind = .update };
+            // A viewport glide moves the viewport itself, so every frame
+            // is an update.
+            if (self.viewport_gliding) return .{ .delay_ms = draw_interval_ms, .kind = .update };
 
             // An update wake includes a draw, so it wins ties.
             if (kitty_delay) |k| {
@@ -1581,7 +1588,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_bottom_node = @intFromPtr(br.node);
                     self.last_bottom_y = br.y;
 
-                    // Scroll
+                    // Scroll, ending any glided scroll.
+                    if (state.viewport_glide.isActive()) {
+                        state.viewport_glide.cancel(state.terminal);
+                        state.scroll_offset_px = 0;
+                    }
                     state.terminal.scrollViewport(.bottom);
                 }
 
@@ -1594,6 +1605,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Bring the glides up to now, then snapshot them.
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
                     _ = state.stepGlides(now);
+                    // Glided viewport scroll moves the viewport and its
+                    // sub-row offset, so before anything below reads them.
+                    if (state.viewport_glide.isActive()) {
+                        const since = self.viewport_glide_clock orelse now;
+                        const dt: f32 = @as(f32, @floatFromInt(@max(since.durationTo(now).nanoseconds, 0))) /
+                            std.time.ns_per_s;
+                        state.scroll_offset_px = state.viewport_glide.step(state.terminal, dt) * cell_h;
+                        state.publishHit();
+                    }
+                    self.viewport_gliding = state.viewport_glide.isActive();
+                    self.viewport_glide_clock = if (self.viewport_gliding) now else null;
                     self.glide_clock = now;
                     self.glide_active = false;
                     self.glide_map = null;

@@ -475,6 +475,19 @@ pub const Action = union(enum) {
     /// lines.
     scroll_page_lines: i16,
 
+    /// Scroll the screen down at a steady reading speed, like a
+    /// teleprompter, until the bottom of the scrollback. Run it again to
+    /// stop. Any other scroll action adds to the motion.
+    smooth_cruise,
+
+    /// Change the speed of `smooth_cruise` by the given number of steps of
+    /// a quarter faster each. Negative values slow it down. The speed is
+    /// kept for the next cruise.
+    ///
+    /// For example, `smooth_cruise_speed:1` is a quarter faster and
+    /// `smooth_cruise_speed:-1` a fifth slower.
+    smooth_cruise_speed: f32,
+
     /// Adjust the current selection in the given direction or position,
     /// relative to the cursor.
     ///
@@ -1438,6 +1451,8 @@ pub const Action = union(enum) {
             .scroll_page_down,
             .scroll_page_fractional,
             .scroll_page_lines,
+            .smooth_cruise,
+            .smooth_cruise_speed,
             .adjust_selection,
             .jump_to_prompt,
             .write_scrollback_file,
@@ -2747,6 +2762,10 @@ pub const Set = struct {
             trigger.key = .{ .unicode = event.unshifted_codepoint };
             if (self.get(trigger)) |v| return v;
         }
+
+        // A modifier on its own is not a key to catch: pressing shift to
+        // type a bound `G` must not first run a table's catch_all.
+        if (event.key.modifier()) return null;
 
         // Fallback to catch_all with modifiers first, then without modifiers.
         trigger.key = .catch_all;
@@ -4480,6 +4499,12 @@ test "set: getEvent catch_all fallback" {
         }).?.value_ptr.*.leaf;
         try testing.expect(action.action == .ignore);
     }
+
+    // A modifier on its own is not caught
+    try testing.expect(s.getEvent(.{
+        .key = .shift_left,
+        .mods = .{ .shift = true },
+    }) == null);
 
     // Specific binding takes precedence over catch_all
     try s.parseAndPut(alloc, "ctrl+b=new_window");
