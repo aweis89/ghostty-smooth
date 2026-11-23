@@ -208,6 +208,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// A glided viewport scroll (`State.viewport_glide`) is running, and
         /// when it was last stepped.
         viewport_gliding: bool = false,
+        /// `.reader_park` still to send to the surface (see `State.park`).
+        reader_park_pending: bool = false,
         viewport_glide_clock: ?std.Io.Timestamp = null,
         /// Draw-to-draw gaps while a glide animates (`GHOSTTY_SMOOTH_FRAME_LOG`).
         frame_log: FrameLog = .{},
@@ -1608,7 +1610,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     _ = state.stepGlides(now);
                     // Park: once the bound turn scrolls past the top while
                     // the viewport follows the bottom, pin it there.
-                    if (state.parkIfDue()) _ = self.surface_mailbox.push(.reader_park, .instant);
+                    if (state.parkIfDue()) self.reader_park_pending = true;
                     // Glided viewport scroll moves the viewport and its
                     // sub-row offset, so before anything below reads them.
                     if (state.viewport_glide.isActive()) {
@@ -1978,6 +1980,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) !bool {
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
+            // A park just pinned the viewport: the surface enters its
+            // reader table. Retried each frame until the mailbox takes it.
+            defer if (self.reader_park_pending) {
+                if (self.surface_mailbox.push(.reader_park, .instant) > 0) self.reader_park_pending = false;
+            };
             defer if (self.scrollbar_dirty) {
                 // Fail instantly if the surface mailbox if full, we'll just
                 // get it on the next frame.

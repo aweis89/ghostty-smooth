@@ -564,17 +564,29 @@ pub const StreamHandler = struct {
                         log.warn("invalid smooth APC: {s}", .{unknown.content});
                         return;
                     };
-                    self.terminal.screens.active.cursor.page_row.smooth_mark = kind;
+                    const screen = self.terminal.screens.active;
+                    screen.cursor.page_row.smooth_mark = kind;
                     if (kind == @intFromEnum(renderer.State.ViewportGlide.Mark.turn) and
-                        self.renderer_state.park == .armed)
+                        self.renderer_state.park == .armed and
+                        self.terminal.screens.active_key == .primary)
                     {
-                        self.renderer_state.park = .bound;
+                        self.renderer_state.bindPark(&screen.pages, screen.cursor.page_pin.*);
                         try self.queueRender();
                     }
                     return;
                 }
                 if (std.mem.eql(u8, body, "park")) {
-                    self.renderer_state.park = .armed;
+                    self.renderer_state.armPark();
+                    return;
+                }
+                // The app's turn is all written: drop a park that never
+                // fired, unless those last rows just made it due.
+                if (std.mem.eql(u8, body, "park;off")) {
+                    if (self.renderer_state.parkIfDue()) {
+                        self.surfaceMessageWriter(.reader_park);
+                        try self.queueRender();
+                    }
+                    self.renderer_state.dropPark();
                     return;
                 }
                 var cmd = renderer.State.Smooth.parse(body) catch {
@@ -1078,6 +1090,8 @@ pub const StreamHandler = struct {
     pub fn fullReset(
         self: *StreamHandler,
     ) !void {
+        // Before the reset frees the pages the park's pin is on.
+        self.renderer_state.dropPark();
         self.terminal.fullReset();
         try self.clearSmooth();
         try self.setMouseShape(.text);

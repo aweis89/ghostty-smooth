@@ -114,6 +114,7 @@ fn position(self: *const ViewportGlide, term: *Terminal) struct { v: f32, max: f
 /// Glide `rows` further (negative: up), clamped to the scrollback.
 pub fn scrollBy(self: *ViewportGlide, term: *Terminal, rows: f32) void {
     if (self.isActive() and self.movedElsewhere(term)) self.reset();
+    self.hold_dir = 0;
     const p = self.position(term);
     const target = std.math.clamp(p.v + self.remaining + rows, 0, p.max);
     self.setRemaining(term, target - p.v);
@@ -122,6 +123,7 @@ pub fn scrollBy(self: *ViewportGlide, term: *Terminal, rows: f32) void {
 /// Glide to the top (`.top`) or bottom (`.bottom`) of the scrollback.
 pub fn scrollToEnd(self: *ViewportGlide, term: *Terminal, end: enum { top, bottom }) void {
     if (self.isActive() and self.movedElsewhere(term)) self.reset();
+    self.hold_dir = 0;
     const p = self.position(term);
     self.cruise_dir = 0;
     self.setRemaining(term, switch (end) {
@@ -181,8 +183,13 @@ pub fn endHold(self: *ViewportGlide, term: *Terminal) void {
     const p = self.position(term);
     const at = p.v + self.remaining;
     var dest = if (dir > 0) @ceil(at) else @floor(at);
-    if (@abs(dest - self.hold_from) < 1) dest = self.hold_from + dir;
+    // At least a row from where the hold began, on a whole row.
+    if (@abs(dest - self.hold_from) < 1)
+        dest = if (dir > 0) @ceil(self.hold_from + 1) else @floor(self.hold_from - 1);
     self.remaining = std.math.clamp(dest, 0, p.max) - p.v;
+    // Carry the held speed into the spring rather than easing from rest.
+    if (self.remaining * dir > 0)
+        self.velocity = -dir * hold_speed * @min(1, self.hold_t / hold_ramp);
 }
 
 /// Row marks an app sets (`ESC _ smooth;mark;K ESC \`).
@@ -198,6 +205,7 @@ pub fn jumpToMark(self: *ViewportGlide, term: *Terminal, kind: Mark, dir: i8) bo
     const from: usize = @intFromFloat(@max(0, @round(p.v + self.remaining)));
     const row = findMark(term, kind, from, dir) orelse return false;
     self.cruise_dir = 0;
+    self.hold_dir = 0;
     const target = @min(@as(f32, @floatFromInt(row)), p.max);
     self.setRemaining(term, target - p.v);
     return true;

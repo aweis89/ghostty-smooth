@@ -54,6 +54,9 @@ viewport_glide: ViewportGlide = .{},
 /// and the surface enters its `reader` key table. Anything that takes the
 /// viewport elsewhere first, or a keystroke, drops it.
 park: enum { off, armed, bound } = .off,
+/// The bound turn's row, tracked on `park_pages` (the primary screen's).
+park_pin: ?*terminalpkg.PageList.Pin = null,
+park_pages: ?*terminalpkg.PageList = null,
 
 /// Experimental app-declared smooth scroll regions, keyed by id. See
 /// `Smooth` for the escape sequence.
@@ -309,6 +312,9 @@ test "preedit range shifts left at right edge" {
 ///   ESC _ smooth;park ESC \                               protocol 10: park at
 ///                                                         the next turn mark
 ///                                                         (see `State.park`)
+///   ESC _ smooth;park;off ESC \                           protocol 10: the turn
+///                                                         is written; drop a
+///                                                         park not yet due
 ///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;10
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
@@ -1318,6 +1324,34 @@ pub fn stepGlides(self: *State, now: std.Io.Timestamp) bool {
     return moving;
 }
 
+/// Arm a park: the next turn mark binds it (`ESC _ smooth;park ESC \`).
+/// Caller must hold the mutex.
+pub fn armPark(self: *State) void {
+    self.dropPark();
+    self.park = .armed;
+}
+
+/// Bind an armed park to the turn just marked at `pin` on the primary
+/// screen's `pages`. Caller must hold the mutex.
+pub fn bindPark(self: *State, pages: *terminalpkg.PageList, pin: terminalpkg.PageList.Pin) void {
+    if (self.park != .armed) return;
+    self.park_pin = pages.trackPin(pin) catch {
+        self.park = .off;
+        return;
+    };
+    self.park_pages = pages;
+    self.park = .bound;
+}
+
+/// Forget any park. Caller must hold the mutex, and call it before
+/// anything frees the pages the park's pin is on (a full reset).
+pub fn dropPark(self: *State) void {
+    if (self.park_pin) |p| self.park_pages.?.untrackPin(p);
+    self.park_pin = null;
+    self.park_pages = null;
+    self.park = .off;
+}
+
 /// Pin the viewport at the bound park's turn if it has scrolled past the
 /// top; true when it just did (see `park`). Caller must hold the mutex.
 pub fn parkIfDue(self: *State) bool {
@@ -1326,17 +1360,31 @@ pub fn parkIfDue(self: *State) bool {
     // A full-screen app has the screen: wait for the conversation.
     if (t.screens.active_key != .primary) return false;
     const pages = &t.screens.active.pages;
-    if (pages.viewport != .active) {
-        self.park = .off;
+    const pin = self.park_pin.?;
+    // Its row gone (evicted, cleared) or no longer the turn: never park
+    // at some other turn instead.
+    if (pages != self.park_pages.? or pages.viewport != .active or pin.garbage or
+        pin.rowAndCell().row.smooth_mark != @intFromEnum(ViewportGlide.Mark.turn))
+    {
+        self.dropPark();
         return false;
     }
+    const pt = pages.pointFromPin(.screen, pin.*) orelse {
+        self.dropPark();
+        return false;
+    };
+    const row: usize = pt.screen.y;
     const sb = pages.scrollbar();
-    const top = sb.total -| sb.len;
-    const row = ViewportGlide.findMark(t, .turn, sb.total -| 1, -1) orelse return false;
-    if (row >= top) return false;
+    if (row >= sb.total -| sb.len) return false;
     t.scrollViewport(.{ .row = row });
-    self.park = .off;
+    self.dropPark();
     return true;
+}
+
+fn testMarkTurn(state: *State, term: *terminalpkg.Terminal) void {
+    const screen = term.screens.active;
+    screen.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    state.bindPark(&screen.pages, screen.cursor.page_pin.*);
 }
 
 test "park: pins the viewport once the turn scrolls past the top" {
@@ -1346,9 +1394,10 @@ test "park: pins the viewport once the turn scrolls past the top" {
     var state: State = .{ .mutex = undefined, .terminal = &term };
 
     try term.printString("a\r\nb\r\n");
-    term.screens.active.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    state.armPark();
+    testMarkTurn(&state, &term);
     const turn_row = term.screens.active.cursor.y;
-    state.park = .bound;
+    try testing.expect(state.park == .bound);
     // Still on screen: nothing yet.
     try term.printString("prompt\r\n");
     try testing.expect(!state.parkIfDue());
@@ -1366,11 +1415,31 @@ test "park: dropped when the viewport is already in history" {
     var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10 });
     defer term.deinit(testing.allocator);
     var state: State = .{ .mutex = undefined, .terminal = &term };
+    state.armPark();
+    testMarkTurn(&state, &term);
     for (0..30) |_| try term.printString("line\r\n");
     term.scrollViewport(.{ .delta = -5 });
-    state.park = .bound;
     try testing.expect(!state.parkIfDue());
     try testing.expect(state.park == .off);
+}
+
+test "park: never lands on an older turn when its own mark is erased" {
+    const testing = std.testing;
+    var term = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10 });
+    defer term.deinit(testing.allocator);
+    var state: State = .{ .mutex = undefined, .terminal = &term };
+
+    // An older turn, scrolled well into history.
+    term.screens.active.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    for (0..30) |_| try term.printString("old\r\n");
+    state.armPark();
+    testMarkTurn(&state, &term);
+    // A full clear (pcode's resize replay) erases the bound turn's mark.
+    term.eraseDisplay(.complete, false);
+    for (0..30) |_| try term.printString("replay\r\n");
+    try testing.expect(!state.parkIfDue());
+    try testing.expect(state.park == .off);
+    try testing.expect(term.screens.active.pages.viewport == .active);
 }
 
 /// The smooth scroll region containing viewport cell (x, y), if any; where

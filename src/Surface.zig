@@ -1173,7 +1173,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
-        .reader_park => _ = try self.performBindingAction(.{ .activate_key_table = "reader" }),
+        .reader_park => reader: {
+            // Back at the bottom already (typed meanwhile): not reading.
+            {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                if (self.io.terminal.screens.active.pages.viewport == .active) break :reader;
+            }
+            _ = try self.performBindingAction(.{ .activate_key_table = "reader" });
+        },
 
         .present_surface => try self.presentSurface(),
 
@@ -2991,8 +2999,10 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        // Typing a follow-up: don't park the answer from under it.
-        self.renderer_state.park = .off;
+        // Typing a follow-up: don't park the answer from under it. Not on a
+        // release: with release reporting, the Enter that sent the prompt
+        // would drop the park it armed.
+        if (event.action != .release) self.renderer_state.dropPark();
         if (self.config.scroll_to_bottom.keystroke) {
             self.stopViewportGlide();
             self.io.terminal.scrollViewport(.bottom);
@@ -3016,10 +3026,12 @@ fn maybeHandleBinding(
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
         .release => {
+            // A held `smooth_hold` key let go. Not matched by binding hash:
+            // a modifier pressed meanwhile would change it and the scroll
+            // would run on to the end.
+            if (!event.key.modifier()) try self.endViewportHold();
             if (self.keyboard.last_trigger) |last| {
                 if (last == event.bindingHash()) {
-                    // Letting go of a `smooth_hold` key ends the hold.
-                    try self.glideViewport(.end_hold);
                     // We don't reset the last trigger on release because
                     // an apprt may send multiple release events for a single
                     // press event.
@@ -3520,7 +3532,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // A held scroll key's release goes to whatever took focus.
-    if (!focused) try self.glideViewport(.end_hold);
+    if (!focused) try self.endViewportHold();
 
     // Notify our render thread of the new state
     _ = self.renderer_thread.mailbox.push(global.io(), .{
@@ -3869,7 +3881,6 @@ const ViewportMotion = union(enum) {
     cruise,
     cruise_speed: f32,
     hold: f32,
-    end_hold,
     jump: struct { kind: rendererpkg.State.ViewportGlide.Mark, dir: i8 },
 };
 
@@ -3886,11 +3897,22 @@ fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
             .cruise => glide.toggleCruise(t, 1),
             .cruise_speed => |steps| glide.adjustCruise(steps),
             .hold => |dir| glide.startHold(t, dir),
-            .end_hold => glide.endHold(t),
             // Past the newest turn is the live bottom.
             .jump => |j| if (!glide.jumpToMark(t, j.kind, j.dir) and
                 j.kind == .turn and j.dir > 0) glide.scrollToEnd(t, .bottom),
         }
+    }
+    try self.queueRender();
+}
+
+/// End a `smooth_hold`, if one is running.
+fn endViewportHold(self: *Surface) !void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const glide = &self.renderer_state.viewport_glide;
+        if (glide.hold_dir == 0) return;
+        glide.endHold(&self.io.terminal);
     }
     try self.queueRender();
 }
@@ -6430,6 +6452,8 @@ fn completeClipboardPaste(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
+        // Pasting a follow-up, like typing one, keeps the answer from parking.
+        self.renderer_state.dropPark();
 
         // If we have paste protection enabled, we detect unsafe pastes and return
         // an error. The error approach allows apprt to attempt to complete the paste

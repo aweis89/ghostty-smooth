@@ -2969,7 +2969,9 @@ const ReflowCursor = struct {
 
     fn copyRowMetadata(self: *ReflowCursor, other: *const Row) void {
         self.page_row.semantic_prompt = other.semantic_prompt;
-        self.page_row.smooth_mark = other.smooth_mark;
+        // Only a row's start carries its mark: a continuation joining the
+        // row while widening must not clear it.
+        if (!other.wrap_continuation) self.page_row.smooth_mark = other.smooth_mark;
     }
 };
 
@@ -18797,6 +18799,33 @@ test "PageList resize reflow keeps a smooth mark on the first line only" {
         if (m == 1) turns += 1;
     }
     try testing.expectEqual(@as(usize, 1), turns);
+}
+
+test "PageList resize reflow widening keeps a smooth mark" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 4, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+    {
+        const page = s.pages.first.?.page();
+        // A marked row soft-wrapped onto the next.
+        const first = page.getRowAndCell(0, 0).row;
+        first.smooth_mark = 2;
+        first.wrap = true;
+        page.getRowAndCell(0, 1).row.wrap_continuation = true;
+        for (0..2) |y| for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'a' } },
+            };
+        };
+    }
+
+    try s.resize(.{ .cols = 8, .reflow = true });
+    const p = s.pin(.{ .screen = .{} }).?;
+    try testing.expectEqual(@as(u2, 2), p.rowAndCell().row.smooth_mark);
 }
 
 test "PageList resize reflow semantic prompt marks" {
