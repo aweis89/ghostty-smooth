@@ -950,11 +950,17 @@ struct ImageVertexIn {
 
   // The final width/height of the image in pixels.
   float2 dest_size [[attribute(3)]];
+
+  // Nonzero when the image follows smooth scroll regions (Kitty
+  // placements); zero for grid-fixed images like the debug overlay.
+  uint smooth [[attribute(4)]];
 };
 
 struct ImageVertexOut {
   float4 position [[position]];
   float2 tex_coord;
+  float4 clip [[flat]];
+  float fade_bottom [[flat]];
 };
 
 vertex ImageVertexOut image_vertex(
@@ -995,6 +1001,30 @@ vertex ImageVertexOut image_vertex(
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
 
+  // Smooth scroll region: glide and clip with the text around the image
+  // (as cell_text_vertex does), keyed on the image's top-left cell.
+  out.clip = float4(-1e9, 1e9, -1e9, 1e9);
+  out.fade_bottom = 0.0;
+  int region = in.smooth != 0u
+    ? smooth_region_at(uniforms, int2(floor(in.grid_pos)))
+    : -1;
+  if (region >= 0) {
+    float4 r = float4(uniforms.smooth_rects[region]);
+    float ox = uniforms.smooth_offsets_x[region];
+    image_pos.y -= uniforms.smooth_offsets[region];
+    float right = r.w + 1;
+    if (ox >= 0.0) {
+      image_pos.x -= ox;
+      right = r.w;
+    }
+    if (smooth_no_overscan(uniforms, region)) r.y += 1;
+    out.clip = float4(
+      uniforms.grid_padding.x + r.xy * uniforms.cell_size.y,
+      uniforms.grid_padding.w + float2(r.z, right) * uniforms.cell_size.x
+    );
+    out.fade_bottom = uniforms.smooth_fade_bottom[region];
+  }
+
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);
   out.tex_coord = tex_coord;
@@ -1006,6 +1036,16 @@ fragment float4 image_fragment(
   texture2d<float> image [[texture(0)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  if (in.position.y < in.clip.x || in.position.y >= in.clip.y ||
+      in.position.x < in.clip.z || in.position.x >= in.clip.w) {
+    discard_fragment();
+  }
+  float fade = 1.0;
+  if (in.fade_bottom > 0.0) {
+    fade = smoothstep(0.0, in.fade_bottom, in.clip.y - in.position.y);
+    if (fade <= 0.001) discard_fragment();
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,
@@ -1020,6 +1060,6 @@ fragment float4 image_fragment(
 
   rgba.rgb *= rgba.a;
 
-  return rgba;
+  return rgba * fade;
 }
 

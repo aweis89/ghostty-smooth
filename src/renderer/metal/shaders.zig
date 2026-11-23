@@ -329,6 +329,8 @@ pub const Image = extern struct {
     cell_offset: [2]f32,
     source_rect: [4]f32,
     dest_size: [2]f32,
+    /// Nonzero when the image follows smooth scroll regions.
+    smooth: u32 = 0,
 };
 
 /// Single parameter for the bg image shader.

@@ -171,6 +171,10 @@ pub const State = struct {
                         @as(f32, @floatFromInt(p.width)),
                         @as(f32, @floatFromInt(p.height)),
                     },
+
+                    // Kitty images glide with smooth scroll regions like
+                    // the text around them; the debug overlay is fixed.
+                    .smooth = @intFromBool(placement_type != .overlay),
                 }},
             ) catch |err| {
                 log.warn("error creating image vertex buffer err={}", .{err});
