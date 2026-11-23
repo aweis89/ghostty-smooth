@@ -53,8 +53,9 @@ enum PCode {
     /// dash before argv[0], and a venv's Python finds its venv from argv[0], so
     /// `env` starts it with a plain one. `-I` keeps the directory, user site
     /// and PYTHON* variables out of its imports. `args` must be plain already.
-    static func pythonCommand(_ python: String, module: String, args: [String]) -> String {
-        (["/usr/bin/env", shellQuoted(python), "-I", "-m", module] + args).joined(separator: " ")
+    /// `env` entries are plain `NAME=value` words, set for the program alone.
+    static func pythonCommand(_ python: String, module: String, args: [String], env: [String] = []) -> String {
+        (["/usr/bin/env"] + env + [shellQuoted(python), "-I", "-m", module] + args).joined(separator: " ")
     }
 
     static func shellQuoted(_ text: String) -> String {

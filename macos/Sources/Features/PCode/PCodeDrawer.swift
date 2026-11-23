@@ -154,7 +154,9 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
             return message("This session host's pcode predates the drawer: run /restart in pcode.")
         }
         // The ids are plain by now.
-        return PCode.pythonCommand(python, module: "pcode.btw_tail", args: [host, thread])
+        // Tells the viewer we draw its key footer, so it leaves its own key line out.
+        return PCode.pythonCommand(
+            python, module: "pcode.btw_tail", args: [host, thread], env: ["PCODE_NATIVE_HINTS=1"])
     }
 
     /// A command that only shows `text`; the embedded API waits after every

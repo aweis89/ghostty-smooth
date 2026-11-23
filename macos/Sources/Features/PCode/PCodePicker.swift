@@ -64,9 +64,26 @@ final class PCodePicker: ObservableObject {
             case cancelKeys = "cancel_keys"
         }
 
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            title = try container.decode(String.self, forKey: .title)
+            header = try container.decode(String.self, forKey: .header)
+            empty = try container.decode(String.self, forKey: .empty)
+            selected = try container.decodeIfPresent(String.self, forKey: .selected)
+            query = try container.decode(String.self, forKey: .query)
+            match = try container.decode(String.self, forKey: .match)
+            custom = try container.decodeIfPresent(String.self, forKey: .custom)
+            items = try container.decode([Item].self, forKey: .items)
+            actions = try container.decode([Action].self, forKey: .actions)
+            cancelKeys = try container.decodeIfPresent([String].self, forKey: .cancelKeys)
+            style = try container.decodeIfPresent(PCodePickStyle.self, forKey: .style)
+            // A footer pcode got wrong costs only the footer, never the list.
+            hints = try? container.decodeIfPresent([PCodeHint].self, forKey: .hints)
+        }
+
         /// The footer: pcode's hints, else the ones an older pcode left to us.
         var footer: [PCodeHint] {
-            if let hints { return Array(hints.prefix(PCodeHint.maxCount)) }
+            if let hints { return Array(hints.filter { !$0.key.isEmpty }.prefix(PCodeHint.maxCount)) }
             var result = [PCodeHint(key: "↩", label: "Choose", keep: true)]
             for action in actions {
                 result.append(PCodeHint(key: PCodePicker.keyLabel(action.key), label: action.label, keep: false))
