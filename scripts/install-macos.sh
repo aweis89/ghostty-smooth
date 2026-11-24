@@ -65,13 +65,7 @@ mkdir -p builds
 trash "$tmp"
 cp -R "$src" "$tmp"
 
-plist="$tmp/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleName $name" "$plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $name" "$plist"
-
-codesign --force --deep --sign - "$tmp" >/dev/null 2>&1
-codesign --verify "$tmp"
+APP_NAME="$name" BUNDLE_ID="$bundle_id" scripts/brand-pcode-app.sh "$tmp"
 
 trash "$dest"
 mv "$tmp" "$dest"

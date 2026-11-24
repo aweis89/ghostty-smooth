@@ -1037,7 +1037,17 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func checkForUpdates(_ sender: Any?) {
-        updateController.checkForUpdates()
+        // pcode: Sparkle's feeds are upstream Ghostty's, so "updating" would
+        // replace this fork with stock Ghostty. Homebrew owns updates instead.
+        let alert = NSAlert()
+        alert.messageText = "Update with Homebrew"
+        alert.informativeText = "Run this in a terminal:\n\nbrew upgrade --cask aweis89/tap/pcode"
+        alert.addButton(withTitle: "Copy Command")
+        alert.addButton(withTitle: "OK")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew upgrade --cask aweis89/tap/pcode", forType: .string)
+        }
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
