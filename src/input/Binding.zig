@@ -477,7 +477,9 @@ pub const Action = union(enum) {
 
     /// Scroll the screen down at a steady reading speed, like a
     /// teleprompter, until the bottom of the scrollback. Run it again to
-    /// stop. Any other scroll action adds to the motion.
+    /// stop: play and pause. Keeping the key that started it held runs it
+    /// three times as fast until the key is let go. Other scroll actions
+    /// add to the motion, except `smooth_hold` upwards, which stops it.
     smooth_cruise,
 
     /// Scroll the screen at a steady speed while the key is held, then
@@ -497,7 +499,9 @@ pub const Action = union(enum) {
 
     /// Change the speed of `smooth_cruise` by the given number of steps of
     /// a quarter faster each. Negative values slow it down. The speed is
-    /// kept for the next cruise.
+    /// kept for the next cruise. Faster while no cruise is running starts
+    /// one at the kept speed, and slower at the slowest speed stops it. A
+    /// key held down changes the speed once, not on every repeat.
     ///
     /// For example, `smooth_cruise_speed:1` is a quarter faster and
     /// `smooth_cruise_speed:-1` a fifth slower.

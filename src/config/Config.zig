@@ -945,6 +945,11 @@ palette: Palette = .{},
 /// The default is `keystroke, no-output`.
 @"scroll-to-bottom": ScrollToBottom = .default,
 
+/// The speed `smooth_cruise` starts at, in rows per second, between 0.5 and
+/// 60. `smooth_cruise_speed` changes it from there, and a new tab or split
+/// starts at the speed the last one was left at.
+@"smooth-cruise-speed": f32 = 2,
+
 /// Determines whether running programs can detect the shift key pressed with a
 /// mouse click. Typically, the shift key is used to extend mouse selection.
 ///
@@ -7468,7 +7473,6 @@ pub const Keybinds = struct {
         "k=smooth_hold:-1",
         "arrow_down=smooth_hold:1",
         "arrow_up=smooth_hold:-1",
-        "space=scroll_page_fractional:0.9",
         "f=scroll_page_fractional:0.9",
         "page_down=scroll_page_fractional:0.9",
         "b=scroll_page_fractional:-0.9",
@@ -7489,9 +7493,17 @@ pub const Keybinds = struct {
         "chain=deactivate_key_table",
         "chain=scroll_to_bottom",
         "shift+g=scroll_to_bottom",
+        // Cruise. Space is play and pause, as in a media player, and held
+        // from a start it boosts. Left and right are slower and faster:
+        // up and down move the page, so the other axis is the pace.
+        "space=smooth_cruise",
         "c=smooth_cruise",
+        "l=smooth_cruise_speed:1",
+        "arrow_right=smooth_cruise_speed:1",
         "equal=smooth_cruise_speed:1",
         "shift+equal=smooth_cruise_speed:1",
+        "h=smooth_cruise_speed:-1",
+        "arrow_left=smooth_cruise_speed:-1",
         "minus=smooth_cruise_speed:-1",
         "q=deactivate_key_table",
         "chain=scroll_to_bottom",
@@ -10816,6 +10828,14 @@ test "default reader key table" {
     var config = try Config.default(alloc);
     defer config.deinit();
     const reader = config.keybind.tables.get("reader").?;
+
+    // Space plays and pauses the cruise; `h` and `l` shift its gear.
+    const space = reader.getEvent(.{ .key = .space, .utf8 = " ", .unshifted_codepoint = ' ' }).?;
+    try testing.expect(space.value_ptr.leaf.action == .smooth_cruise);
+    const h = reader.getEvent(.{ .key = .key_h, .utf8 = "h", .unshifted_codepoint = 'h' }).?;
+    try testing.expectEqual(@as(f32, -1), h.value_ptr.leaf.action.smooth_cruise_speed);
+    const l = reader.getEvent(.{ .key = .key_l, .utf8 = "l", .unshifted_codepoint = 'l' }).?;
+    try testing.expectEqual(@as(f32, 1), l.value_ptr.leaf.action.smooth_cruise_speed);
 
     // `j` scrolls down while held.
     const j = reader.getEvent(.{ .key = .key_j, .utf8 = "j", .unshifted_codepoint = 'j' }).?;

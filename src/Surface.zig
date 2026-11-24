@@ -41,6 +41,11 @@ const ProcessInfo = @import("pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.surface);
 
+/// The cruise speed the last surface to change it was left at, so a new tab
+/// or split starts at the reader's own pace rather than the configured one.
+/// Only read and written on the app thread.
+var kept_cruise_speed: ?f32 = null;
+
 // The renderer implementation to use.
 const Renderer = rendererpkg.Renderer;
 
@@ -633,6 +638,11 @@ pub fn init(
         .renderer_state = .{
             .mutex = mutex,
             .terminal = &self.io.terminal,
+            .viewport_glide = glide: {
+                var glide: rendererpkg.State.ViewportGlide = .{};
+                glide.setCruiseSpeed(kept_cruise_speed orelse config.@"smooth-cruise-speed");
+                break :glide glide;
+            },
         },
         .renderer_thr = undefined,
         .mouse = .{},
@@ -3019,7 +3029,7 @@ fn maybeHandleBinding(
             // A held `smooth_hold` key let go. Not matched by binding hash:
             // a modifier pressed meanwhile would change it and the scroll
             // would run on to the end.
-            if (!event.key.modifier()) try self.endViewportHold();
+            if (!event.key.modifier()) try self.releaseViewportKey();
             if (self.keyboard.last_trigger) |last| {
                 if (last == event.bindingHash()) {
                     // We don't reset the last trigger on release because
@@ -3175,7 +3185,11 @@ fn maybeHandleBinding(
         // actions perform.
         var performed: bool = false;
         for (actions) |action| {
-            if (self.performBindingAction(action)) |v| {
+            const result = if (event.action == .repeat)
+                self.repeatBindingAction(action)
+            else
+                self.performBindingAction(action);
+            if (result) |v| {
                 performed = performed or v;
             } else |err| {
                 log.info(
@@ -3522,7 +3536,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // A held scroll key's release goes to whatever took focus.
-    if (!focused) try self.endViewportHold();
+    if (!focused) try self.releaseViewportKey();
 
     // Notify our render thread of the new state
     _ = self.renderer_thread.mailbox.push(global.io(), .{
@@ -3869,42 +3883,118 @@ const ViewportMotion = union(enum) {
     top,
     bottom,
     cruise,
+    /// The cruise key repeating while held.
+    cruise_boost,
     cruise_speed: f32,
     hold: f32,
     jump: struct { kind: rendererpkg.State.ViewportGlide.Mark, dir: i8 },
 };
 
 fn glideViewport(self: *Surface, motion: ViewportMotion) !void {
+    var changed: ?CruiseState = null;
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         const glide = &self.renderer_state.viewport_glide;
         const t = &self.io.terminal;
+        const before: CruiseState = .of(glide);
         switch (motion) {
             .by => |rows| glide.scrollBy(t, rows),
             .top => glide.scrollToEnd(t, .top),
             .bottom => glide.scrollToEnd(t, .bottom),
             .cruise => glide.toggleCruise(t, 1),
-            .cruise_speed => |steps| glide.adjustCruise(steps),
+            .cruise_boost => glide.boostCruise(),
+            .cruise_speed => |steps| glide.adjustCruise(t, steps),
             .hold => |dir| glide.startHold(t, dir),
             // Past the newest turn is the live bottom.
             .jump => |j| if (!glide.jumpToMark(t, j.kind, j.dir) and
                 j.kind == .turn and j.dir > 0) glide.scrollToEnd(t, .bottom),
         }
+        const after: CruiseState = .of(glide);
+        // The cruise keys always answer, even at a limit; any other key
+        // only when it stopped the cruise.
+        if (!std.meta.eql(before, after) or motion == .cruise or motion == .cruise_speed)
+            changed = after;
     }
+    if (changed) |state| self.showCruiseState(state);
     try self.queueRender();
 }
 
-/// End a `smooth_hold`, if one is running.
-fn endViewportHold(self: *Surface) !void {
+/// A binding's action for a key repeating while held. The cruise key
+/// boosts rather than toggling on every repeat, and a gear key shifts once
+/// a press.
+fn repeatBindingAction(self: *Surface, action: input.Binding.Action) !bool {
+    switch (action) {
+        .smooth_cruise => try self.glideViewport(.cruise_boost),
+        .smooth_cruise_speed => {},
+        else => return self.performBindingAction(action),
+    }
+    return true;
+}
+
+/// A key was let go: end a `smooth_hold` and a cruise boost, if running.
+fn releaseViewportKey(self: *Surface) !void {
+    var changed: ?CruiseState = null;
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         const glide = &self.renderer_state.viewport_glide;
-        if (glide.hold_dir == 0) return;
-        glide.endHold(&self.io.terminal);
+        if (!glide.wantsRelease()) return;
+        const before: CruiseState = .of(glide);
+        glide.releaseKey(&self.io.terminal);
+        const after: CruiseState = .of(glide);
+        if (!std.meta.eql(before, after)) changed = after;
     }
+    if (changed) |state| self.showCruiseState(state);
     try self.queueRender();
+}
+
+/// What the reader sees of a cruise: whether it runs, boosted, and how fast.
+const CruiseState = struct {
+    cruising: bool,
+    boosted: bool,
+    speed: f32,
+
+    fn of(glide: *const rendererpkg.State.ViewportGlide) CruiseState {
+        return .{
+            .cruising = glide.cruise_dir != 0,
+            .boosted = glide.boosted,
+            .speed = glide.cruise_speed,
+        };
+    }
+
+    /// "▶ 2.5 rows/s", "▶▶ 7.5 rows/s" boosted, "⏸ 2.5 rows/s" paused.
+    fn label(self: CruiseState, buf: []u8) ![]const u8 {
+        const boost: f32 = if (self.boosted) rendererpkg.State.ViewportGlide.cruise_boost else 1;
+        const icon = if (!self.cruising) "⏸" else if (self.boosted) "▶▶" else "▶";
+        const speed = if (self.cruising) self.speed * boost else self.speed;
+        // Two decimals only where one would show two gears as the same.
+        return if (speed < 1)
+            try std.fmt.bufPrint(buf, "{s} {d:.2} rows/s", .{ icon, speed })
+        else
+            try std.fmt.bufPrint(buf, "{s} {d:.1} rows/s", .{ icon, speed });
+    }
+};
+
+/// Keep the cruise speed for the next surface and show the state as a brief
+/// toast where the apprt draws them (`pcode;toast`, macOS); the reader has
+/// no status line to look at while scrolled back.
+fn showCruiseState(self: *Surface, state: CruiseState) void {
+    kept_cruise_speed = state.speed;
+
+    var label_buf: [48]u8 = undefined;
+    const label = state.label(&label_buf) catch return;
+    const prefix = "toast;0;900;";
+    var buf: [prefix.len + 64 + 1]u8 = undefined;
+    @memcpy(buf[0..prefix.len], prefix);
+    const encoded = std.base64.standard.Encoder.encode(buf[prefix.len..], label);
+    const len = prefix.len + encoded.len;
+    buf[len] = 0;
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .pcode_event,
+        .{ .payload = buf[0..len :0] },
+    ) catch |err| log.warn("error showing the cruise speed err={}", .{err});
 }
 
 /// Stop a glided viewport scroll where it is. Caller holds the renderer
