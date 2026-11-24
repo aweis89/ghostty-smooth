@@ -286,8 +286,13 @@ struct PCodeDrawerSurface: View {
                 .frame(height: 1)
         }
         .frame(width: width, height: height)
-        .background(ghostty.config.backgroundColor)
-        .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 2)
+        .background(
+            // Shadow the drawer's backdrop rather than its VStack, or SwiftUI
+            // casts a separate drop shadow from the terminal surface, dividers
+            // and every keycap in the hint footer.
+            ghostty.config.backgroundColor
+                .shadow(color: .black.opacity(0.35), radius: 8, x: -2, y: 2)
+        )
     }
 
     /// The drawer's own scheme: its background is the terminal's, not the system's.
