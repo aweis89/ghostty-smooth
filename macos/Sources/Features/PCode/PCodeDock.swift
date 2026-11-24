@@ -150,12 +150,10 @@ struct PCodeDockedSurface: View {
             .padding(Self.inset)
             .frame(height: height)
             .background(ghostty.config.backgroundColor)
+            // One surface in the terminal's own color; the shadow alone sets it
+            // off the transcript (pcode draws no box inside it when docked).
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: Self.cornerRadius)
-                    .strokeBorder(ghostty.config.splitDividerColor, lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.4), radius: 16, x: 0, y: -3)
+            .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: -2)
             .padding(.horizontal, Self.margin)
             .padding(.top, 2)
             .padding(.bottom, Self.margin)
