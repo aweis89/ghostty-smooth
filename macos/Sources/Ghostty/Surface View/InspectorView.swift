@@ -24,7 +24,7 @@ extension Ghostty {
 
             ZStack {
                 if !surfaceView.inspectorVisible {
-                    PCodeDrawerSurface(surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit)
+                    PCodeDockedSurface(surfaceView: surfaceView, dock: surfaceView.pcodeDock, isSplit: isSplit)
                 } else {
                     SplitView(.vertical, $split, dividerColor: ghostty.config.splitDividerColor, left: {
                         SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)

@@ -103,7 +103,11 @@ enum PCode {
     static func keyboardOverlay(in window: NSWindow?) -> Ghostty.SurfaceView? {
         var view = window?.firstResponder as? NSView
         while let current = view {
-            if let surface = current as? Ghostty.SurfaceView { return surface.isPCodeOverlay ? surface : nil }
+            if let surface = current as? Ghostty.SurfaceView {
+                // SPIKE: the docked editor stands for pcode's terminal itself: Cmd+W closes that.
+                if surface.pcodeOwner is PCodeDock { return nil }
+                return surface.isPCodeOverlay ? surface : nil
+            }
             view = current.superview
         }
         return nil
@@ -136,6 +140,7 @@ private var pcodeDrawerKey: UInt8 = 0
 private var pcodePopupKey: UInt8 = 0
 private var pcodeCompletionKey: UInt8 = 0
 private var pcodeToastKey: UInt8 = 0
+private var pcodeDockKey: UInt8 = 0
 private var pcodeOwnerKey: UInt8 = 0
 private var pcodeSessionKey: UInt8 = 0
 
@@ -182,6 +187,16 @@ extension Ghostty.SurfaceView {
         let toast = PCodeToast(surfaceView: self)
         objc_setAssociatedObject(self, &pcodeToastKey, toast, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return toast
+    }
+
+    /// SPIKE: this surface's docked pcode editor, made the first time it is asked for.
+    var pcodeDock: PCodeDock {
+        if let dock = objc_getAssociatedObject(self, &pcodeDockKey) as? PCodeDock {
+            return dock
+        }
+        let dock = PCodeDock(surfaceView: self)
+        objc_setAssociatedObject(self, &pcodeDockKey, dock, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return dock
     }
 
     private var existingPCodePopup: PCodePopup? {
@@ -261,6 +276,8 @@ extension Ghostty.SurfaceView {
             pcodeCompletion.handle(payload)
         case "toast":
             pcodeToast.handle(payload)
+        case "dock", "dock-close":
+            pcodeDock.handle(payload)
         default:
             pcodeDrawer.handle(payload)
         }
