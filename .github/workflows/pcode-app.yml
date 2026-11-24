@@ -3,7 +3,8 @@ name: pcode-app
 # Pushing a tag like pcode-app-v0.1.0 builds Pcode.app (arm64, ad-hoc signed)
 # and attaches Pcode-<version>-arm64.zip to a GitHub Release. The Homebrew cask
 # in aweis89/homebrew-tap downloads that zip. The tag prefix keeps clear of
-# upstream's v* release tags. workflow_dispatch builds without releasing.
+# upstream's v* release tags. workflow_dispatch on a branch builds without
+# releasing.
 on:
   push:
     tags: ["pcode-app-v*"]
@@ -11,6 +12,11 @@ on:
 
 permissions:
   contents: write
+
+# Releases finish in tag order, so an older build can't point the cask back.
+concurrency:
+  group: pcode-app-release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -37,7 +43,8 @@ jobs:
         run: |
           case "$GITHUB_REF" in
             refs/tags/pcode-app-v*) version=${GITHUB_REF_NAME#pcode-app-v} ;;
-            *) version=0.0.0-dev.$(git rev-parse --short HEAD) ;;
+            # The g keeps an all-digit sha (0412345) from failing semver.
+            *) version=0.0.0-dev.g$(git rev-parse --short HEAD) ;;
           esac
           echo "VERSION=$version" >> "$GITHUB_ENV"
           # Ghostty's own version, as its About window shows it: the upstream
@@ -73,6 +80,7 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+              $(echo "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+)*$' || echo --prerelease) \
               --title "Pcode.app $VERSION" \
               --notes "Install with Homebrew (the zip alone is ad-hoc signed and Gatekeeper blocks it):
 

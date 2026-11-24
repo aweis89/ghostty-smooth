@@ -912,7 +912,9 @@ class AppDelegate: NSObject,
             GlobalEventTap.shared.disable()
         }
 
-        updateAppIcon(from: config)
+        // pcode: no updateAppIcon(from:). A `macos-icon` in a shared Ghostty
+        // config would paint Ghostty's icon over Pcode's, writing into the
+        // bundle and breaking its signature.
     }
 
     /// Temporarily override the configured application appearance for this session.

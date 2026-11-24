@@ -37,9 +37,14 @@ if [ -f "$icns" ]; then
     pb "Delete :CFBundleIconName" 2>/dev/null || true
     pb "Set :CFBundleIconFile Pcode"
     rm -rf "$app/Contents/PlugIns/DockTilePlugin.plugin"
+    rmdir "$app/Contents/PlugIns" 2>/dev/null || true
+    pb "Delete :NSDockTilePlugIn" 2>/dev/null || true
 else
     echo "warning: $icns missing; keeping Ghostty's icon" >&2
 fi
 
+# Plain ad-hoc: this drops the hardened runtime and entitlements, which only
+# matter for notarization. Adding `-o runtime` would need --entitlements
+# macos/GhosttyReleaseLocal.entitlements too, or TCC prompts break.
 codesign --force --deep --sign - "$app" >/dev/null 2>&1
 codesign --verify --deep --strict "$app"
