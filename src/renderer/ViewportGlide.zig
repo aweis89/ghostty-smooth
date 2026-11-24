@@ -174,26 +174,36 @@ pub fn toggleCruise(self: *ViewportGlide, term: *Terminal, dir: f32) void {
     if (self.isActive() and self.movedElsewhere(term)) self.reset();
     if (self.cruise_dir != dir) {
         self.startCruise(term, dir);
-        self.boost_armed = true;
+        self.boost_armed = self.cruise_dir != 0;
         return;
     }
     self.stopCruise();
 }
 
+/// Does nothing where there is nowhere to go, so the caller can see from
+/// `cruise_dir` that no cruise began.
 fn startCruise(self: *ViewportGlide, term: *Terminal, dir: f32) void {
     self.endCruise();
+    const p = self.position(term);
+    const headed = p.v + self.remaining;
+    if (if (dir > 0) headed >= p.max else headed <= 0) return;
     self.cruise_dir = dir;
     self.remember(term);
 }
 
 /// Stop cruising: carry the speed into the spring and come to rest on the
 /// next whole row in the direction of travel, rather than snapping to one.
+/// A spring in flight (a page key during the cruise) is aimed at a whole
+/// row again: the cruise moved the view under it.
 fn stopCruise(self: *ViewportGlide) void {
     const v = self.cruise_v;
     self.endCruise();
-    if (self.remaining != 0 or self.lag == 0) return;
-    self.remaining = if (v < 0) self.lag - 1 else self.lag;
-    self.velocity = -v;
+    // Where the view is headed, in rows from the viewport's own row.
+    const at = self.remaining - self.lag;
+    const dest = if (v < 0) @floor(at) else @ceil(at);
+    if (dest == at) return;
+    self.remaining += dest - at;
+    if (self.remaining * v > 0) self.velocity -= v;
 }
 
 /// The key that started the cruise is repeating: run at `cruise_boost`
@@ -287,13 +297,18 @@ pub fn findMark(term: *Terminal, kind: Mark, from: usize, dir: i8) ?usize {
 
 /// Shift the cruise's gear by `steps` factors of `cruise_step`. Faster
 /// while stopped starts the cruise at the kept speed instead, and slower
-/// at the minimum stops it, so the two keys alone can drive it.
+/// than the minimum stops it, so the two keys alone can drive it.
 pub fn adjustCruise(self: *ViewportGlide, term: *Terminal, steps: f32) void {
     if (self.isActive() and self.movedElsewhere(term)) self.reset();
     if (steps > 0 and self.cruise_dir == 0) return self.startCruise(term, 1);
-    if (steps < 0 and self.cruise_dir != 0 and self.cruise_speed <= min_cruise)
-        return self.stopCruise();
-    self.setCruiseSpeed(self.cruise_speed * std.math.pow(f32, cruise_step, steps));
+    // A step past a limit is not taken, rather than clamped: shifting back
+    // then returns to the same speeds.
+    const speed = self.cruise_speed * std.math.pow(f32, cruise_step, steps);
+    if (speed < min_cruise) {
+        if (self.cruise_dir != 0) self.stopCruise();
+        return;
+    }
+    if (speed <= max_cruise) self.cruise_speed = speed;
 }
 
 pub fn setCruiseSpeed(self: *ViewportGlide, speed: f32) void {
@@ -451,7 +466,7 @@ test "viewport glide: cruise runs at its speed and stops at the bottom" {
     const cruised = viewportOffset(&term);
     try testing.expect(cruised == 3 or cruised == 4);
 
-    g.adjustCruise(&term, 100);
+    g.setCruiseSpeed(1000);
     try testing.expectEqual(max_cruise, g.cruise_speed);
     try settle(&g, &term);
     try testing.expect(term.screens.active.pages.viewport == .active);
@@ -502,6 +517,9 @@ test "viewport glide: holding the cruise key boosts until it is let go" {
     try testing.expect(g.wantsRelease());
     g.releaseKey(&term);
     try testing.expect(!g.wantsRelease());
+    // A stray repeat after the release does not boost again.
+    g.boostCruise();
+    try testing.expect(!g.boosted);
     for (0..240) |_| _ = g.step(&term, 1.0 / 120.0);
     try testing.expectEqual(@as(f32, 1), g.cruise_dir);
     try testing.expect(@abs(g.cruise_v - default_cruise) < 0.01);
@@ -537,17 +555,61 @@ test "viewport glide: gears start, shift and stop the cruise" {
     g.adjustCruise(&term, 1);
     try testing.expect(@abs(g.cruise_speed - default_cruise) < 0.001);
 
-    // Slower down to the minimum, then one more stops.
-    g.adjustCruise(&term, -100);
-    try testing.expectEqual(min_cruise, g.cruise_speed);
+    // Slower down to the lowest gear, then one more stops.
+    for (0..6) |_| g.adjustCruise(&term, -1);
+    const lowest = g.cruise_speed;
+    try testing.expect(lowest >= min_cruise and lowest / cruise_step < min_cruise);
     try testing.expectEqual(@as(f32, 1), g.cruise_dir);
     g.adjustCruise(&term, -1);
     try testing.expectEqual(@as(f32, 0), g.cruise_dir);
-    try testing.expectEqual(min_cruise, g.cruise_speed);
+    try testing.expectEqual(lowest, g.cruise_speed);
     try settle(&g, &term);
 
+    // Back up the same gears: the limit did not shift them.
+    g.adjustCruise(&term, 1);
+    for (0..6) |_| g.adjustCruise(&term, 1);
+    try testing.expect(@abs(g.cruise_speed - default_cruise) < 0.001);
+    // A step past the top is not taken.
+    g.adjustCruise(&term, 100);
+    try testing.expect(@abs(g.cruise_speed - default_cruise) < 0.001);
+
     g.setCruiseSpeed(std.math.nan(f32));
-    try testing.expectEqual(min_cruise, g.cruise_speed);
+    try testing.expect(@abs(g.cruise_speed - default_cruise) < 0.001);
+}
+
+test "viewport glide: no cruise starts at the bottom" {
+    const testing = std.testing;
+    var term = try testTerminal(100);
+    defer term.deinit(testing.allocator);
+
+    var g: ViewportGlide = .{};
+    g.toggleCruise(&term, 1);
+    try testing.expectEqual(@as(f32, 0), g.cruise_dir);
+    try testing.expect(!g.boost_armed);
+    g.adjustCruise(&term, 1);
+    try testing.expectEqual(@as(f32, 0), g.cruise_dir);
+    try testing.expect(!g.isActive());
+}
+
+test "viewport glide: pausing with a page in flight lands on a row" {
+    const testing = std.testing;
+    var term = try testTerminal(100);
+    defer term.deinit(testing.allocator);
+
+    var g: ViewportGlide = .{};
+    g.scrollToEnd(&term, .top);
+    try settle(&g, &term);
+
+    g.toggleCruise(&term, 1);
+    for (0..156) |_| _ = g.step(&term, 1.0 / 120.0);
+    g.scrollBy(&term, 5);
+    for (0..6) |_| _ = g.step(&term, 1.0 / 120.0);
+    g.toggleCruise(&term, 1);
+    // Headed for a whole row, so nothing snaps at the end.
+    const headed = g.remaining - g.lag;
+    try testing.expect(@abs(headed - @round(headed)) < 0.0001);
+    try settle(&g, &term);
+    try testing.expectEqual(@as(f32, 0), g.lag);
 }
 
 test "viewport glide: holding up stops a cruise, holding down adds to it" {
