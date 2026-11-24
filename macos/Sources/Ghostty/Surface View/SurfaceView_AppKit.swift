@@ -718,7 +718,9 @@ extension Ghostty {
 
             // If our window/app is already focused, then this click is only
             // being used to transfer split focus.
-            suppressLeftMouseUntilRelease = NSApp.isActive && window.isKeyWindow
+            // SPIKE: not under a shown pcode dock, which takes the keyboard back
+            // after every click: the transcript would never get a click through.
+            suppressLeftMouseUntilRelease = NSApp.isActive && window.isKeyWindow && !pcodeHasShownDock
 
             // Make ourselves the first responder
             window.makeFirstResponder(self)

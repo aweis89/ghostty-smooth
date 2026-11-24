@@ -293,6 +293,9 @@ extension Ghostty.SurfaceView {
         return dock.surface
     }
 
+    /// SPIKE: whether this is a pane with its pcode dock shown under it.
+    var pcodeHasShownDock: Bool { shownPCodeDock != nil }
+
     /// SPIKE: a click in the transcript is done. Unless it left a selection
     /// (kept here for Cmd+C), the keyboard goes back to the docked editor.
     func pcodeDidMouseUp() {
