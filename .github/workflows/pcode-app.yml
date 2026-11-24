@@ -33,16 +33,27 @@ jobs:
           xcodebuild -downloadComponent MetalToolchain
           brew list gettext >/dev/null 2>&1 || brew install gettext
 
-      - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dxcframework-target=native
-
-      - name: Package Pcode.app
+      - name: Version
         run: |
           case "$GITHUB_REF" in
             refs/tags/pcode-app-v*) version=${GITHUB_REF_NAME#pcode-app-v} ;;
             *) version=0.0.0-dev.$(git rev-parse --short HEAD) ;;
           esac
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          # Ghostty's own version, as its About window shows it: the upstream
+          # base plus ours. Passing it also skips build.zig's check that a
+          # tagged HEAD is a vX.Y.Z upstream release, which panics on our tags.
+          base=$(sed -nE 's/^ *\.version = "([0-9]+\.[0-9]+\.[0-9]+).*",/\1/p' build.zig.zon)
+          echo "GHOSTTY_VERSION=$base-pcode.$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: >-
+          zig build -Doptimize=ReleaseFast -Dxcframework-target=native
+          -Dversion-string="$GHOSTTY_VERSION"
+
+      - name: Package Pcode.app
+        run: |
+          version=$VERSION
           mkdir dist
           cp -R macos/build/ReleaseLocal/Ghostty.app dist/Pcode.app
           scripts/brand-pcode-app.sh dist/Pcode.app "$version"
