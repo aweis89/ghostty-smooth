@@ -569,7 +569,36 @@ extension Ghostty {
 
         // MARK: Actions (macOS)
 
+        /// SPIKE: actions about the window's layout (splits, tabs, the window),
+        /// which a pcode overlay (its dock, a popup) cannot carry out itself.
+        private static func isPaneAction(_ tag: ghostty_action_tag_e) -> Bool {
+            switch tag {
+            case GHOSTTY_ACTION_NEW_SPLIT, GHOSTTY_ACTION_GOTO_SPLIT, GHOSTTY_ACTION_RESIZE_SPLIT,
+                 GHOSTTY_ACTION_EQUALIZE_SPLITS, GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM,
+                 GHOSTTY_ACTION_NEW_TAB, GHOSTTY_ACTION_GOTO_TAB, GHOSTTY_ACTION_MOVE_TAB,
+                 GHOSTTY_ACTION_CLOSE_TAB, GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+                 GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW, GHOSTTY_ACTION_NEW_WINDOW,
+                 GHOSTTY_ACTION_CLOSE_WINDOW, GHOSTTY_ACTION_TOGGLE_FULLSCREEN,
+                 GHOSTTY_ACTION_TOGGLE_MAXIMIZE, GHOSTTY_ACTION_FLOAT_WINDOW,
+                 GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE, GHOSTTY_ACTION_INSPECTOR:
+                return true
+            default:
+                return false
+            }
+        }
+
         static func action(_ app: ghostty_app_t, target: ghostty_target_s, action: ghostty_action_s) -> Bool {
+            // SPIKE: a keybinding pressed in a pcode overlay (the docked editor,
+            // a popup) acts on the pane it belongs to: the overlay is not in the
+            // window's split tree, so a split of it would go nowhere.
+            var target = target
+            if target.tag == GHOSTTY_TARGET_SURFACE, isPaneAction(action.tag),
+               let surface = target.target.surface,
+               let view = surfaceView(from: surface), view.isPCodeOverlay,
+               let pane = view.pcodeOwner?.surfaceView?.surface {
+                target.target.surface = pane
+            }
+
             // Make sure it a target we understand so all our action handlers can assert
             switch target.tag {
             case GHOSTTY_TARGET_APP, GHOSTTY_TARGET_SURFACE:
