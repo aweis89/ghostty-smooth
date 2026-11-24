@@ -293,6 +293,13 @@ extension Ghostty.SurfaceView {
         return dock.surface
     }
 
+    /// SPIKE: for a dock's terminal, the height of it the card shows, from its
+    /// bottom edge; the rest is clipped off and must not take clicks.
+    var pcodeDockVisibleHeight: CGFloat? {
+        guard let dock = pcodeOwner as? PCodeDock, cellSize.height > 0 else { return nil }
+        return PCodeDock.cardHeight(rows: dock.rows, cell: cellSize.height)
+    }
+
     /// SPIKE: whether this is a pane with its pcode dock shown under it.
     var pcodeHasShownDock: Bool { shownPCodeDock != nil }
 

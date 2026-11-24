@@ -24,6 +24,15 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published private(set) var rows = 3
 
     static let maxRows = 40
+    /// The dock's terminal is always this tall and never resizes; the card
+    /// shows only its bottom `rows`, so growing is a clip, not a grid resize.
+    static let gridRows = maxRows
+
+    /// The card's height for `rows` terminal rows of `cell` points: the rows,
+    /// the terminal's own padding, and a part row of slack.
+    static func cardHeight(rows: Int, cell: CGFloat) -> CGFloat {
+        CGFloat(rows) * cell + cell * 0.5 + 12
+    }
 
     weak var surfaceView: Ghostty.SurfaceView?
     private var closeObserver: NSObjectProtocol?
@@ -131,25 +140,30 @@ struct PCodeDockedSurface: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        // Only the card's arrival animates: animating its height resizes the
-        // terminal grid on every frame, which jitters.
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
+        // The dock's grid never resizes, so its height can animate: only the
+        // transcript pane above resizes along the way.
+        .animation(.easeOut(duration: 0.12), value: dock.rows)
     }
 
     private func card(_ docked: Ghostty.SurfaceView) -> some View {
         let cell = docked.cellSize.height > 0
             ? docked.cellSize.height
             : (surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight)
-        // Room for the rows, the terminal's own padding, and a part row of
-        // slack so a rounding never costs a row (pcode bottom-aligns its layout).
-        let height = CGFloat(dock.rows) * cell + cell * 0.5 + 12
         // The card is the dock's terminal itself, edge to edge: pcode tints its
         // background (OSC 11) a shade off the pane's, and its own padding takes
         // that tint, so the whole card is one raised surface. The backdrop only
         // gives the shadow its shape.
-        return Ghostty.SurfaceWrapper(surfaceView: docked, isSplit: false)
-            .id(ObjectIdentifier(docked))
-            .frame(height: height)
+        //
+        // The terminal keeps a fixed `gridRows` height, bottom-aligned in the
+        // card and clipped: pcode draws its layout at the bottom of it, so a
+        // taller layout is already drawn when the card grows to show it.
+        return ZStack(alignment: .bottom) {
+            Ghostty.SurfaceWrapper(surfaceView: docked, isSplit: false)
+                .id(ObjectIdentifier(docked))
+                .frame(height: PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: cell))
+        }
+            .frame(height: PCodeDock.cardHeight(rows: dock.rows, cell: cell), alignment: .bottom)
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
             .background(
                 RoundedRectangle(cornerRadius: Self.cornerRadius)
