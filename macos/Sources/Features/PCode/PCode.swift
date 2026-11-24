@@ -199,6 +199,10 @@ extension Ghostty.SurfaceView {
         return dock
     }
 
+    var existingPCodeDock: PCodeDock? {
+        objc_getAssociatedObject(self, &pcodeDockKey) as? PCodeDock
+    }
+
     private var existingPCodePopup: PCodePopup? {
         objc_getAssociatedObject(self, &pcodePopupKey) as? PCodePopup
     }
@@ -301,6 +305,10 @@ extension Ghostty.SurfaceView {
     /// otherwise focus it, and the popup take focus back, on every move).
     var pcodeAllowsMouseFocus: Bool {
         if isPCodeOverlay { return !pcodeIgnoresMouse }
+        // SPIKE: hovering the transcript must not take the keyboard from a shown
+        // dock; a click still does (to select and copy), and keys typed then
+        // still reach the editor through pcode.
+        if existingPCodeDock?.ready == true { return false }
         return existingPCodePopup?.ready != true
     }
 }

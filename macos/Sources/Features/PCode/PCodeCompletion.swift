@@ -112,9 +112,15 @@ final class PCodeCompletion: ObservableObject {
 
     /// A click anywhere on the list must leave the keyboard with pcode's terminal.
     func restoreFocus() {
-        if let surfaceView, surfaceView.window?.firstResponder !== surfaceView {
-            Ghostty.moveFocus(to: surfaceView)
+        if let editor = editorSurface, editor.window?.firstResponder !== editor {
+            Ghostty.moveFocus(to: editor)
         }
+    }
+
+    /// SPIKE: the terminal pcode's editor runs in: its docked one while shown.
+    private var editorSurface: Ghostty.SurfaceView? {
+        if let dock = surfaceView?.existingPCodeDock, dock.ready, let docked = dock.surface { return docked }
+        return surfaceView
     }
 
     func theme(config: Ghostty.Config, fonts: PCodePickFonts?) -> PCodePickTheme {
@@ -128,7 +134,18 @@ final class PCodeCompletion: ObservableObject {
     }
 
     /// The cursor's cell in the terminal view, top-left origin, in points.
-    func cursorCell() -> CGRect? { surfaceView?.pcodeCursorCell }
+    ///
+    /// SPIKE: with a dock shown, the dock's cursor, in this terminal's
+    /// coordinates (below its bottom edge): the list layer spans both.
+    func cursorCell() -> CGRect? {
+        guard let surfaceView else { return nil }
+        guard let editor = editorSurface, editor !== surfaceView else { return surfaceView.pcodeCursorCell }
+        guard let cell = editor.pcodeCursorCell else { return nil }
+        let docked = editor.convert(editor.bounds, to: nil)
+        let pane = surfaceView.convert(surfaceView.bounds, to: nil)
+        // Window coordinates have a bottom-left origin; the cell's is top-left.
+        return cell.offsetBy(dx: docked.minX - pane.minX, dy: pane.maxY - docked.maxY)
+    }
 }
 
 /// The completion list, hung over pcode's editor box from where the word

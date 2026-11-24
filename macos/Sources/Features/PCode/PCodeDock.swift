@@ -132,8 +132,9 @@ struct PCodeDockedSurface: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        // Only the card's arrival animates: animating its height resizes the
+        // terminal grid on every frame, which jitters.
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
-        .animation(.easeOut(duration: 0.1), value: dock.rows)
     }
 
     private func card(_ docked: Ghostty.SurfaceView) -> some View {
