@@ -48,6 +48,11 @@ scroll_offset_px: f32 = 0,
 /// viewport and `scroll_offset_px` while active. See `ViewportGlide`.
 viewport_glide: ViewportGlide = .{},
 
+/// Fork: where the reader was when the app began to clear and rewrite the
+/// scrollback (`ESC _ smooth;replay;begin ESC \`), to scroll back to at
+/// `smooth;replay;end`. Null when the viewport followed the bottom.
+replay_anchor: ?ViewportGlide.Anchor = null,
+
 /// Fork: `ESC _ smooth;park ESC \` arms a park, and the next turn mark
 /// (`smooth;mark;1`) binds it. Once that row scrolls above the top while
 /// the viewport follows the bottom, the renderer pins the viewport there.
@@ -317,6 +322,14 @@ test "preedit range shifts left at right edge" {
 ///   ESC _ smooth;park;off ESC \                           protocol 10: the turn
 ///                                                         is written; drop a
 ///                                                         park not yet due
+///   ESC _ smooth;replay;begin ESC \                       the app is about to
+///                                                         clear the scrollback
+///                                                         and write it again:
+///                                                         note where a reader
+///                                                         scrolled back is
+///   ESC _ smooth;replay;end ESC \                         it is written: scroll
+///                                                         back there (see
+///                                                         `ViewportGlide.Anchor`)
 ///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;10
 ///
 /// `advance` (protocol 4) is for an app that scrolls a region itself, such
@@ -1366,7 +1379,7 @@ pub fn parkIfDue(self: *State) bool {
     // Its row gone (evicted, cleared) or no longer the turn: never park
     // at some other turn instead.
     if (pages != self.park_pages.? or pages.viewport != .active or pin.garbage or
-        pin.rowAndCell().row.smooth_mark != @intFromEnum(ViewportGlide.Mark.turn))
+        pin.rowAndCell().row.smooth_mark != @backingInt(ViewportGlide.Mark.turn))
     {
         self.dropPark();
         return false;
@@ -1385,7 +1398,7 @@ pub fn parkIfDue(self: *State) bool {
 
 fn testMarkTurn(state: *State, term: *terminalpkg.Terminal) void {
     const screen = term.screens.active;
-    screen.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    screen.cursor.page_row.smooth_mark = @backingInt(ViewportGlide.Mark.turn);
     state.bindPark(&screen.pages, screen.cursor.page_pin.*);
 }
 
@@ -1432,7 +1445,7 @@ test "park: never lands on an older turn when its own mark is erased" {
     var state: State = .{ .mutex = undefined, .terminal = &term };
 
     // An older turn, scrolled well into history.
-    term.screens.active.cursor.page_row.smooth_mark = @intFromEnum(ViewportGlide.Mark.turn);
+    term.screens.active.cursor.page_row.smooth_mark = @backingInt(ViewportGlide.Mark.turn);
     for (0..30) |_| try term.printString("old\r\n");
     state.armPark();
     testMarkTurn(&state, &term);

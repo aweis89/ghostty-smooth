@@ -573,7 +573,7 @@ pub const StreamHandler = struct {
                     };
                     const screen = self.terminal.screens.active;
                     screen.cursor.page_row.smooth_mark = kind;
-                    if (kind == @intFromEnum(renderer.State.ViewportGlide.Mark.turn) and
+                    if (kind == @backingInt(renderer.State.ViewportGlide.Mark.turn) and
                         self.renderer_state.park == .armed and
                         self.terminal.screens.active_key == .primary)
                     {
@@ -591,6 +591,18 @@ pub const StreamHandler = struct {
                 if (std.mem.eql(u8, body, "park;off")) {
                     if (self.renderer_state.parkIfDue()) try self.queueRender();
                     self.renderer_state.dropPark();
+                    return;
+                }
+                // The app clears the scrollback and writes it all again (a
+                // resize): keep a reader scrolled back where they were.
+                if (std.mem.eql(u8, body, "replay;begin")) {
+                    self.renderer_state.replay_anchor = renderer.State.ViewportGlide.Anchor.take(self.terminal);
+                    return;
+                }
+                if (std.mem.eql(u8, body, "replay;end")) {
+                    const anchor = self.renderer_state.replay_anchor orelse return;
+                    self.renderer_state.replay_anchor = null;
+                    if (anchor.restore(self.terminal)) try self.queueRender();
                     return;
                 }
                 var cmd = renderer.State.Smooth.parse(body) catch {

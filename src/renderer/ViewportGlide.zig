@@ -295,6 +295,106 @@ pub fn findMark(term: *Terminal, kind: Mark, from: usize, dir: i8) ?usize {
     }
 }
 
+/// Where a reader scrolled back into history is, in terms of marks rather
+/// than rows, so it can be found again after the app clears the scrollback
+/// and writes it all out afresh (`ESC _ smooth;replay;begin ESC \`, pcode's
+/// resize replay). The rows wrap differently the second time, so a row
+/// number means nothing; the marks come back in the same order.
+pub const Anchor = struct {
+    /// Marks of any kind below the viewport's top row. Counted from the
+    /// bottom: scrollback evicted off the top does not change it.
+    below: usize,
+    /// How far the top row is from the mark at or above it (or the top of
+    /// the scrollback) to the next one below (or the end), in [0, 1).
+    frac: f32,
+
+    /// The anchor for where the viewport is now, or null when it follows
+    /// the bottom: there is no place to keep.
+    pub fn take(term: *Terminal) ?Anchor {
+        if (term.screens.active_key != .primary) return null;
+        const pages = &term.screens.active.pages;
+        if (pages.viewport == .active) return null;
+        const sb = pages.scrollbar();
+        if (sb.offset + sb.len >= sb.total) return null;
+        const top = sb.offset;
+
+        var prev: usize = 0;
+        var next: usize = sb.total;
+        var below: usize = 0;
+        var it: MarkIterator = .init(term);
+        while (it.next()) |row| {
+            if (row <= top) {
+                prev = row;
+                continue;
+            }
+            if (below == 0) next = row;
+            below += 1;
+        }
+        const span: f32 = @floatFromInt(next - prev);
+        const into: f32 = @floatFromInt(top - prev);
+        return .{ .below = below, .frac = into / span };
+    }
+
+    /// Scroll the viewport back to the anchor in the scrollback as it is
+    /// now. Returns false, leaving the viewport alone, when the marks it
+    /// counted are not all there.
+    pub fn restore(self: Anchor, term: *Terminal) bool {
+        if (term.screens.active_key != .primary) return false;
+        const pages = &term.screens.active.pages;
+
+        var count: usize = 0;
+        var it: MarkIterator = .init(term);
+        while (it.next()) |_| count += 1;
+        if (self.below > count) return false;
+
+        // The marks either side: number `first_below` from the top is the
+        // first below the anchor, and the one before it is at or above.
+        const first_below = count - self.below;
+        var prev: usize = 0;
+        var next: usize = pages.scrollbar().total;
+        var i: usize = 0;
+        it = .init(term);
+        while (it.next()) |row| : (i += 1) {
+            if (i + 1 == first_below) prev = row;
+            if (i == first_below) {
+                next = row;
+                break;
+            }
+        }
+        const span: f32 = @floatFromInt(next - prev);
+        // Never onto the next mark: that is the section after this one.
+        const into: usize = @min(
+            @as(usize, @intFromFloat(@round(self.frac * span))),
+            (next - prev) -| 1,
+        );
+        // Into the active area clamps to it: back to following the bottom.
+        term.scrollViewport(.{ .row = prev + into });
+        return true;
+    }
+};
+
+/// The screen rows (from the top of scrollback) that carry a mark of any
+/// kind, top to bottom.
+const MarkIterator = struct {
+    pin: ?terminalpkg.PageList.Pin,
+    row: usize = 0,
+
+    fn init(term: *Terminal) MarkIterator {
+        return .{ .pin = term.screens.active.pages.pin(.{ .screen = .{} }) };
+    }
+
+    fn next(self: *MarkIterator) ?usize {
+        while (self.pin) |pin| {
+            const row = self.row;
+            const marked = pin.rowAndCell().row.smooth_mark != 0;
+            self.pin = pin.down(1);
+            self.row += 1;
+            if (marked) return row;
+        }
+        return null;
+    }
+};
+
 /// Shift the cruise's gear by `steps` factors of `cruise_step`. Faster
 /// while stopped starts the cruise at the kept speed instead, and slower
 /// than the minimum stops it, so the two keys alone can drive it.
@@ -709,6 +809,109 @@ test "viewport glide: a held key scrolls steadily and a tap moves one row" {
 fn markRow(term: *Terminal, screen_y: usize, kind: Mark) void {
     const p = term.screens.active.pages.pin(.{ .screen = .{ .y = @intCast(screen_y) } }).?;
     p.rowAndCell().row.smooth_mark = @backingInt(kind);
+}
+
+test "anchor: none while the viewport follows the bottom" {
+    const testing = std.testing;
+    var term = try testTerminal(100);
+    defer term.deinit(testing.allocator);
+    markRow(&term, 20, .turn);
+    try testing.expect(Anchor.take(&term) == null);
+}
+
+test "anchor: finds the same place between the same marks after a rewrite" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    markRow(&term, 20, .turn);
+    markRow(&term, 60, .block);
+    markRow(&term, 100, .turn);
+    markRow(&term, 150, .block);
+
+    // A quarter of the way from the block at 60 to the turn at 100.
+    term.scrollViewport(.{ .row = 70 });
+    const anchor = Anchor.take(&term).?;
+    try testing.expectEqual(@as(usize, 2), anchor.below);
+    try testing.expectEqual(@as(f32, 0.25), anchor.frac);
+
+    // The app clears everything and writes it again narrower: more rows,
+    // the marks in the same order on other rows.
+    term.eraseDisplay(.complete, false);
+    term.eraseDisplay(.scrollback, false);
+    try testing.expect(term.screens.active.pages.viewport == .active);
+    for (0..300) |_| try term.printString("line\r\n");
+    markRow(&term, 30, .turn);
+    markRow(&term, 90, .block);
+    markRow(&term, 170, .turn);
+    markRow(&term, 240, .block);
+
+    try testing.expect(anchor.restore(&term));
+    try testing.expectEqual(@as(usize, 110), viewportOffset(&term));
+}
+
+test "anchor: on a mark stays on it, above the first counts from the top" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    markRow(&term, 40, .turn);
+    markRow(&term, 100, .turn);
+
+    term.scrollViewport(.{ .row = 100 });
+    const on = Anchor.take(&term).?;
+    try testing.expectEqual(@as(usize, 0), on.below);
+    try testing.expectEqual(@as(f32, 0), on.frac);
+
+    term.scrollViewport(.{ .row = 10 });
+    const above = Anchor.take(&term).?;
+    try testing.expectEqual(@as(usize, 2), above.below);
+    try testing.expectEqual(@as(f32, 0.25), above.frac);
+
+    // Rewritten with the marks moved.
+    const p40 = term.screens.active.pages.pin(.{ .screen = .{ .y = 40 } }).?;
+    p40.rowAndCell().row.smooth_mark = 0;
+    const p100 = term.screens.active.pages.pin(.{ .screen = .{ .y = 100 } }).?;
+    p100.rowAndCell().row.smooth_mark = 0;
+    markRow(&term, 80, .turn);
+    markRow(&term, 120, .turn);
+
+    try testing.expect(on.restore(&term));
+    try testing.expectEqual(@as(usize, 120), viewportOffset(&term));
+    try testing.expect(above.restore(&term));
+    try testing.expectEqual(@as(usize, 20), viewportOffset(&term));
+}
+
+test "anchor: the viewport is left alone when marks are missing" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    markRow(&term, 40, .turn);
+    markRow(&term, 100, .turn);
+    term.scrollViewport(.{ .row = 10 });
+    const anchor = Anchor.take(&term).?;
+
+    // One of the two marks did not come back.
+    const p = term.screens.active.pages.pin(.{ .screen = .{ .y = 40 } }).?;
+    p.rowAndCell().row.smooth_mark = 0;
+    term.scrollViewport(.{ .row = 50 });
+    try testing.expect(!anchor.restore(&term));
+    try testing.expectEqual(@as(usize, 50), viewportOffset(&term));
+}
+
+test "anchor: a place that is now in the active area is the bottom" {
+    const testing = std.testing;
+    var term = try testTerminal(200);
+    defer term.deinit(testing.allocator);
+    markRow(&term, 100, .turn);
+    term.scrollViewport(.{ .row = 150 });
+    const anchor = Anchor.take(&term).?;
+
+    // Rewritten shorter: the mark's section starts inside the last page.
+    term.eraseDisplay(.complete, false);
+    term.eraseDisplay(.scrollback, false);
+    for (0..30) |_| try term.printString("line\r\n");
+    markRow(&term, 28, .turn);
+    try testing.expect(anchor.restore(&term));
+    try testing.expect(term.screens.active.pages.viewport == .active);
 }
 
 test "viewport glide: jumps between marks, landing on the current one first" {
