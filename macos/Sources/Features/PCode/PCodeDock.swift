@@ -118,7 +118,6 @@ struct PCodeDockedSurface: View {
     var isSplit: Bool
 
     private static let margin: CGFloat = 8
-    private static let inset: CGFloat = 6
     private static let cornerRadius: CGFloat = 12
     private static let fallbackLineHeight: CGFloat = 18
 
@@ -144,16 +143,18 @@ struct PCodeDockedSurface: View {
         // Room for the rows, the terminal's own padding, and a part row of
         // slack so a rounding never costs a row (pcode bottom-aligns its layout).
         let height = CGFloat(dock.rows) * cell + cell * 0.5 + 12
+        // The card is the dock's terminal itself, edge to edge: pcode tints its
+        // background (OSC 11) a shade off the pane's, and its own padding takes
+        // that tint, so the whole card is one raised surface. The backdrop only
+        // gives the shadow its shape.
         return Ghostty.SurfaceWrapper(surfaceView: docked, isSplit: false)
             .id(ObjectIdentifier(docked))
-            .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius - Self.inset))
-            .padding(Self.inset)
             .frame(height: height)
-            .background(ghostty.config.backgroundColor)
-            // One surface in the terminal's own color; the shadow alone sets it
-            // off the transcript (pcode draws no box inside it when docked).
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-            .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: -2)
+            .background(
+                RoundedRectangle(cornerRadius: Self.cornerRadius)
+                    .fill(ghostty.config.backgroundColor)
+                    .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: -2))
             .padding(.horizontal, Self.margin)
             .padding(.top, 2)
             .padding(.bottom, Self.margin)

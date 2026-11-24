@@ -287,6 +287,26 @@ extension Ghostty.SurfaceView {
         }
     }
 
+    /// SPIKE: a shown dock's terminal, if this is the pane it docks under.
+    private var shownPCodeDock: Ghostty.SurfaceView? {
+        guard !isPCodeOverlay, let dock = existingPCodeDock, dock.ready else { return nil }
+        return dock.surface
+    }
+
+    /// SPIKE: a click in the transcript is done. Unless it left a selection
+    /// (kept here for Cmd+C), the keyboard goes back to the docked editor.
+    func pcodeDidMouseUp() {
+        guard let docked = shownPCodeDock, let surface, !ghostty_surface_has_selection(surface) else { return }
+        Ghostty.moveFocus(to: docked)
+    }
+
+    /// SPIKE: typing in the transcript (after a selection): the key still
+    /// reaches the editor through pcode, and the keyboard goes back to the dock.
+    func pcodeWillKeyDown(_ event: NSEvent) {
+        guard let docked = shownPCodeDock, !event.modifierFlags.contains(.command) else { return }
+        Ghostty.moveFocus(to: docked)
+    }
+
     /// This surface took the keyboard. While its popup is shown, the popup gets it back.
     func pcodeDidFocus() {
         guard !isPCodeOverlay else { return }

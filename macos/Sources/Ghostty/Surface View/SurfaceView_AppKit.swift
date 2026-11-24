@@ -940,6 +940,8 @@ extension Ghostty {
         }
 
         override func mouseUp(with event: NSEvent) {
+            // SPIKE: after the release (and its selection) is handled.
+            defer { pcodeDidMouseUp() }
             // If this mouse-up corresponds to a focus-only click transfer,
             // suppress it so we don't emit a release without a press.
             if suppressLeftMouseUntilRelease {
@@ -1134,6 +1136,7 @@ extension Ghostty {
         }
 
         override func keyDown(with event: NSEvent) {
+            pcodeWillKeyDown(event)
             guard let surface = self.surface else {
                 self.interpretKeyEvents([event])
                 return
