@@ -599,10 +599,19 @@ pub const StreamHandler = struct {
                     self.renderer_state.replay_anchor = renderer.State.ViewportGlide.Anchor.take(self.terminal);
                     return;
                 }
-                if (std.mem.eql(u8, body, "replay;end")) {
+                // `replay;end;N`: N of the marks now at the bottom are new.
+                const replay_end = "replay;end;";
+                if (std.mem.startsWith(u8, body, replay_end)) {
+                    const added = std.fmt.parseInt(u16, body[replay_end.len..], 10) catch {
+                        log.warn("invalid smooth APC: {s}", .{unknown.content});
+                        return;
+                    };
                     const anchor = self.renderer_state.replay_anchor orelse return;
                     self.renderer_state.replay_anchor = null;
-                    if (anchor.restore(self.terminal)) try self.queueRender();
+                    // A glide in flight was heading somewhere in the old rows.
+                    self.renderer_state.viewport_glide.cancel(self.terminal);
+                    self.renderer_state.scroll_offset_px = 0;
+                    if (anchor.restore(self.terminal, added)) try self.queueRender();
                     return;
                 }
                 var cmd = renderer.State.Smooth.parse(body) catch {

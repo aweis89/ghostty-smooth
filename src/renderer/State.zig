@@ -50,7 +50,7 @@ viewport_glide: ViewportGlide = .{},
 
 /// Fork: where the reader was when the app began to clear and rewrite the
 /// scrollback (`ESC _ smooth;replay;begin ESC \`), to scroll back to at
-/// `smooth;replay;end`. Null when the viewport followed the bottom.
+/// `smooth;replay;end;N`. Null when the viewport followed the bottom.
 replay_anchor: ?ViewportGlide.Anchor = null,
 
 /// Fork: `ESC _ smooth;park ESC \` arms a park, and the next turn mark
@@ -327,7 +327,9 @@ test "preedit range shifts left at right edge" {
 ///                                                         and write it again:
 ///                                                         note where a reader
 ///                                                         scrolled back is
-///   ESC _ smooth;replay;end ESC \                         it is written: scroll
+///   ESC _ smooth;replay;end;N ESC \                       it is written, with
+///                                                         N marks at the end
+///                                                         that are new: scroll
 ///                                                         back there (see
 ///                                                         `ViewportGlide.Anchor`)
 ///   ESC _ smooth;? ESC \                                  query; reply smooth;ok;10
