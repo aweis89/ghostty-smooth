@@ -70,3 +70,32 @@ jobs:
           \`\`\`"
           gh release upload "$GITHUB_REF_NAME" "dist/Pcode-$VERSION-arm64.zip" \
             -R "$GITHUB_REPOSITORY" --clobber
+
+      # GITHUB_TOKEN cannot push to another repository; the tap holds this
+      # key's public half as a write deploy key.
+      - uses: actions/checkout@v7.0.1
+        if: startsWith(github.ref, 'refs/tags/pcode-app-v')
+        with:
+          repository: aweis89/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: Point the cask at this release
+        if: startsWith(github.ref, 'refs/tags/pcode-app-v')
+        working-directory: homebrew-tap
+        run: |
+          # Pre-releases (pcode-app-v0.2.0rc1) stay off the cask.
+          echo "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+)*$' || exit 0
+          sha256=$(shasum -a 256 "../dist/Pcode-$VERSION-arm64.zip" | cut -d' ' -f1)
+          sed -i '' -E \
+            -e "s/^  version \"[^\"]*\"/  version \"$VERSION\"/" \
+            -e "s/^  sha256 \"[^\"]*\"/  sha256 \"$sha256\"/" Casks/pcode.rb
+          git diff --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: point the pcode cask at Pcode.app $VERSION"
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
