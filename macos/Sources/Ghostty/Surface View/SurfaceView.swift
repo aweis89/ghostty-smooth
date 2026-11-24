@@ -66,7 +66,10 @@ extension Ghostty {
                         SurfaceResizeOverlay(
                             geoSize: geo.size,
                             size: surfaceSize,
-                            overlay: ghostty.config.resizeOverlay,
+                            // SPIKE: a pcode dock changing height resizes its pane
+                            // (and the dock) all the time: no size pill for that.
+                            overlay: surfaceView.isPCodeOverlay || surfaceView.pcodeHasShownDock
+                                ? .never : ghostty.config.resizeOverlay,
                             position: ghostty.config.resizeOverlayPosition,
                             duration: ghostty.config.resizeOverlayDuration,
                             focusInstant: surfaceView.focusInstant)
