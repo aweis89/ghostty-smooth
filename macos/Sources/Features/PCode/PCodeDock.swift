@@ -133,10 +133,12 @@ struct PCodeDockedSurface: View {
     var body: some View {
         VStack(spacing: 0) {
             PCodeDrawerSurface(surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit)
-                .zIndex(0)
+                // Above the card: the dock's terminal is taller than the card
+                // and reaches up under the transcript, which must win clicks.
+                .zIndex(1)
             if let docked = dock.surface {
                 card(docked)
-                    .zIndex(1)
+                    .zIndex(0)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }

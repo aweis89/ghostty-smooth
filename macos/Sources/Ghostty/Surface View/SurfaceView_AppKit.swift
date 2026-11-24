@@ -932,16 +932,6 @@ extension Ghostty {
             setSurfaceSize(width: UInt32(scaledSize.width), height: UInt32(scaledSize.height))
         }
 
-        /// SPIKE: a pcode dock's terminal is taller than its card; the clipped-off
-        /// top must let clicks through to the transcript drawn there.
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            let hit = super.hitTest(point)
-            guard hit != nil, let visible = pcodeDockVisibleHeight else { return hit }
-            let local = convert(point, from: superview)
-            let fromBottom = isFlipped ? bounds.height - local.y : local.y
-            return fromBottom <= visible ? hit : nil
-        }
-
         override func mouseDown(with event: NSEvent) {
             // A focus-only click activates the split without sending input to the terminal.
             // mouseUp suppresses the matching release.
