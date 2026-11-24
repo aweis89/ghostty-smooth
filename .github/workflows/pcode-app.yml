@@ -54,17 +54,17 @@ jobs:
       - name: Package Pcode.app
         run: |
           version=$VERSION
-          mkdir dist
-          cp -R macos/build/ReleaseLocal/Ghostty.app dist/Pcode.app
-          scripts/brand-pcode-app.sh dist/Pcode.app "$version"
-          lipo -archs dist/Pcode.app/Contents/MacOS/ghostty
-          ditto -c -k --keepParent dist/Pcode.app "dist/Pcode-$version-arm64.zip"
-          shasum -a 256 "dist/Pcode-$version-arm64.zip"
+          mkdir pcode-dist
+          cp -R macos/build/ReleaseLocal/Ghostty.app pcode-dist/Pcode.app
+          scripts/brand-pcode-app.sh pcode-dist/Pcode.app "$version"
+          lipo -archs pcode-dist/Pcode.app/Contents/MacOS/ghostty
+          ditto -c -k --keepParent pcode-dist/Pcode.app "pcode-dist/Pcode-$version-arm64.zip"
+          shasum -a 256 "pcode-dist/Pcode-$version-arm64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: Pcode-${{ env.VERSION }}-arm64
-          path: dist/Pcode-${{ env.VERSION }}-arm64.zip
+          path: pcode-dist/Pcode-${{ env.VERSION }}-arm64.zip
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/pcode-app-v')
@@ -79,7 +79,7 @@ jobs:
           \`\`\`sh
           brew install --cask aweis89/tap/pcode
           \`\`\`"
-          gh release upload "$GITHUB_REF_NAME" "dist/Pcode-$VERSION-arm64.zip" \
+          gh release upload "$GITHUB_REF_NAME" "pcode-dist/Pcode-$VERSION-arm64.zip" \
             -R "$GITHUB_REPOSITORY" --clobber
 
       # GITHUB_TOKEN cannot push to another repository; the tap holds this
@@ -97,7 +97,7 @@ jobs:
         run: |
           # Pre-releases (pcode-app-v0.2.0rc1) stay off the cask.
           echo "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+)*$' || exit 0
-          sha256=$(shasum -a 256 "../dist/Pcode-$VERSION-arm64.zip" | cut -d' ' -f1)
+          sha256=$(shasum -a 256 "../pcode-dist/Pcode-$VERSION-arm64.zip" | cut -d' ' -f1)
           sed -i '' -E \
             -e "s/^  version \"[^\"]*\"/  version \"$VERSION\"/" \
             -e "s/^  sha256 \"[^\"]*\"/  sha256 \"$sha256\"/" Casks/pcode.rb
