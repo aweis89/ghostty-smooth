@@ -5,12 +5,13 @@ import UniformTypeIdentifiers
 /// Window snapshots and frame recordings for the debug socket, made inside the
 /// app so they need no Screen Recording permission.
 ///
-/// `CALayer.render(in:)` draws a window's whole layer tree (SwiftUI chrome,
-/// clips, corner radii) but not IOSurface contents, which is how terminals
-/// draw. For the render, each such layer's contents are swapped for an image
-/// of its IOSurface and then put back, inside one transaction so the screen
-/// never sees the swap. Effects the window server adds (blurs, vibrancy, the
-/// window's own shadow) are not in the picture.
+/// `CALayer.render(in:)` neither draws IOSurface contents (how terminals
+/// draw) nor takes swapped-in images for them, so this walks the layer tree
+/// itself: each layer is rendered alone (its sublayers hidden for the
+/// moment), terminals are drawn from their IOSurface, and clips, opacity,
+/// transforms and flipped geometry are applied on the way down. Effects the
+/// window server adds (blurs, vibrancy, backdrops, the window's own shadow)
+/// and mask shapes other than rounded rects are not in the picture.
 enum DebugSnapshot {
     typealias Reply = DebugCommands.Reply
     typealias Failure = DebugCommands.Failure
@@ -46,26 +47,12 @@ enum DebugSnapshot {
         ctx.setFillColor(window.backgroundColor.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         ctx.scaleBy(x: scale, y: scale)
-        if root.isGeometryFlipped {
-            ctx.translateBy(x: 0, y: bounds.height)
-            ctx.scaleBy(x: 1, y: -1)
-        }
-
-        var swapped: [(CALayer, Any)] = []
-        func swap(_ layer: CALayer) {
-            if let contents = layer.contents, isIOSurface(contents), let image = image(of: contents) {
-                swapped.append((layer, contents))
-                layer.contents = image
-            }
-            layer.sublayers?.forEach(swap)
-        }
+        var drawn = 0
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        swap(root)
-        root.render(in: ctx)
-        for (layer, contents) in swapped { layer.contents = contents }
+        draw(root, in: ctx, flipped: false, terminals: &drawn)
         CATransaction.commit()
-        lastSwapped = swapped.count
+        lastSwapped = drawn
 
         guard let image = ctx.makeImage() else { throw Failure("render made no image") }
         guard let crop else { return image }
@@ -73,6 +60,81 @@ enum DebugSnapshot {
                             width: crop.width * scale, height: crop.height * scale).integral
         guard let cropped = image.cropping(to: pixels) else { throw Failure("crop is outside the window") }
         return cropped
+    }
+
+    /// Draws `layer` and its sublayers into `ctx`, whose origin is at the
+    /// layer's bounds origin. `flipped` is whether the coordinates are y-down.
+    static func draw(_ layer: CALayer, in ctx: CGContext, flipped: Bool, terminals: inout Int) {
+        guard !layer.isHidden, layer.opacity > 0 else { return }
+        let bounds = layer.bounds
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        if layer.opacity < 1 {
+            ctx.setAlpha(CGFloat(layer.opacity))
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        }
+        defer { if layer.opacity < 1 { ctx.endTransparencyLayer() } }
+
+        // The layer's own content, drawn upright.
+        ctx.saveGState()
+        if flipped {
+            ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+        }
+        if let contents = layer.contents, isIOSurface(contents) {
+            if let image = image(of: contents) {
+                // Terminals use top-left gravity: pixels at contentsScale from the top.
+                let scale = max(layer.contentsScale, 1)
+                let size = CGSize(width: CGFloat(image.width) / scale, height: CGFloat(image.height) / scale)
+                ctx.clip(to: bounds)
+                ctx.draw(image, in: CGRect(x: bounds.minX, y: bounds.maxY - size.height,
+                                           width: size.width, height: size.height))
+                terminals += 1
+            }
+        } else {
+            let sublayers = layer.sublayers ?? []
+            let wasHidden = sublayers.map(\.isHidden)
+            sublayers.forEach { $0.isHidden = true }
+            layer.render(in: ctx)
+            zip(sublayers, wasHidden).forEach { $0.isHidden = $1 }
+        }
+        ctx.restoreGState()
+
+        guard let sublayers = layer.sublayers, !sublayers.isEmpty else { return }
+        if layer.masksToBounds {
+            ctx.addPath(CGPath(roundedRect: bounds, cornerWidth: layer.cornerRadius,
+                               cornerHeight: layer.cornerRadius, transform: nil))
+            ctx.clip()
+        }
+        if let mask = layer.mask {
+            let radius = mask.cornerRadius
+            ctx.addPath(CGPath(roundedRect: mask.frame, cornerWidth: radius, cornerHeight: radius, transform: nil))
+            ctx.clip()
+        }
+        var childFlipped = flipped
+        if layer.isGeometryFlipped {
+            ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            childFlipped.toggle()
+        }
+        if !CATransform3DIsIdentity(layer.sublayerTransform),
+           CATransform3DIsAffine(layer.sublayerTransform) {
+            ctx.translateBy(x: bounds.midX, y: bounds.midY)
+            ctx.concatenate(CATransform3DGetAffineTransform(layer.sublayerTransform))
+            ctx.translateBy(x: -bounds.midX, y: -bounds.midY)
+        }
+        for sub in sublayers.sorted(by: { $0.zPosition < $1.zPosition }) {
+            ctx.saveGState()
+            ctx.translateBy(x: sub.position.x, y: sub.position.y)
+            if !CATransform3DIsIdentity(sub.transform), CATransform3DIsAffine(sub.transform) {
+                ctx.concatenate(CATransform3DGetAffineTransform(sub.transform))
+            }
+            let anchor = sub.anchorPoint
+            ctx.translateBy(x: -anchor.x * sub.bounds.width - sub.bounds.minX,
+                            y: -anchor.y * sub.bounds.height - sub.bounds.minY)
+            draw(sub, in: ctx, flipped: childFlipped, terminals: &terminals)
+            ctx.restoreGState()
+        }
     }
 
     static func writePNG(_ image: CGImage, to path: String) throws {
