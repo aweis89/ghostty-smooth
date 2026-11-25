@@ -114,6 +114,8 @@ final class PCodeWorkspace: ObservableObject {
     let ghostty: Ghostty.App
     /// Whether the workspace window is on screen; set by its controller.
     var windowVisible: () -> Bool = { false }
+    /// The workspace window, for confirmation sheets; set by its controller.
+    weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private static let openKey = "PCodeWorkspaceOpenSessions"
 
@@ -210,6 +212,80 @@ final class PCodeWorkspace: ObservableObject {
         panes.append(pane)
         saveOpen()
         if shouldSelect { select(pane) }
+    }
+
+    // MARK: Sidebar actions
+
+    static func reveal(_ directory: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: directory)])
+    }
+
+    static func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func confirmDelete(info: PCodeSessionInfo) {
+        confirm("Delete “\(info.label)”?") { [weak self] in self?.delete(id: info.id) }
+    }
+
+    func confirmDelete(pane: PCodeSessionPane) {
+        guard let id = pane.sessionID else { return }
+        let title = info(for: pane)?.label ?? "this session"
+        confirm("Delete “\(title)”?", detail: "It is closed first, ending pcode in it.") { [weak self, weak pane] in
+            guard let self, let pane else { return }
+            self.close(pane)
+            // pcode lets go of the session a moment after its terminal closes.
+            self.delete(id: id, retries: 10)
+        }
+    }
+
+    private func confirm(_ message: String, detail: String? = nil, then action: @escaping () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = [detail, "Its transcript and history are removed. This can't be undone."]
+            .compactMap { $0 }.joined(separator: " ")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard let window else { return }
+        alert.beginSheetModal(for: window) { if $0 == .alertFirstButtonReturn { action() } }
+    }
+
+    /// `pcode --delete-session <id>`, which refuses a session still open in
+    /// a process: retried while one is letting go of it.
+    private func delete(id: String, retries: Int = 0) {
+        guard PCode.valid(id, length: 1...64) else { return }
+        let command = "\(PCodeWorkspaceMode.command) --delete-session \(PCode.shellQuoted(id))"
+        let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shell)
+            // A login shell, as the session terminals get: `pcode` is on its PATH.
+            process.arguments = ["-l", "-c", command]
+            let errors = Pipe()
+            process.standardError = errors
+            process.standardOutput = FileHandle.nullDevice
+            var status: Int32 = -1
+            if (try? process.run()) != nil {
+                process.waitUntilExit()
+                status = process.terminationStatus
+            }
+            let message = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if status != 0, retries > 0, message.contains("open in another process") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.delete(id: id, retries: retries - 1) }
+                    return
+                }
+                self.reloadHistory()
+                guard status != 0 else { return }
+                let alert = NSAlert()
+                alert.messageText = "Couldn't delete the session"
+                alert.informativeText = message.isEmpty ? "pcode exited with status \(status)." : message
+                if let window = self.window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+            }
+        }
     }
 
     /// Tell each terminal's renderer whether it is on screen, as Ghostty's own
@@ -385,39 +461,66 @@ struct PCodeWorkspaceView: View {
         List(selection: selection) {
             Section("Open") {
                 ForEach(workspace.panes) { pane in
-                    PCodePaneRow(pane: pane, info: workspace.info(for: pane))
+                    PCodePaneRow(pane: pane, info: workspace.info(for: pane)) { openMenu(pane) }
                         .tag(PCodeSidebarItem.pane(pane.id))
-                        .contextMenu {
-                            Button("Close Session") { workspace.requestClose(pane) }
-                        }
+                        .contextMenu { openMenu(pane) }
                 }
             }
             Section("Recent") {
                 ForEach(workspace.recent) { info in
-                    PCodeSessionRow(title: info.label, subtitle: info.directoryName, running: false)
-                        .tag(PCodeSidebarItem.saved(info.id))
+                    PCodeSessionRow(title: info.label, subtitle: info.directoryName, running: false) {
+                        recentMenu(info)
+                    }
+                    .tag(PCodeSidebarItem.saved(info.id))
+                    .contextMenu { recentMenu(info) }
                 }
             }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
     }
-}
 
-private struct PCodePaneRow: View {
-    @ObservedObject var pane: PCodeSessionPane
-    var info: PCodeSessionInfo?
+    @ViewBuilder private func openMenu(_ pane: PCodeSessionPane) -> some View {
+        Button("Close Session") { workspace.requestClose(pane) }
+        if pane.sessionID != nil {
+            Button("Delete Session…", role: .destructive) { workspace.confirmDelete(pane: pane) }
+        }
+        Divider()
+        Button("Reveal Directory in Finder") { PCodeWorkspace.reveal(pane.directory) }
+        if let id = pane.sessionID {
+            Button("Copy Session ID") { PCodeWorkspace.copy(id) }
+        }
+    }
 
-    var body: some View {
-        let title = info?.label ?? (pane.title.isEmpty ? "New session" : pane.title)
-        PCodeSessionRow(title: title, subtitle: (pane.directory as NSString).lastPathComponent, running: true)
+    @ViewBuilder private func recentMenu(_ info: PCodeSessionInfo) -> some View {
+        Button("Open") { workspace.open(info) }
+        Button("Delete Session…", role: .destructive) { workspace.confirmDelete(info: info) }
+        Divider()
+        Button("Reveal Directory in Finder") { PCodeWorkspace.reveal(info.workspace) }
+        Button("Copy Session ID") { PCodeWorkspace.copy(info.id) }
     }
 }
 
-private struct PCodeSessionRow: View {
+private struct PCodePaneRow<Actions: View>: View {
+    @ObservedObject var pane: PCodeSessionPane
+    var info: PCodeSessionInfo?
+    @ViewBuilder var actions: () -> Actions
+
+    var body: some View {
+        let title = info?.label ?? (pane.title.isEmpty ? "New session" : pane.title)
+        PCodeSessionRow(
+            title: title, subtitle: (pane.directory as NSString).lastPathComponent, running: true,
+            actions: actions)
+    }
+}
+
+/// A sidebar row; its actions are a right-click menu and, on hover, a … button.
+private struct PCodeSessionRow<Actions: View>: View {
     var title: String
     var subtitle: String
     var running: Bool
+    @ViewBuilder var actions: () -> Actions
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -428,8 +531,17 @@ private struct PCodeSessionRow: View {
                 Text(title).lineLimit(1).truncationMode(.tail)
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
+            Spacer(minLength: 0)
+            Menu { actions() } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .opacity(hovering ? 1 : 0)
+                .help("Session actions")
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
     }
 }
 
@@ -502,6 +614,7 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         }
         super.init(window: window)
         window.delegate = self
+        workspace.window = window
         workspace.windowVisible = { [weak window] in
             window?.occlusionState.contains(.visible) ?? false
         }
