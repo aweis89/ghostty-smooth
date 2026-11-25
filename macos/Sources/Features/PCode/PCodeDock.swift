@@ -130,22 +130,45 @@ struct PCodeDockedSurface: View {
     private static let cornerRadius: CGFloat = 12
     private static let fallbackLineHeight: CGFloat = 18
 
+    /// Rows of card the /btw drawer leaves room for; a taller card draws over its bottom.
+    private static let drawerClearRows = 6
+
     var body: some View {
-        VStack(spacing: 0) {
-            PCodeDrawerSurface(surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit)
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                PCodeDrawerSurface(
+                    surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
+                    drawsDrawer: false)
                 // Above the card: the dock's terminal is taller than the card
                 // and reaches up under the transcript, which must win clicks.
                 .zIndex(1)
-            if let docked = dock.surface {
-                card(docked)
-                    .zIndex(0)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                if let docked = dock.surface {
+                    card(docked)
+                        .zIndex(0)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
+            // The drawer over the whole area, card included, at a size the
+            // card never changes: resizing its terminal as the card grew with
+            // streamed output scrolled whatever the user was reading in it.
+            PCodeDrawerSurface(
+                surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
+                drawsSurface: false,
+                bottomInset: dock.surface == nil ? nil : drawerInset)
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
         // The dock's grid never resizes, so its height can animate: only the
         // transcript pane above resizes along the way.
         .animation(.easeOut(duration: 0.12), value: dock.rows)
+    }
+
+    /// Space under the drawer: the card at `drawerClearRows` rows, with its margins.
+    private var drawerInset: CGFloat {
+        let docked = dock.surface
+        let cell = (docked?.cellSize.height ?? 0) > 0
+            ? docked!.cellSize.height
+            : (surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight)
+        return PCodeDock.cardHeight(rows: Self.drawerClearRows, cell: cell) + 2 + Self.margin
     }
 
     private func card(_ docked: Ghostty.SurfaceView) -> some View {

@@ -34,6 +34,24 @@ struct PCodeSessionInfo: Identifiable, Hashable, Decodable {
     let name: String?
     let title: String?
     let turns: Int
+    /// The main checkout, for a session in one of its worktrees; absent in old sessions.
+    let project: String?
+
+    /// What the sidebar's project filter groups by.
+    var projectPath: String { project.flatMap { $0.isEmpty ? nil : $0 } ?? workspace }
+
+    /// Whether a pcode process holds this session now: pcode keeps an
+    /// exclusive `flock` on its `.lock` while it is open (`sessions.is_open`).
+    /// Reopening one of those would only continue a copy of it.
+    static func isOpen(_ id: String) -> Bool {
+        let path = root.appendingPathComponent(id).appendingPathComponent(".lock").path
+        let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        guard flock(fd, LOCK_SH | LOCK_NB) == 0 else { return errno == EWOULDBLOCK }
+        flock(fd, LOCK_UN)
+        return false
+    }
 
     var label: String {
         if let name, !name.isEmpty { return name }
@@ -82,6 +100,15 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     /// not observe the whole surface, which publishes on every resize and focus change.
     @Published private(set) var title = ""
     private var titleSubscription: AnyCancellable?
+    private var dockSubscription: AnyCancellable?
+    private var progressSubscription: AnyCancellable?
+
+    /// What the session is doing, from the progress pcode reports to its
+    /// terminal (OSC 9;4): a turn running, a failed one not yet seen, or idle.
+    enum Activity { case idle, running, failed }
+    @Published private(set) var activity: Activity = .idle
+    /// Called when pcode's docked editor comes or goes, so a hidden pane can size it.
+    var onDockChange: (() -> Void)?
 
     init(surface: Ghostty.SurfaceView, directory: String, sessionID: String?) {
         self.surface = surface
@@ -90,6 +117,23 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
         titleSubscription = surface.$title.removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.title = $0 }
+        progressSubscription = surface.$progressReport
+            .map { report -> Activity in
+                switch report?.state {
+                case .set?, .indeterminate?, .pause?: return .running
+                case .error?: return .failed
+                default: return .idle
+                }
+            }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.activity = $0 }
+        dockSubscription = surface.pcodeDock.$surface
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                // After the publish: the new surface is in place by then.
+                DispatchQueue.main.async { self?.onDockChange?() }
+            }
     }
 
     /// Every terminal this pane shows: pcode's, its docked editor's, and the shell.
@@ -179,7 +223,11 @@ final class PCodeWorkspace: ObservableObject {
         reloadHistory { [weak self] all in
             guard let self, self.panes.isEmpty else { return }
             let infos = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-            for id in ids { if let info = infos[id] { self.open(info, select: false) } }
+            // Not one open in another process (a terminal, another window):
+            // that would start a copy of it here instead.
+            for id in ids {
+                if let info = infos[id], !PCodeSessionInfo.isOpen(id) { self.open(info, select: false) }
+            }
             if self.panes.isEmpty { self.newSession() } else { self.select(self.panes[0]) }
         }
     }
@@ -200,10 +248,27 @@ final class PCodeWorkspace: ObservableObject {
 
     private var historyGeneration = 0
 
-    /// Recent sessions not already open here.
+    /// Recent sessions not already open here, in the chosen project if one is.
     var recent: [PCodeSessionInfo] {
         let open = Set(panes.compactMap(\.sessionID))
-        return history.filter { !open.contains($0.id) }
+        return history.filter { !open.contains($0.id) && (projectFilter == nil || $0.projectPath == projectFilter) }
+    }
+
+    /// The project (`PCodeSessionInfo.projectPath`) the Recent list is limited to, if any.
+    @Published var projectFilter: String? = UserDefaults.standard.string(forKey: PCodeWorkspace.filterKey) {
+        didSet { UserDefaults.standard.set(projectFilter, forKey: Self.filterKey) }
+    }
+    private static let filterKey = "PCodeWorkspaceProjectFilter"
+
+    /// Projects with saved sessions, most recently used first, with how many each has.
+    var projects: [(path: String, count: Int)] {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for info in history {
+            if counts[info.projectPath] == nil { order.append(info.projectPath) }
+            counts[info.projectPath, default: 0] += 1
+        }
+        return order.map { ($0, counts[$0] ?? 0) }
     }
 
     func info(for pane: PCodeSessionPane) -> PCodeSessionInfo? {
@@ -214,6 +279,7 @@ final class PCodeWorkspace: ObservableObject {
     func newSession(directory: String? = nil) {
         let dir = directory ?? selectedPane?.directory ?? NSHomeDirectory()
         guard let pane = makePane(args: [], directory: dir, sessionID: nil) else { return }
+        adopt(pane)
         panes.insert(pane, at: 0)
         select(pane)
     }
@@ -225,7 +291,9 @@ final class PCodeWorkspace: ObservableObject {
         }
         guard PCode.valid(info.id, length: 1...64) else { return }
         guard let pane = makePane(args: ["-c", info.id], directory: info.workspace, sessionID: info.id) else { return }
+        adopt(pane)
         panes.append(pane)
+        presizeHidden()
         saveOpen()
         if shouldSelect { select(pane) }
     }
@@ -321,9 +389,54 @@ final class PCodeWorkspace: ObservableObject {
         }
     }
 
+    // MARK: Hidden panes' sizes
+
+    /// The session area's size, measured by the view; hidden panes are sized to it.
+    var detailSize: CGSize = .zero {
+        didSet { if detailSize != oldValue { presizeHidden() } }
+    }
+
+    /// Give every hidden pane's terminals the size they will have when shown.
+    ///
+    /// A hidden pane is in no window, so nothing lays its terminals out: they
+    /// keep the size they were made with (a few dozen columns), pcode in them
+    /// draws to that, and showing one reflows everything at once. Sized to
+    /// match the shown pane, showing it changes nothing.
+    func presizeHidden() {
+        guard let window, detailSize.width > 0, detailSize.height > 0 else { return }
+        let scale = window.backingScaleFactor
+        let shown = selectedPane
+        let transcript = Self.measured(shown?.surface) ?? detailSize
+        let dock = Self.measured(shown?.surface.existingPCodeDock?.surface)
+            ?? CGSize(width: detailSize.width - 16, height: PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: 18))
+        for pane in panes where pane.id != selected {
+            Self.setSize(pane.surface, transcript, scale: scale)
+            if let docked = pane.surface.existingPCodeDock?.surface {
+                Self.setSize(docked, dock, scale: scale)
+            }
+        }
+    }
+
+    private static func measured(_ view: NSView?) -> CGSize? {
+        guard let view, view.window != nil, view.bounds.width > 0, view.bounds.height > 0 else { return nil }
+        return view.bounds.size
+    }
+
+    private static func setSize(_ view: Ghostty.SurfaceView, _ size: CGSize, scale: CGFloat) {
+        guard let surface = view.surface, view.window == nil else { return }
+        ghostty_surface_set_content_scale(surface, scale, scale)
+        ghostty_surface_set_size(surface, UInt32(size.width * scale), UInt32(size.height * scale))
+    }
+
+    private func adopt(_ pane: PCodeSessionPane) {
+        pane.onDockChange = { [weak self] in self?.presizeHidden() }
+    }
+
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
         syncOcclusion()
+        // The pane just hidden keeps its size; the others follow the shown one.
+        DispatchQueue.main.async { [weak self] in self?.presizeHidden() }
         // After SwiftUI has put the pane's views in the window.
         DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
     }
@@ -433,6 +546,11 @@ struct PCodeWorkspaceView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(ghostty.config.backgroundColor)
+            .background(GeometryReader { proxy in
+                Color.clear
+                    .onAppear { workspace.detailSize = proxy.size }
+                    .onChange(of: proxy.size) { workspace.detailSize = $0 }
+            })
         }
     }
 
@@ -485,18 +603,48 @@ struct PCodeWorkspaceView: View {
                         .contextMenu { openMenu(pane) }
                 }
             }
-            Section("Recent") {
+            Section {
                 ForEach(workspace.recent) { info in
-                    PCodeSessionRow(title: info.label, subtitle: info.directoryName, running: false) {
+                    PCodeSessionRow(title: info.label, subtitle: info.directoryName, activity: nil) {
                         recentMenu(info)
                     }
                     .tag(PCodeSidebarItem.saved(info.id))
                     .contextMenu { recentMenu(info) }
                 }
+            } header: {
+                recentHeader
             }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+    }
+
+    private var recentHeader: some View {
+        HStack(spacing: 4) {
+            Text(workspace.projectFilter.map { "Recent · \(($0 as NSString).lastPathComponent)" } ?? "Recent")
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Menu {
+                Picker("Project", selection: $workspace.projectFilter) {
+                    Text("All Projects").tag(String?.none)
+                    Divider()
+                    ForEach(workspace.projects, id: \.path) { project in
+                        Text("\((project.path as NSString).lastPathComponent)  (\(project.count))")
+                            .tag(String?.some(project.path))
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            } label: {
+                Image(systemName: workspace.projectFilter == nil
+                    ? "line.3.horizontal.decrease.circle"
+                    : "line.3.horizontal.decrease.circle.fill")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Show one project's sessions")
+        }
     }
 
     @ViewBuilder private func openMenu(_ pane: PCodeSessionPane) -> some View {
@@ -528,8 +676,8 @@ private struct PCodePaneRow<Actions: View>: View {
     var body: some View {
         let title = info?.label ?? (pane.title.isEmpty ? "New session" : pane.title)
         PCodeSessionRow(
-            title: title, subtitle: (pane.directory as NSString).lastPathComponent, running: true,
-            actions: actions)
+            title: title, subtitle: (pane.directory as NSString).lastPathComponent,
+            activity: pane.activity, actions: actions)
     }
 }
 
@@ -537,15 +685,15 @@ private struct PCodePaneRow<Actions: View>: View {
 private struct PCodeSessionRow<Actions: View>: View {
     var title: String
     var subtitle: String
-    var running: Bool
+    /// Nil for a session not open here.
+    var activity: PCodeSessionPane.Activity?
     @ViewBuilder var actions: () -> Actions
     @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(running ? Color.green : Color.clear)
-                .frame(width: 6, height: 6)
+            PCodeActivityIndicator(activity: activity)
+                .frame(width: 12, height: 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).lineLimit(1).truncationMode(.tail)
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -564,21 +712,104 @@ private struct PCodeSessionRow<Actions: View>: View {
     }
 }
 
+/// Open and idle: a dot. A turn running: pcode's `dual` spinner (two
+/// counter-rotating crescents, `kitty_spinner._render_dual`). Failed: red.
+private struct PCodeActivityIndicator: View {
+    var activity: PCodeSessionPane.Activity?
+
+    var body: some View {
+        switch activity {
+        case .running?:
+            // 30 fps is plenty for 12 points, and keeps the sidebar from
+            // redrawing at the terminal's 120.
+            TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+                let t = context.date.timeIntervalSinceReferenceDate
+                Canvas { gc, size in
+                    let side = min(size.width, size.height)
+                    let center = CGPoint(x: size.width / 2, y: size.height / 2)
+                    Self.arc(gc, center: center, radius: side * 0.40, width: side * 0.13,
+                             head: t * 3.6, sweep: 2.65, color: .accentColor)
+                    Self.arc(gc, center: center, radius: side * 0.22, width: side * 0.12,
+                             head: -t * 5.4, sweep: 2.45, color: .accentColor.opacity(0.75))
+                }
+            }
+        case .failed?:
+            Circle().fill(Color.red).frame(width: 6, height: 6)
+        case .idle?:
+            Circle().fill(Color.secondary.opacity(0.7)).frame(width: 6, height: 6)
+        case nil:
+            Color.clear
+        }
+    }
+
+    /// A crescent whose tail fades behind its head, as in pcode's spinner.
+    private static func arc(
+        _ gc: GraphicsContext, center: CGPoint, radius: CGFloat, width: CGFloat,
+        head: Double, sweep: Double, color: Color
+    ) {
+        let steps = 12
+        for step in 0..<steps {
+            let from = head - sweep * Double(step + 1) / Double(steps)
+            let to = head - sweep * Double(step) / Double(steps)
+            var path = Path()
+            path.addArc(center: center, radius: radius, startAngle: .radians(from), endAngle: .radians(to), clockwise: false)
+            let fade = 1.0 - 0.85 * Double(step) / Double(steps)
+            gc.stroke(path, with: .color(color.opacity(fade)), style: StrokeStyle(lineWidth: width, lineCap: step == 0 ? .round : .butt))
+        }
+    }
+}
+
 /// A session: pcode's terminal with everything pcode lays over it, and the bottom shell.
 private struct PCodeSessionPaneView: View {
     @ObservedObject var pane: PCodeSessionPane
-    private static let shellHeight: CGFloat = 200
+    @EnvironmentObject var ghostty: Ghostty.App
+    /// The shell's height, set by dragging its top edge; shared by every session.
+    @AppStorage("PCodeWorkspaceShellHeight") private var shellHeight: Double = 200
+    @State private var dragStart: Double?
+    private static let minShell: CGFloat = 80
+    /// pcode's own pane keeps at least this much above the shell.
+    private static let minSession: CGFloat = 200
 
     var body: some View {
-        VStack(spacing: 0) {
-            Ghostty.InspectableSurface(surfaceView: pane.surface, isSplit: false)
-            if pane.shellVisible, let shell = pane.shell {
-                Divider()
-                Ghostty.SurfaceWrapper(surfaceView: shell, isSplit: false)
-                    .id(ObjectIdentifier(shell))
-                    .frame(height: Self.shellHeight)
+        GeometryReader { geometry in
+            let maxShell = max(Self.minShell, geometry.size.height - Self.minSession)
+            VStack(spacing: 0) {
+                Ghostty.InspectableSurface(surfaceView: pane.surface, isSplit: false)
+                if pane.shellVisible, let shell = pane.shell {
+                    handle(maxShell: maxShell)
+                    Ghostty.SurfaceWrapper(surfaceView: shell, isSplit: false)
+                        .id(ObjectIdentifier(shell))
+                        .frame(height: min(maxShell, max(Self.minShell, shellHeight)))
+                }
             }
         }
+    }
+
+    /// The shell's top edge: a hairline to see, a taller strip to drag.
+    private func handle(maxShell: CGFloat) -> some View {
+        Rectangle()
+            .fill(ghostty.config.splitDividerColor)
+            .frame(height: 1)
+            .overlay(
+                Color.clear
+                    .frame(height: 9)
+                    .contentShape(Rectangle())
+                    .backport.pointerStyle(.resizeUpDown)
+                    .onHover { inside in
+                        if #available(macOS 15, *) { return }
+                        if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture(coordinateSpace: .global)
+                            .onChanged { gesture in
+                                let start = dragStart ?? shellHeight
+                                dragStart = start
+                                shellHeight = min(maxShell, max(Self.minShell, start - gesture.translation.height))
+                            }
+                            .onEnded { _ in dragStart = nil }
+                    )
+            )
+            .zIndex(1)
     }
 }
 

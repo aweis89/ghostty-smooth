@@ -178,6 +178,14 @@ struct PCodeDrawerSurface: View {
     @ObservedObject var surfaceView: Ghostty.SurfaceView
     @ObservedObject var drawer: PCodeDrawer
     var isSplit: Bool
+    /// SPIKE: the docked layout draws the terminal and the drawer as separate
+    /// layers (`PCodeDockedSurface`), so the drawer can span the editor card's
+    /// area too and keep one size while the card grows and shrinks.
+    var drawsSurface = true
+    var drawsDrawer = true
+    /// Space kept clear under the drawer instead of the editor rows the
+    /// undocked layout leaves uncovered.
+    var bottomInset: CGFloat?
 
     /// The drawer's share of the surface's width, set by dragging its left edge.
     @State private var fraction: CGFloat = 0.70
@@ -191,11 +199,17 @@ struct PCodeDrawerSurface: View {
 
     var body: some View {
         GeometryReader { geometry in
-            Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
+            ZStack {
+                if drawsSurface {
+                    Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
+                } else {
+                    Color.clear.allowsHitTesting(false)
+                }
+            }
                 .overlay(alignment: .topTrailing) {
                     ZStack(alignment: .topTrailing) {
                         Color.clear
-                        if drawer.visible, let viewer = drawer.viewer {
+                        if drawsDrawer, drawer.visible, let viewer = drawer.viewer {
                             overlay(
                                 viewer,
                                 width: width(in: geometry.size.width),
@@ -220,6 +234,7 @@ struct PCodeDrawerSurface: View {
     }
 
     private func height(in total: CGFloat) -> CGFloat {
+        if let bottomInset { return max(min(total, Self.minHeight), total - bottomInset) }
         let lineHeight = surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
         let extraPadding: CGFloat
         if let rows = surfaceView.surfaceSize?.rows, rows > 0, surfaceView.cellSize.height > 0 {
