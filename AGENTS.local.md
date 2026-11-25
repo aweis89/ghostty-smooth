@@ -15,6 +15,13 @@ it alone so rebases stay clean, and put fork rules here.
   <one of your symbols>`. If you can't merge (the checkout has someone else's
   uncommitted work, or the user said to hold off), say so at the top of your
   final message, name the branch, and say the change isn't in the installed app.
-- **Several sessions share this checkout.** Check `git status` before merging,
-  and commit only your own paths; untracked files can be another session's
-  work in progress.
+- **Several sessions share this checkout, so build and install from a
+  worktree.** A `just install` from a dirty `~/p/ghostty-smooth` ships another
+  session's half-done edits and drops any feature not on `pcode-smooth` yet.
+  Develop in a worktree, merge into `pcode-smooth` once it's clean, and install
+  from the merged result. Check `git status` before merging, and commit only
+  your own paths: untracked files can be another session's work in progress.
+- **Push from the parent directory.** This repo has upstream's own `.envrc`,
+  which is blocked, so direnv doesn't load the credentials from `~/p` here and
+  `git push` fails with "Invalid username or token". Run `cd ~/p && git -C
+  ghostty-smooth push origin <branch>` instead.
