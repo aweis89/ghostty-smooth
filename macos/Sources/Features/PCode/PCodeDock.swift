@@ -31,8 +31,10 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
     /// Rows of slack the card takes on top of the rows it shows: the margins
     /// around it, the terminal's own padding and a part row of headroom.
     /// pcode reckons the pane rows the card hides from it, so keep this in
-    /// step with `CARD_SLACK_ROWS` in pcode's `pcode/dock.py`.
-    static let slackRows: CGFloat = 1.75
+    /// step with `CARD_SLACK_ROWS` in pcode's `pcode/dock.py`. The terminal's
+    /// padding is in points, not cells: at 1.75, a 9pt cell lost the top
+    /// row's top couple of points to it; 2 leaves room down to that size.
+    static let slackRows: CGFloat = 2
     /// The card's top and bottom margins, inside `footprint`.
     static let topMargin: CGFloat = 2
     static let bottomMargin: CGFloat = 8
@@ -143,7 +145,6 @@ struct PCodeDockedSurface: View {
     @ObservedObject var dock: PCodeDock
     var isSplit: Bool
 
-    private static let cornerRadius: CGFloat = 12
     private static let fallbackLineHeight: CGFloat = 18
 
     /// Rows of card the /btw drawer leaves room for; a taller card draws over its bottom.
@@ -168,15 +169,7 @@ struct PCodeDockedSurface: View {
             // than the card; the clipped-off top lets clicks through to what
             // is under it (`SurfaceScrollView.hitTest`).
             if let docked = dock.surface {
-                // The card's whole footprint, margins included, takes the
-                // clicks the card itself doesn't: the pane rows under it are
-                // hidden, and a click there would start a selection in them.
-                Color.clear
-                    .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell))
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0))
-                    .allowsHitTesting(dock.ready)
-                card(docked)
+                PCodeDockCard(docked: docked, dock: dock, fallbackCell: paneCell)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -194,13 +187,43 @@ struct PCodeDockedSurface: View {
     /// The dock's row height, or the pane's until the dock has one.
     private var cell: CGFloat {
         if let docked = dock.surface, docked.cellSize.height > 0 { return docked.cellSize.height }
-        return surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
+        return paneCell
     }
 
-    private func card(_ docked: Ghostty.SurfaceView) -> some View {
-        let cell = docked.cellSize.height > 0
-            ? docked.cellSize.height
-            : (surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight)
+    private var paneCell: CGFloat {
+        surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
+    }
+}
+
+/// The docked editor's card, with a backstop over its whole footprint.
+///
+/// Its own view so it observes the dock's terminal: the card's height is in
+/// that terminal's cells, and pcode reckons the pane rows the card covers from
+/// them, so a font change there must resize the card at once.
+private struct PCodeDockCard: View {
+    @EnvironmentObject var ghostty: Ghostty.App
+    @ObservedObject var docked: Ghostty.SurfaceView
+    @ObservedObject var dock: PCodeDock
+    var fallbackCell: CGFloat
+
+    private static let cornerRadius: CGFloat = 12
+
+    var body: some View {
+        let cell = docked.cellSize.height > 0 ? docked.cellSize.height : fallbackCell
+        ZStack(alignment: .bottom) {
+            // The card's whole footprint, margins included, takes the clicks
+            // the card itself doesn't: the pane rows under it are hidden, and
+            // a click there would start a selection in them.
+            Color.clear
+                .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell))
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0))
+                .allowsHitTesting(dock.ready)
+            card(cell: cell)
+        }
+    }
+
+    private func card(cell: CGFloat) -> some View {
         // The card is the dock's terminal itself, edge to edge: pcode tints its
         // background (OSC 11) a shade off the pane's, and its own padding takes
         // that tint, so the whole card is one raised surface. The backdrop only
