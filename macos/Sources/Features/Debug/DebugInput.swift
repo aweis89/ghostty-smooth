@@ -40,7 +40,7 @@ enum DebugInput {
             "left": (123, function(NSLeftArrowFunctionKey)), "right": (124, function(NSRightArrowFunctionKey)),
             "home": (115, function(NSHomeFunctionKey)), "end": (119, function(NSEndFunctionKey)),
             "pageup": (116, function(NSPageUpFunctionKey)), "pagedown": (121, function(NSPageDownFunctionKey)),
-            "backslash": (42, "\\"), "plus": (24, "="), "minus": (27, "-"),
+            "backslash": (42, "\\"), "minus": (27, "-"),
         ]
         let fkeys: [UInt16] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111]
         for (index, code) in fkeys.enumerated() {
@@ -84,6 +84,7 @@ enum DebugInput {
     }
 
     static func stroke(key: String, mods: NSEvent.ModifierFlags) throws -> Stroke {
+        if key.lowercased() == "plus" { return try stroke(key: "+", mods: mods) }
         if key.count > 1, let (code, chars) = named[key.lowercased()] {
             return Stroke(keyCode: code, chars: chars, mods: mods, fixed: true)
         }
@@ -303,6 +304,9 @@ enum DebugInput {
 
     /// `from`/`to` as points (or `from_cell`/`to_cell` of `surface`).
     static func drag(_ args: [String: Any], _ reply: @escaping Reply) throws {
+        guard args["from"] != nil || args["from_cell"] != nil, args["to"] != nil || args["to_cell"] != nil else {
+            throw Failure("drag needs from (or from_cell) and to (or to_cell)")
+        }
         let (window, x1, y1) = try DebugCommands.target(args, key: "from")
         let (_, x2, y2) = try DebugCommands.target(args, key: "to")
         let start = try DebugCommands.windowPoint(x1, y1, in: window)
