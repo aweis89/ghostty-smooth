@@ -279,6 +279,7 @@ final class PCodeWorkspace: ObservableObject {
     private var historyByID: [String: PCodeSessionInfo] = [:]
 
     let ghostty: Ghostty.App
+    let peek = PCodePeekController()
     /// Whether the workspace window is on screen; set by its controller.
     var windowVisible: () -> Bool = { false }
     /// The workspace window, for confirmation sheets; set by its controller.
@@ -296,6 +297,7 @@ final class PCodeWorkspace: ObservableObject {
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
+        peek.onTargetChange = { [weak self] in self?.syncOcclusion() }
         let center = NotificationCenter.default
         observers.append(center.addObserver(
             forName: Ghostty.Notification.ghosttyCloseSurface, object: nil, queue: .main
@@ -541,7 +543,46 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func openDirectoryPicker() {
+        peek.dismiss()
         showingDirectoryPicker = true
+    }
+
+    func peekTarget(for info: PCodeSessionInfo) -> PCodePeekTarget {
+        PCodePeekTarget(
+            sessionID: info.id,
+            title: info.label,
+            subtitle: info.worktreeName ?? Self.relativeTime(info.updatedDate),
+            directory: info.workspace,
+            turnsHint: info.turns,
+            updatedDate: info.updatedDate,
+            isOpen: false,
+            paneID: nil,
+            info: info)
+    }
+
+    func peekTarget(for pane: PCodeSessionPane) -> PCodePeekTarget {
+        let saved = info(for: pane)
+        let placeholder = pane.title.isEmpty || pane.title == "👻"
+        let title = saved?.label ?? (placeholder ? "New session" : pane.title)
+        return PCodePeekTarget(
+            sessionID: pane.sessionID,
+            title: title,
+            subtitle: saved?.worktreeName ?? pane.worktreeName,
+            directory: pane.directory,
+            turnsHint: saved?.turns,
+            updatedDate: saved?.updatedDate,
+            isOpen: true,
+            paneID: pane.id,
+            info: saved)
+    }
+
+    func openPeekTarget(_ target: PCodePeekTarget) {
+        peek.dismiss()
+        if let paneID = target.paneID, let pane = panes.first(where: { $0.id == paneID }) {
+            select(pane)
+        } else if let info = target.info ?? target.sessionID.flatMap({ historyByID[$0] }) {
+            open(info)
+        }
     }
 
     func dismissDirectoryPicker() {
@@ -615,6 +656,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func open(_ info: PCodeSessionInfo, select shouldSelect: Bool = true) {
+        if shouldSelect { peek.dismiss() }
         if let pane = panes.first(where: { $0.sessionID == info.id }) {
             if shouldSelect { select(pane) }
             return
@@ -762,8 +804,9 @@ final class PCodeWorkspace: ObservableObject {
     /// compete with the one being watched.
     func syncOcclusion() {
         let windowVisible = windowVisible()
+        let peekedPaneID = peek.target?.paneID
         for pane in panes {
-            let visible = windowVisible && pane.id == selected
+            let visible = windowVisible && (pane.id == selected || pane.id == peekedPaneID)
             for view in pane.surfaces {
                 // Always sent: a new surface's flag starts false while its
                 // renderer starts visible, so comparing would skip hiding it.
@@ -908,6 +951,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func select(_ pane: PCodeSessionPane) {
+        peek.dismiss()
         selected = pane.id
         if isViewed(pane) { markSeen(pane) }
         syncOcclusion()
@@ -926,6 +970,7 @@ final class PCodeWorkspace: ObservableObject {
 
     /// Remove `pane` and end its terminals. Not from inside one of their callbacks.
     func close(_ pane: PCodeSessionPane) {
+        if peek.target?.paneID == pane.id { peek.dismiss() }
         guard let index = panes.firstIndex(where: { $0 === pane }) else { return }
         panes.remove(at: index)
         if let shell = pane.shell { PCode.retire(shell) }
@@ -1049,6 +1094,15 @@ struct PCodeWorkspaceView: View {
                     } else {
                         Text("No session open").foregroundStyle(.secondary)
                     }
+
+                    PCodePeekOverlay(
+                        peek: workspace.peek,
+                        livePane: workspace.peek.target?.paneID.flatMap { id in
+                            workspace.panes.first { $0.id == id }
+                        }
+                    ) { target in
+                        workspace.openPeekTarget(target)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(ghostty.config.backgroundColor)
@@ -1064,6 +1118,8 @@ struct PCodeWorkspaceView: View {
                     .transition(.opacity)
             }
         }
+        .onAppear { workspace.peek.startMonitoring() }
+        .onDisappear { workspace.peek.stopMonitoring() }
     }
 
     private var sidebarHeader: some View {
@@ -1156,7 +1212,14 @@ struct PCodeWorkspaceView: View {
         let section = Section {
             if !collapsed {
                 ForEach(group.openPanes) { pane in
-                    PCodePaneRow(pane: pane, info: workspace.info(for: pane)) { openMenu(pane) }
+                    PCodePaneRow(
+                        pane: pane,
+                        info: workspace.info(for: pane),
+                        onHoverChange: { hovering in
+                            guard pane.id != workspace.selected else { return }
+                            workspace.peek.rowHoverChanged(workspace.peekTarget(for: pane), hovering: hovering)
+                        }
+                    ) { openMenu(pane) }
                         .tag(PCodeSidebarItem.pane(pane.id))
                         .contextMenu { openMenu(pane) }
                 }
@@ -1169,7 +1232,10 @@ struct PCodeWorkspaceView: View {
                         title: info.label,
                         subtitle: info.worktreeName ?? PCodeWorkspace.relativeTime(info.updatedDate),
                         activity: nil,
-                        unseen: workspace.unseenIDs.contains(info.id)
+                        unseen: workspace.unseenIDs.contains(info.id),
+                        onHoverChange: { hovering in
+                            workspace.peek.rowHoverChanged(workspace.peekTarget(for: info), hovering: hovering)
+                        }
                     ) {
                         recentMenu(info)
                     }
@@ -1261,6 +1327,14 @@ struct PCodeWorkspaceView: View {
     }
 
     @ViewBuilder private func openMenu(_ pane: PCodeSessionPane) -> some View {
+        if pane.id != workspace.selected {
+            Button {
+                workspace.peek.peekFromMenu(workspace.peekTarget(for: pane))
+            } label: {
+                Label("Peek (⌥ Hover)", systemImage: "eye")
+            }
+            Divider()
+        }
         Button("Close Session") { workspace.requestClose(pane) }
         if pane.sessionID != nil {
             Button("Delete Session…", role: .destructive) { workspace.confirmDelete(pane: pane) }
@@ -1273,6 +1347,11 @@ struct PCodeWorkspaceView: View {
     }
 
     @ViewBuilder private func recentMenu(_ info: PCodeSessionInfo) -> some View {
+        Button {
+            workspace.peek.peekFromMenu(workspace.peekTarget(for: info))
+        } label: {
+            Label("Peek (⌥ Hover)", systemImage: "eye")
+        }
         Button("Open") { workspace.open(info) }
         Button("Delete Session…", role: .destructive) { workspace.confirmDelete(info: info) }
         Divider()
@@ -1340,6 +1419,7 @@ private struct PCodeFolderHeader: View {
 private struct PCodePaneRow<Actions: View>: View {
     @ObservedObject var pane: PCodeSessionPane
     var info: PCodeSessionInfo?
+    var onHoverChange: ((Bool) -> Void)? = nil
     @ViewBuilder var actions: () -> Actions
 
     var body: some View {
@@ -1351,6 +1431,7 @@ private struct PCodePaneRow<Actions: View>: View {
             subtitle: info?.worktreeName ?? pane.worktreeName,
             activity: pane.activity,
             unseen: pane.unseen,
+            onHoverChange: onHoverChange,
             actions: actions)
     }
 }
@@ -1363,6 +1444,7 @@ private struct PCodeSessionRow<Actions: View>: View {
     var activity: PCodeSessionPane.Activity?
     /// A finished response not yet looked at here.
     var unseen = false
+    var onHoverChange: ((Bool) -> Void)? = nil
     @ViewBuilder var actions: () -> Actions
     @State private var hovering = false
 
@@ -1386,7 +1468,10 @@ private struct PCodeSessionRow<Actions: View>: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-        .onHover { hovering = $0 }
+        .onHover { inside in
+            hovering = inside
+            onHoverChange?(inside)
+        }
     }
 }
 
@@ -1774,7 +1859,7 @@ private struct PCodeActivityIndicator: View {
 }
 
 /// A session: pcode's terminal with everything pcode lays over it, and the bottom shell.
-private struct PCodeSessionPaneView: View {
+struct PCodeSessionPaneView: View {
     @ObservedObject var pane: PCodeSessionPane
     @EnvironmentObject var ghostty: Ghostty.App
     /// The shell's height, set by dragging its top edge; shared by every session.
@@ -1909,6 +1994,7 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         if workspace.showingDirectoryPicker {
             workspace.showingDirectoryPicker = false
         }
+        workspace.peek.dismiss()
     }
 
     required init?(coder: NSCoder) { fatalError("not restorable from a coder") }
@@ -1920,6 +2006,10 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
     @IBAction func close(_ sender: Any) {
         if workspace.showingDirectoryPicker {
             workspace.dismissDirectoryPicker()
+            return
+        }
+        if workspace.peek.isShowing {
+            workspace.peek.dismiss()
             return
         }
         if let picker = PCode.keyboardPicker(in: window) {
