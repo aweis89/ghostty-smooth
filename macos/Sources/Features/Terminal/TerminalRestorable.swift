@@ -139,6 +139,12 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // no matter what. Note its safe to use "ghostty.config" directly here
         // because window restoration is only ever invoked on app start so we
         // don't have to deal with config reloads.
+        // SPIKE: pcode's workspace window reopens its own sessions instead.
+        if PCodeWorkspaceMode.enabled {
+            completionHandler(nil, nil)
+            return
+        }
+
         if appDelegate.ghostty.config.windowSaveState == "never" {
             AppDelegate.logger.warning("skip restoration: window-save-state=never")
             completionHandler(nil, nil)

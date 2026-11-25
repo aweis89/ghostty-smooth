@@ -227,6 +227,7 @@ extension Ghostty.SurfaceView {
             objc_setAssociatedObject(self, &pcodeSessionKey, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC)
             // The window encodes its surface tree, so it is the window that is now stale.
             window?.invalidateRestorableState()
+            NotificationCenter.default.post(name: PCodeWorkspace.sessionChanged, object: self)
         }
     }
 
