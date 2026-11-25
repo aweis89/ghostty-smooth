@@ -594,8 +594,8 @@ extension Ghostty {
             var target = target
             if target.tag == GHOSTTY_TARGET_SURFACE, isPaneAction(action.tag),
                let surface = target.target.surface,
-               let view = surfaceView(from: surface), view.isPCodeOverlay,
-               let pane = view.pcodeOwner?.surfaceView?.surface {
+               let view = surfaceView(from: surface),
+               let pane = PCodeHooks.shared.pane(forOverlay: view)?.surface {
                 target.target.surface = pane
             }
 
@@ -1977,7 +1977,7 @@ extension Ghostty {
                   let surfaceView = self.surfaceView(from: surface),
                   // Copied now: the string is only valid during this call.
                   let text = String(cString: v.payload, encoding: .utf8) else { return }
-            surfaceView.pcodeEvent(text)
+            PCodeHooks.shared.handleEvent(text, from: surfaceView)
         }
 
         private static func pwdChanged(

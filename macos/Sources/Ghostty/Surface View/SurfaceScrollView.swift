@@ -25,13 +25,13 @@ class SurfaceScrollView: NSView {
     /// on the same row.
     private var lastSentRow: Int?
 
-    /// SPIKE: a pcode dock's terminal is taller than its card; the clipped-off
+    /// A pcode dock's terminal is taller than its card; the clipped-off
     /// top must let clicks through to the transcript drawn there. This is the
     /// outermost view, so declining here (not in the surface) keeps the scroll
     /// view from claiming the click instead.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
-        guard hit != nil, let visible = surfaceView.pcodeDockVisibleHeight else { return hit }
+        guard hit != nil, let visible = PCodeHooks.shared.clickableHeight(surfaceView) else { return hit }
         let local = convert(point, from: superview)
         let fromBottom = isFlipped ? bounds.height - local.y : local.y
         return fromBottom <= visible ? hit : nil

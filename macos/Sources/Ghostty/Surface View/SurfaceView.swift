@@ -45,9 +45,9 @@ extension Ghostty {
                         // A pcode overlay (drawer viewer, popup) stands in for the
                         // surface it is over: that one is in the window's split tree,
                         // so the window keeps its title, directory and split actions.
-                        .focusedValue(\.ghosttySurfacePwd, surfaceView.pcodeWindowSurface.pwd)
-                        .focusedValue(\.ghosttySurfaceView, surfaceView.pcodeWindowSurface)
-                        .focusedValue(\.ghosttySurfaceCellSize, surfaceView.pcodeWindowSurface.cellSize)
+                        .focusedValue(\.ghosttySurfacePwd, PCodeHooks.shared.windowSurface(for: surfaceView).pwd)
+                        .focusedValue(\.ghosttySurfaceView, PCodeHooks.shared.windowSurface(for: surfaceView))
+                        .focusedValue(\.ghosttySurfaceCellSize, PCodeHooks.shared.windowSurface(for: surfaceView).cellSize)
                         .onReceive(pubBecomeKey) { notification in
                             guard let window = notification.object as? NSWindow else { return }
                             guard let surfaceWindow = surfaceView.window else { return }
@@ -66,9 +66,9 @@ extension Ghostty {
                         SurfaceResizeOverlay(
                             geoSize: geo.size,
                             size: surfaceSize,
-                            // SPIKE: a pcode dock changing height resizes its pane
-                            // (and the dock) all the time: no size pill for that.
-                            overlay: surfaceView.isPCodeOverlay || surfaceView.pcodeHasShownDock
+                            // A pcode dock changing height resizes its pane (and
+                            // the dock) all the time: no size pill for that.
+                            overlay: PCodeHooks.shared.suppressesResizeOverlay(surfaceView)
                                 ? .never : ghostty.config.resizeOverlay,
                             position: ghostty.config.resizeOverlayPosition,
                             duration: ghostty.config.resizeOverlayDuration,

@@ -24,7 +24,7 @@ extension Ghostty {
 
             ZStack {
                 if !surfaceView.inspectorVisible {
-                    PCodeDockedSurface(surfaceView: surfaceView, dock: surfaceView.pcodeDock, isSplit: isSplit)
+                    PCodeHooks.shared.surfaceContent(surfaceView, isSplit: isSplit)
                 } else {
                     SplitView(.vertical, $split, dividerColor: ghostty.config.splitDividerColor, left: {
                         SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
@@ -40,9 +40,7 @@ extension Ghostty {
             }
             // pcode's completion list and toast over the terminal, and its popup
             // over all of it, with or without the inspector.
-            .overlay { PCodeCompletionLayer(completion: surfaceView.pcodeCompletion) }
-            .overlay { PCodeToastLayer(toast: surfaceView.pcodeToast) }
-            .overlay { PCodePopupLayer(popup: surfaceView.pcodePopup) }
+            .overlay { PCodeHooks.shared.surfaceOverlay(surfaceView) }
             .onReceive(pubInspector) { onControlInspector($0) }
             .onChange(of: surfaceView.inspectorVisible) { inspectorVisible in
                 // When we show the inspector, we want to focus on the inspector.
