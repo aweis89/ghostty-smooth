@@ -505,7 +505,16 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         workspace.windowVisible = { [weak window] in
             window?.occlusionState.contains(.visible) ?? false
         }
+        // A light/dark switch (`theme = light:…,dark:…`) reloads the config;
+        // the titlebar and any gap must take the new background too.
+        configSubscription = ghostty.$config
+            .receive(on: DispatchQueue.main)
+            .sink { [weak window] config in
+                window?.backgroundColor = NSColor(config.backgroundColor).withAlphaComponent(1)
+            }
     }
+
+    private var configSubscription: AnyCancellable?
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
         workspace.syncOcclusion()
