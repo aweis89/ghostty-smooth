@@ -59,7 +59,7 @@ final class PCodeRestart {
         }
         lines.append("Shells under sessions, sessions without a turn yet, and any other "
             + "terminal windows close, ending what runs in them.")
-        if target.standardizedFileURL != Bundle.main.bundleURL.standardizedFileURL {
+        if target.resolvingSymlinksInPath() != Bundle.main.bundleURL.resolvingSymlinksInPath() {
             lines.append("Pcode starts again from the newest build, \(target.lastPathComponent).")
         }
         alert.informativeText = lines.joined(separator: "\n\n")
@@ -79,16 +79,21 @@ final class PCodeRestart {
         // From here on, panes whose pcode exits leave the saved list alone.
         workspace?.beginRestart()
         for pane in workspace?.panes ?? [] {
-            guard let pid = PCodeProcess.pid(in: pane.surface) else { continue }
-            if kill(pid, SIGUSR2) == 0 { waiting.append(pid) }
+            for pid in PCodeProcess.pids(in: pane.surface) where kill(pid, SIGUSR2) == 0 {
+                waiting.append(pid)
+            }
         }
         total = waiting.count
         guard total > 0 else { return relaunch() }
         started = Date()
         showProgress()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // In the common modes, so it keeps firing while a menu tracks or a
+        // sheet runs modally.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     private func poll() {
@@ -195,21 +200,41 @@ enum PCodeProcess {
     /// Ghostty starts commands through `login(1)`, which stays on as pcode's
     /// parent and holds the foreground group, and a `$PCODE_COMMAND` such as
     /// `uv run … pcode` adds a layer of its own. So: of the processes on the
-    /// pane's tty, the outermost that is pcode.
+    /// pane's tty, the outermost that is pcode: any with a pcode anywhere
+    /// above it (a pcode started from a shell pcode runs) is left out. All
+    /// of them when several unrelated ones remain.
     @MainActor
-    static func pid(in view: Ghostty.SurfaceView) -> pid_t? {
-        guard let tty = view.surfaceModel?.ttyName else { return nil }
-        return pid(onTTY: tty)
+    static func pids(in view: Ghostty.SurfaceView) -> [pid_t] {
+        guard let tty = view.surfaceModel?.ttyName else { return [] }
+        return pids(onTTY: tty)
     }
 
-    static func pid(onTTY name: String) -> pid_t? {
+    static func pids(onTTY name: String) -> [pid_t] {
         let path = name.hasPrefix("/") ? name : "/dev/" + name
         var info = stat()
-        guard stat(path, &info) == 0 else { return nil }
+        guard stat(path, &info) == 0 else { return [] }
         let processes = Self.processes(tty: info.st_rdev)
         let parents = Dictionary(processes.map { ($0.pid, $0.ppid) }, uniquingKeysWith: { first, _ in first })
         let pcode = Set(processes.map(\.pid).filter(isPCode))
-        return pcode.filter { !pcode.contains(parents[$0] ?? 0) }.min()
+        // Up the whole chain, past processes off the tty too.
+        func underPCode(_ pid: pid_t) -> Bool {
+            var seen: Set<pid_t> = [pid]
+            var parent = parents[pid] ?? parentPID(pid)
+            while let current = parent, current > 1, seen.insert(current).inserted {
+                if pcode.contains(current) || (parents[current] == nil && isPCode(current)) { return true }
+                parent = parents[current] ?? parentPID(current)
+            }
+            return false
+        }
+        return pcode.filter { !underPCode($0) }.sorted()
+    }
+
+    private static func parentPID(_ pid: pid_t) -> pid_t? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info.kp_eproc.e_ppid
     }
 
     private static func processes(tty: dev_t) -> [(pid: pid_t, ppid: pid_t)] {
@@ -233,6 +258,15 @@ enum PCodeProcess {
         if named(first) { return true }
         guard (first as NSString).lastPathComponent.hasPrefix("python"), argv.count > 1 else { return false }
         return named(argv[1]) || (argv[1] == "-m" && argv.count > 2 && argv[2] == "pcode")
+    }
+
+    /// Whether `pid` is pcode or one of its background hosts, which run as
+    /// `…/python3 -m pcode.host ARGS`.
+    static func isPCodeOrHost(_ pid: pid_t) -> Bool {
+        if isPCode(pid) { return true }
+        let argv = arguments(pid)
+        guard argv.count > 2, (argv[0] as NSString).lastPathComponent.hasPrefix("python") else { return false }
+        return argv[1] == "-m" && argv[2] == "pcode.host"
     }
 
     /// A process's argv, read as `ps` does (KERN_PROCARGS2: argc, the exec
@@ -305,14 +339,22 @@ enum PCodeRelaunch {
     /// Start a detached helper that waits for this process to exit, then
     /// opens `app`. In its own session, with no inherited descriptors (a pty
     /// held open would keep a terminal's process from seeing it close).
+    /// Should opening `app` by path fail (an install that replaced it as
+    /// this one quit), the app is opened by bundle identifier instead.
     static func openWhenGone(_ app: URL) -> Bool {
-        let script = #"pid=$1; shift; while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done; exec /usr/bin/open -n "$@""#
-        var args = ["/bin/sh", "-c", script, "sh", String(getpid())]
+        let script = #"""
+            pid=$1 app=$2 id=$3; shift 3
+            while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+            /usr/bin/open -n "$@" "$app" && exit 0
+            [ -n "$id" ] && exec /usr/bin/open -n "$@" -b "$id"
+            exit 1
+            """#
+        let identifier = bundleIdentifier(app) ?? Bundle.main.bundleIdentifier ?? ""
+        var args = ["/bin/sh", "-c", script, "sh", String(getpid()), app.path, identifier]
         let environment = ProcessInfo.processInfo.environment
         for key in forwarded {
             if let value = environment[key], !value.isEmpty { args += ["--env", "\(key)=\(value)"] }
         }
-        args.append(app.path)
 
         var attributes: posix_spawnattr_t?
         posix_spawnattr_init(&attributes)
