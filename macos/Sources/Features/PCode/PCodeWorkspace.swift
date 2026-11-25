@@ -674,7 +674,9 @@ private struct PCodePaneRow<Actions: View>: View {
     @ViewBuilder var actions: () -> Actions
 
     var body: some View {
-        let title = info?.label ?? (pane.title.isEmpty ? "New session" : pane.title)
+        // Ghostty's placeholder title until pcode sets one.
+        let placeholder = pane.title.isEmpty || pane.title == "👻"
+        let title = info?.label ?? (placeholder ? "New session" : pane.title)
         PCodeSessionRow(
             title: title, subtitle: (pane.directory as NSString).lastPathComponent,
             activity: pane.activity, actions: actions)
