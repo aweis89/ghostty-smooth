@@ -12,17 +12,42 @@ import SwiftUI
 /// tabs or windows: every one lives in this window, and switching only swaps
 /// which pane is shown, so a hidden session keeps running.
 ///
-/// On with `PCODE_WORKSPACE=1` (or the `PCodeWorkspace` default). pcode runs as
-/// `$PCODE_COMMAND` (default `pcode`), resumed with `-c <id>` in the session's
-/// own directory.
+/// On by default (see `PCodeWorkspaceMode.enabled` to turn it off). pcode runs
+/// as `$PCODE_COMMAND` (default `pcode`) through the user's login shell,
+/// resumed with `-c <id>` in the session's own directory.
 enum PCodeWorkspaceMode {
-    static let enabled: Bool =
-        ProcessInfo.processInfo.environment["PCODE_WORKSPACE"] == "1"
-        || UserDefaults.standard.bool(forKey: "PCodeWorkspace")
+    /// On unless turned off: `PCODE_WORKSPACE=0`, or
+    /// `defaults write com.pcode.terminal PCodeWorkspace -bool false` for
+    /// Ghostty's own terminal windows, tabs and splits.
+    static let enabled: Bool = {
+        if let env = ProcessInfo.processInfo.environment["PCODE_WORKSPACE"], !env.isEmpty {
+            return env != "0"
+        }
+        return UserDefaults.standard.object(forKey: "PCodeWorkspace") as? Bool ?? true
+    }()
 
     static var command: String {
         let value = ProcessInfo.processInfo.environment["PCODE_COMMAND"] ?? ""
         return value.isEmpty ? "pcode" : value
+    }
+
+    /// The user's login shell: `$SHELL`, else their account's (a Dock or
+    /// Finder launch may have no `SHELL`).
+    static var loginShell: String {
+        if let shell = ProcessInfo.processInfo.environment["SHELL"], !shell.isEmpty { return shell }
+        if let entry = getpwuid(getuid()), let shell = entry.pointee.pw_shell {
+            let path = String(cString: shell)
+            if !path.isEmpty { return path }
+        }
+        return "/bin/zsh"
+    }
+
+    /// `pcode` with `args`, through a login shell: an app launched from the
+    /// Dock gets launchd's bare PATH, where a Homebrew or `uv tool` pcode is
+    /// not, so only the user's own shell setup finds it.
+    static func shellCommand(_ args: [String]) -> String {
+        let inner = "exec " + ([command] + args.map(PCode.shellQuoted)).joined(separator: " ")
+        return "\(PCode.shellQuoted(loginShell)) -l -c \(PCode.shellQuoted(inner))"
     }
 }
 
@@ -341,7 +366,7 @@ final class PCodeWorkspace: ObservableObject {
     private func delete(id: String, retries: Int = 0) {
         guard PCode.valid(id, length: 1...64) else { return }
         let command = "\(PCodeWorkspaceMode.command) --delete-session \(PCode.shellQuoted(id))"
-        let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"
+        let shell = PCodeWorkspaceMode.loginShell
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: shell)
@@ -502,7 +527,7 @@ final class PCodeWorkspace: ObservableObject {
     private func makePane(args: [String], directory: String, sessionID: String?) -> PCodeSessionPane? {
         guard let app = ghostty.app else { return nil }
         var config = Ghostty.SurfaceConfiguration()
-        config.command = ([PCodeWorkspaceMode.command] + args.map(PCode.shellQuoted)).joined(separator: " ")
+        config.command = PCodeWorkspaceMode.shellCommand(args)
         config.workingDirectory = FileManager.default.fileExists(atPath: directory) ? directory : NSHomeDirectory()
         // The docked editor (PCodeDock) is what the workspace shows under each session.
         config.environmentVariables["PCODE_DOCK"] = "1"
