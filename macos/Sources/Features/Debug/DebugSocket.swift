@@ -315,8 +315,9 @@ enum DebugCommands {
             if ghostty_surface_read_text(surface, ghostty_selection_s(top_left: point, bottom_right: point,
                                                                       rectangle: false), &text) {
                 defer { ghostty_surface_free_text(surface, &text) }
+                // `tl_px_y` is the cell's bottom edge (quick look treats it as a baseline).
                 if text.tl_px_x.isFinite, text.tl_px_y.isFinite {
-                    return (text.tl_px_x, text.tl_px_y)
+                    return (text.tl_px_x, text.tl_px_y - cellH)
                 }
             }
         }
