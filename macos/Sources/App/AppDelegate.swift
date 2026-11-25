@@ -1073,8 +1073,11 @@ class AppDelegate: NSObject,
 
     @IBAction func newWindow(_ sender: Any?) {
         if PCodeWorkspaceMode.enabled {
-            let workspace = PCodeWorkspaceController.shared(ghostty).workspace
-            if !workspace.panes.isEmpty { workspace.newSession() }
+            let controller = PCodeWorkspaceController.shared(ghostty)
+            let wasVisible = controller.window?.isVisible == true
+            if wasVisible || !controller.workspace.panes.isEmpty {
+                controller.workspace.newSession()
+            }
             PCodeWorkspaceController.show(ghostty)
             return
         }
