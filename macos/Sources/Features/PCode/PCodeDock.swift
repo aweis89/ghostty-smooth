@@ -28,27 +28,23 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
     /// shows only its bottom `rows`, so growing is a clip, not a grid resize.
     static let gridRows = maxRows
 
-    /// Rows of slack the card takes on top of the rows it shows: the margins
-    /// around it, the terminal's own padding and a part row of headroom.
-    /// pcode reckons the pane rows the card hides from it, so keep this in
-    /// step with `CARD_SLACK_ROWS` in pcode's `pcode/dock.py`. The terminal's
-    /// padding is in points, not cells: at 1.75, a 9pt cell lost the top
-    /// row's top couple of points to it; 2 leaves room down to that size.
-    static let slackRows: CGFloat = 2
+    /// Vertical padding inside the card, in points: covers the terminal's
+    /// bottom padding and leaves symmetric breathing room above the top row
+    /// regardless of font size.
+    static let cardPadding: CGFloat = 12
     /// The card's top and bottom margins, inside `footprint`.
     static let topMargin: CGFloat = 2
     static let bottomMargin: CGFloat = 8
 
-    /// Everything the card covers at the bottom of pcode's pane for `rows`
-    /// rows of `cell` points, margins included: whole cells, so pcode can
-    /// work it out from its own cell size.
-    static func footprint(rows: Int, cell: CGFloat) -> CGFloat {
-        (CGFloat(rows) + slackRows) * cell
-    }
-
     /// The card's own height for `rows` terminal rows of `cell` points.
     static func cardHeight(rows: Int, cell: CGFloat) -> CGFloat {
-        footprint(rows: rows, cell: cell) - topMargin - bottomMargin
+        CGFloat(rows) * cell + cardPadding
+    }
+
+    /// Everything the card covers at the bottom of pcode's pane for `rows`
+    /// rows of `cell` points, margins included.
+    static func footprint(rows: Int, cell: CGFloat) -> CGFloat {
+        cardHeight(rows: rows, cell: cell) + topMargin + bottomMargin
     }
 
     weak var surfaceView: Ghostty.SurfaceView?
