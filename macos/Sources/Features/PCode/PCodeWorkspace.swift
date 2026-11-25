@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import GhosttyKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// SPIKE: pcode's own window, in place of Ghostty's terminal windows, tabs and splits.
 ///
@@ -62,8 +63,16 @@ struct PCodeSessionInfo: Identifiable, Hashable, Decodable {
     /// The main checkout, for a session in one of its worktrees; absent in old sessions.
     let project: String?
 
-    /// What the sidebar's project filter groups by.
+    /// What the sidebar groups by (main checkout for worktrees, else workspace).
     var projectPath: String { project.flatMap { $0.isEmpty ? nil : $0 } ?? workspace }
+
+    var normalizedProjectPath: String { PCodeWorkspace.normalizePath(projectPath) }
+
+    /// Worktree directory name when this session lives in a worktree under `projectPath`.
+    var worktreeName: String? {
+        let ws = PCodeWorkspace.normalizePath(workspace)
+        return ws != normalizedProjectPath ? directoryName : nil
+    }
 
     /// Whether a pcode process holds this session now: pcode keeps an
     /// exclusive `flock` on its `.lock` while it is open (`sessions.is_open`).
@@ -117,6 +126,8 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     let id = UUID()
     let surface: Ghostty.SurfaceView
     let directory: String
+    /// The project folder this pane is grouped under (main checkout for worktrees).
+    let projectPath: String
     /// The session pcode reports (`pcode;session;<id>`), once it has.
     @Published var sessionID: String?
     @Published private(set) var shell: Ghostty.SurfaceView?
@@ -134,10 +145,13 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     @Published private(set) var activity: Activity = .idle
     /// Called when pcode's docked editor comes or goes, so a hidden pane can size it.
     var onDockChange: (() -> Void)?
+    /// Called when the pane's activity state transitions, so collapsed folder headers refresh.
+    var onActivityChange: (() -> Void)?
 
-    init(surface: Ghostty.SurfaceView, directory: String, sessionID: String?) {
+    init(surface: Ghostty.SurfaceView, directory: String, projectPath: String? = nil, sessionID: String?) {
         self.surface = surface
         self.directory = directory
+        self.projectPath = PCodeWorkspace.normalizePath(projectPath ?? directory)
         self.sessionID = sessionID
         titleSubscription = surface.$title.removeDuplicates()
             .receive(on: DispatchQueue.main)
@@ -152,7 +166,10 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
             }
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in self?.activity = $0 }
+            .sink { [weak self] activity in
+                self?.activity = activity
+                self?.onActivityChange?()
+            }
         dockSubscription = surface.pcodeDock.$surface
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -172,7 +189,51 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
         return surface
     }
 
+    /// Worktree directory name when this pane runs in a worktree under `projectPath`.
+    var worktreeName: String? {
+        let dir = PCodeWorkspace.normalizePath(directory)
+        return dir != projectPath ? (dir as NSString).lastPathComponent : nil
+    }
+
     func setShell(_ view: Ghostty.SurfaceView?) { shell = view }
+}
+
+/// One folder group in the sidebar: open panes first, then recent saved sessions.
+struct PCodeProjectGroup: Identifiable {
+    let path: String
+    let openPanes: [PCodeSessionPane]
+    let recentSessions: [PCodeSessionInfo]
+
+    var id: String { path }
+
+    var name: String {
+        if path == PCodeWorkspace.normalizePath(NSHomeDirectory()) { return "~" }
+        let last = (path as NSString).lastPathComponent
+        return last.isEmpty ? path : last
+    }
+
+    var abbreviatedPath: String { PCodeWorkspace.abbreviatePath(path) }
+
+    /// Aggregate activity across open panes so collapsed folders still surface live state.
+    var activity: PCodeSessionPane.Activity? {
+        if openPanes.contains(where: { $0.activity == .running }) { return .running }
+        if openPanes.contains(where: { $0.activity == .failed }) { return .failed }
+        if !openPanes.isEmpty { return .idle }
+        return nil
+    }
+}
+
+/// One candidate directory in the ⌘⇧N directory picker.
+struct PCodeDirectoryCandidate: Identifiable, Hashable {
+    let path: String
+    let name: String
+    let abbreviatedPath: String
+    let openCount: Int
+    let recentCount: Int
+    let isCurrent: Bool
+    let isRawPath: Bool
+
+    var id: String { isRawPath ? "raw:\(path)" : path }
 }
 
 final class PCodeWorkspace: ObservableObject {
@@ -241,7 +302,7 @@ final class PCodeWorkspace: ObservableObject {
     func restore() {
         let ids = UserDefaults.standard.stringArray(forKey: Self.openKey) ?? []
         guard !ids.isEmpty else {
-            newSession()
+            newSession(directory: pinnedFolders.first ?? NSHomeDirectory())
             reloadHistory()
             return
         }
@@ -253,7 +314,11 @@ final class PCodeWorkspace: ObservableObject {
             for id in ids {
                 if let info = infos[id], !PCodeSessionInfo.isOpen(id) { self.open(info, select: false) }
             }
-            if self.panes.isEmpty { self.newSession() } else { self.select(self.panes[0]) }
+            if self.panes.isEmpty {
+                self.newSession(directory: all.first?.normalizedProjectPath ?? self.pinnedFolders.first ?? NSHomeDirectory())
+            } else {
+                self.select(self.panes[0])
+            }
         }
     }
 
@@ -273,27 +338,107 @@ final class PCodeWorkspace: ObservableObject {
 
     private var historyGeneration = 0
 
-    /// Recent sessions not already open here, in the chosen project if one is.
-    var recent: [PCodeSessionInfo] {
-        let open = Set(panes.compactMap(\.sessionID))
-        return history.filter { !open.contains($0.id) && (projectFilter == nil || $0.projectPath == projectFilter) }
+    /// Folders explicitly added to the sidebar (may have no sessions yet).
+    @Published var pinnedFolders: [String] = (UserDefaults.standard.stringArray(forKey: PCodeWorkspace.pinnedKey) ?? [])
+        .map(PCodeWorkspace.normalizePath) {
+        didSet { UserDefaults.standard.set(pinnedFolders, forKey: Self.pinnedKey) }
+    }
+    /// Folders the user hid from the sidebar (never deletes sessions on disk).
+    @Published var hiddenFolders: Set<String> = Set(
+        (UserDefaults.standard.stringArray(forKey: PCodeWorkspace.hiddenKey) ?? []).map(PCodeWorkspace.normalizePath)
+    ) {
+        didSet { UserDefaults.standard.set(Array(hiddenFolders), forKey: Self.hiddenKey) }
+    }
+    /// Collapsed project folders in the sidebar.
+    @Published var collapsedFolders: Set<String> = Set(
+        (UserDefaults.standard.stringArray(forKey: PCodeWorkspace.collapsedKey) ?? []).map(PCodeWorkspace.normalizePath)
+    ) {
+        didSet { UserDefaults.standard.set(Array(collapsedFolders), forKey: Self.collapsedKey) }
+    }
+    /// Folders where the user clicked "Show more…" for recent sessions.
+    @Published var expandedRecentFolders: Set<String> = []
+    /// Whether the ⌘⇧N fuzzy directory picker overlay is open.
+    @Published var showingDirectoryPicker = false
+
+    private static let pinnedKey = "PCodeWorkspacePinnedFolders"
+    private static let hiddenKey = "PCodeWorkspaceHiddenFolders"
+    private static let collapsedKey = "PCodeWorkspaceCollapsedFolders"
+
+    /// Canonical project path for an open pane (uses `session.json`'s `project` once loaded).
+    func projectPath(for pane: PCodeSessionPane) -> String {
+        info(for: pane)?.normalizedProjectPath ?? pane.projectPath
     }
 
-    /// The project (`PCodeSessionInfo.projectPath`) the Recent list is limited to, if any.
-    @Published var projectFilter: String? = UserDefaults.standard.string(forKey: PCodeWorkspace.filterKey) {
-        didSet { UserDefaults.standard.set(projectFilter, forKey: Self.filterKey) }
-    }
-    private static let filterKey = "PCodeWorkspaceProjectFilter"
-
-    /// Projects with saved sessions, most recently used first, with how many each has.
-    var projects: [(path: String, count: Int)] {
+    /// Sidebar groups: pinned folders, open-pane folders, and recent-session folders (excluding hidden).
+    var projectGroups: [PCodeProjectGroup] {
+        let openIDs = Set(panes.compactMap(\.sessionID))
         var order: [String] = []
-        var counts: [String: Int] = [:]
-        for info in history {
-            if counts[info.projectPath] == nil { order.append(info.projectPath) }
-            counts[info.projectPath, default: 0] += 1
+        var seen: Set<String> = []
+        func register(_ path: String) {
+            if seen.insert(path).inserted { order.append(path) }
         }
-        return order.map { ($0, counts[$0] ?? 0) }
+
+        var openByProject: [String: [PCodeSessionPane]] = [:]
+        for pane in panes {
+            let project = projectPath(for: pane)
+            register(project)
+            openByProject[project, default: []].append(pane)
+        }
+        for path in pinnedFolders where !hiddenFolders.contains(path) {
+            register(path)
+        }
+        var recentByProject: [String: [PCodeSessionInfo]] = [:]
+        for info in history where !openIDs.contains(info.id) {
+            let project = info.normalizedProjectPath
+            guard !hiddenFolders.contains(project) || openByProject[project] != nil else { continue }
+            register(project)
+            recentByProject[project, default: []].append(info)
+        }
+        return order.map { path in
+            PCodeProjectGroup(
+                path: path,
+                openPanes: openByProject[path] ?? [],
+                recentSessions: recentByProject[path] ?? [])
+        }
+    }
+
+    /// Directories offered by the ⌘⇧N fuzzy picker: current project first, then all known folders.
+    var pickerCandidates: [PCodeDirectoryCandidate] {
+        let currentProject = selectedPane.map { projectPath(for: $0) }
+        let groups = projectGroups
+        var seen: Set<String> = []
+        var result: [PCodeDirectoryCandidate] = []
+
+        func append(_ group: PCodeProjectGroup, isCurrent: Bool) {
+            guard seen.insert(group.path).inserted else { return }
+            result.append(PCodeDirectoryCandidate(
+                path: group.path,
+                name: group.name,
+                abbreviatedPath: group.abbreviatedPath,
+                openCount: group.openPanes.count,
+                recentCount: group.recentSessions.count,
+                isCurrent: isCurrent,
+                isRawPath: false))
+        }
+
+        if let currentProject, let currentGroup = groups.first(where: { $0.path == currentProject }) {
+            append(currentGroup, isCurrent: true)
+        }
+        for group in groups {
+            append(group, isCurrent: group.path == currentProject)
+        }
+        let home = Self.normalizePath(NSHomeDirectory())
+        if seen.insert(home).inserted {
+            result.append(PCodeDirectoryCandidate(
+                path: home,
+                name: "~",
+                abbreviatedPath: home,
+                openCount: 0,
+                recentCount: 0,
+                isCurrent: currentProject == home,
+                isRawPath: false))
+        }
+        return result
     }
 
     func info(for pane: PCodeSessionPane) -> PCodeSessionInfo? {
@@ -301,12 +446,89 @@ final class PCodeWorkspace: ObservableObject {
         return history.first { $0.id == id }
     }
 
+    /// ⌘N: new session in the current session's project, or open the picker if none is open.
     func newSession(directory: String? = nil) {
-        let dir = directory ?? selectedPane?.directory ?? NSHomeDirectory()
-        guard let pane = makePane(args: [], directory: dir, sessionID: nil) else { return }
+        let dir: String
+        if let directory {
+            dir = Self.normalizePath(directory)
+        } else if let pane = selectedPane {
+            dir = projectPath(for: pane)
+        } else {
+            openDirectoryPicker()
+            return
+        }
+        hiddenFolders.remove(dir)
+        collapsedFolders.remove(dir)
+        showingDirectoryPicker = false
+        guard let pane = makePane(args: [], directory: dir, projectPath: dir, sessionID: nil) else { return }
         adopt(pane)
         panes.insert(pane, at: 0)
         select(pane)
+    }
+
+    func openDirectoryPicker() {
+        showingDirectoryPicker = true
+    }
+
+    func dismissDirectoryPicker() {
+        showingDirectoryPicker = false
+        if let pane = selectedPane {
+            DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
+        }
+    }
+
+    func toggleCollapsed(_ path: String) {
+        let normalized = Self.normalizePath(path)
+        if collapsedFolders.contains(normalized) {
+            collapsedFolders.remove(normalized)
+        } else {
+            collapsedFolders.insert(normalized)
+        }
+    }
+
+    func addFolder(_ path: String) {
+        let normalized = Self.normalizePath(path)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue else { return }
+        hiddenFolders.remove(normalized)
+        collapsedFolders.remove(normalized)
+        if !pinnedFolders.contains(normalized) {
+            pinnedFolders.insert(normalized, at: 0)
+        }
+    }
+
+    func removeFolder(_ path: String) {
+        let normalized = Self.normalizePath(path)
+        pinnedFolders.removeAll { $0 == normalized }
+        hiddenFolders.insert(normalized)
+    }
+
+    /// Present a native macOS folder chooser (`NSOpenPanel`).
+    func browseForFolder(startSession: Bool) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = startSession ? "New Session" : "Add Folder"
+        panel.message = startSession
+            ? "Choose a folder to start a new pcode session in."
+            : "Choose a project folder to add to the sidebar."
+        if let current = selectedPane?.directory {
+            panel.directoryURL = URL(fileURLWithPath: current)
+        }
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = panel.url, let self else { return }
+            self.addFolder(url.path)
+            if startSession {
+                self.newSession(directory: url.path)
+            }
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            handle(panel.runModal())
+        }
     }
 
     func open(_ info: PCodeSessionInfo, select shouldSelect: Bool = true) {
@@ -315,12 +537,62 @@ final class PCodeWorkspace: ObservableObject {
             return
         }
         guard PCode.valid(info.id, length: 1...64) else { return }
-        guard let pane = makePane(args: ["-c", info.id], directory: info.workspace, sessionID: info.id) else { return }
+        let project = info.normalizedProjectPath
+        hiddenFolders.remove(project)
+        collapsedFolders.remove(project)
+        guard let pane = makePane(
+            args: ["-c", info.id],
+            directory: info.workspace,
+            projectPath: project,
+            sessionID: info.id
+        ) else { return }
         adopt(pane)
         panes.append(pane)
         schedulePresize()
         saveOpen()
         if shouldSelect { select(pane) }
+    }
+
+    // MARK: Path & time helpers
+
+    static func normalizePath(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        let standardized = (expanded as NSString).standardizingPath
+        if standardized.count > 1, standardized.hasSuffix("/") {
+            return String(standardized.dropLast())
+        }
+        return standardized
+    }
+
+    static func abbreviatePath(_ path: String) -> String {
+        let home = normalizePath(NSHomeDirectory())
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    private static let isoWithFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let isoBasic: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    static func relativeTime(_ iso: String) -> String? {
+        guard let date = isoWithFractional.date(from: iso) ?? isoBasic.date(from: iso) else { return nil }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "now" }
+        if seconds < 3600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3600)h" }
+        if seconds < 86_400 * 14 { return "\(seconds / 86_400)d" }
+        return "\(seconds / (86_400 * 7))w"
     }
 
     // MARK: Sidebar actions
@@ -477,6 +749,7 @@ final class PCodeWorkspace: ObservableObject {
 
     private func adopt(_ pane: PCodeSessionPane) {
         pane.onDockChange = { [weak self] in self?.schedulePresize() }
+        pane.onActivityChange = { [weak self] in self?.objectWillChange.send() }
     }
 
     func select(_ pane: PCodeSessionPane) {
@@ -524,17 +797,27 @@ final class PCodeWorkspace: ObservableObject {
         DispatchQueue.main.async { Ghostty.moveFocus(to: target) }
     }
 
-    private func makePane(args: [String], directory: String, sessionID: String?) -> PCodeSessionPane? {
+    private func makePane(
+        args: [String],
+        directory: String,
+        projectPath: String? = nil,
+        sessionID: String?
+    ) -> PCodeSessionPane? {
         guard let app = ghostty.app else { return nil }
         var config = Ghostty.SurfaceConfiguration()
         config.command = PCodeWorkspaceMode.shellCommand(args)
-        config.workingDirectory = FileManager.default.fileExists(atPath: directory) ? directory : NSHomeDirectory()
+        let resolvedDir = FileManager.default.fileExists(atPath: directory) ? directory : NSHomeDirectory()
+        config.workingDirectory = resolvedDir
         // The docked editor (PCodeDock) is what the workspace shows under each session.
         config.environmentVariables["PCODE_DOCK"] = "1"
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
         PCode.applyColorScheme(to: view)
-        return PCodeSessionPane(surface: view, directory: config.workingDirectory ?? directory, sessionID: sessionID)
+        return PCodeSessionPane(
+            surface: view,
+            directory: resolvedDir,
+            projectPath: projectPath ?? resolvedDir,
+            sessionID: sessionID)
     }
 
     private func surfaceClosed(_ view: Ghostty.SurfaceView, processAlive: Bool) {
@@ -572,44 +855,56 @@ private enum PCodeSidebarItem: Hashable {
 struct PCodeWorkspaceView: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var workspace: PCodeWorkspace
+    @State private var isDropTargeted = false
 
     private static let sidebarWidth: CGFloat = 250
+    private static let initialRecentLimit = 5
 
     // A plain stack, not NavigationSplitView, and no toolbar: on macOS 26+
     // those lay glass (blur sampled every frame) over the terminal, which is
     // a scroll view, and make the window composite translucent layers.
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .frame(width: Self.sidebarWidth)
-            Divider()
-            ZStack {
-                if let pane = workspace.selectedPane {
-                    PCodeSessionPaneView(pane: pane)
-                        .id(pane.id)
-                } else {
-                    Text("No session open").foregroundStyle(.secondary)
+        ZStack {
+            HStack(spacing: 0) {
+                sidebar
+                    .frame(width: Self.sidebarWidth)
+                Divider()
+                ZStack {
+                    if let pane = workspace.selectedPane {
+                        PCodeSessionPaneView(pane: pane)
+                            .id(pane.id)
+                    } else {
+                        Text("No session open").foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(ghostty.config.backgroundColor)
+                .background(GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { workspace.detailSize = proxy.size }
+                        .onChange(of: proxy.size) { workspace.detailSize = $0 }
+                })
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(ghostty.config.backgroundColor)
-            .background(GeometryReader { proxy in
-                Color.clear
-                    .onAppear { workspace.detailSize = proxy.size }
-                    .onChange(of: proxy.size) { workspace.detailSize = $0 }
-            })
+
+            if workspace.showingDirectoryPicker {
+                PCodeDirectoryPickerOverlay(workspace: workspace)
+                    .transition(.opacity)
+            }
         }
     }
 
     private var sidebarHeader: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
             Text("Sessions").font(.headline)
             Spacer()
             Button { workspace.toggleShell() } label: { Image(systemName: "terminal") }
                 .keyboardShortcut("j", modifiers: .command)
                 .help("Toggle the shell under this session (⌘J)")
+            Button { workspace.openDirectoryPicker() } label: { Image(systemName: "folder.badge.plus") }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .help("New session in folder… (⌘⇧N)")
             Button { workspace.newSession() } label: { Image(systemName: "square.and.pencil") }
-                .help("New session (⌘N)")
+                .help("New session in current project (⌘N)")
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
@@ -635,62 +930,147 @@ struct PCodeWorkspaceView: View {
         VStack(spacing: 0) {
             sidebarHeader
             sessionList
+            Divider()
+            sidebarFooter
         }
         // Solid, a shade off the terminal's background: no vibrancy behind it.
         .background(Color(nsColor: NSColor(ghostty.config.backgroundColor).blended(
             withFraction: 0.06, of: .white) ?? .windowBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color.accentColor.opacity(isDropTargeted ? 0.8 : 0), lineWidth: 2)
+                .padding(2)
+                .allowsHitTesting(false)
+        )
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleFolderDrop(providers)
+        }
+    }
+
+    private var sidebarFooter: some View {
+        Button {
+            workspace.browseForFolder(startSession: false)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus")
+                    .font(.caption)
+                Text("Add Folder…")
+                    .font(.callout)
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Add a project folder to the sidebar")
     }
 
     private var sessionList: some View {
         List(selection: selection) {
-            Section("Open") {
-                ForEach(workspace.panes) { pane in
-                    PCodePaneRow(pane: pane, info: workspace.info(for: pane)) { openMenu(pane) }
-                        .tag(PCodeSidebarItem.pane(pane.id))
-                        .contextMenu { openMenu(pane) }
-                }
-            }
-            Section {
-                ForEach(workspace.recent) { info in
-                    PCodeSessionRow(title: info.label, subtitle: info.directoryName, activity: nil) {
-                        recentMenu(info)
+            ForEach(workspace.projectGroups) { group in
+                let collapsed = workspace.collapsedFolders.contains(group.path)
+                Section {
+                    if !collapsed {
+                        ForEach(group.openPanes) { pane in
+                            PCodePaneRow(pane: pane, info: workspace.info(for: pane)) { openMenu(pane) }
+                                .tag(PCodeSidebarItem.pane(pane.id))
+                                .contextMenu { openMenu(pane) }
+                        }
+                        let expanded = workspace.expandedRecentFolders.contains(group.path)
+                        let visibleRecent = expanded
+                            ? group.recentSessions
+                            : Array(group.recentSessions.prefix(Self.initialRecentLimit))
+                        ForEach(visibleRecent) { info in
+                            PCodeSessionRow(
+                                title: info.label,
+                                subtitle: info.worktreeName ?? PCodeWorkspace.relativeTime(info.updated),
+                                activity: nil
+                            ) {
+                                recentMenu(info)
+                            }
+                            .tag(PCodeSidebarItem.saved(info.id))
+                            .contextMenu { recentMenu(info) }
+                        }
+                        if !expanded && group.recentSessions.count > Self.initialRecentLimit {
+                            let remaining = group.recentSessions.count - Self.initialRecentLimit
+                            Button {
+                                workspace.expandedRecentFolders.insert(group.path)
+                            } label: {
+                                Text("Show \(remaining) more…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.leading, 20)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        if group.openPanes.isEmpty && group.recentSessions.isEmpty {
+                            Button {
+                                workspace.newSession(directory: group.path)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus")
+                                        .font(.caption2)
+                                    Text("New session")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 20)
+                                .padding(.vertical, 2)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
-                    .tag(PCodeSidebarItem.saved(info.id))
-                    .contextMenu { recentMenu(info) }
+                } header: {
+                    PCodeFolderHeader(
+                        group: group,
+                        isCollapsed: collapsed,
+                        onToggle: { workspace.toggleCollapsed(group.path) },
+                        onNewSession: { workspace.newSession(directory: group.path) }
+                    )
+                    .contextMenu { folderMenu(group) }
                 }
-            } header: {
-                recentHeader
             }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
     }
 
-    private var recentHeader: some View {
-        HStack(spacing: 4) {
-            Text(workspace.projectFilter.map { "Recent · \(($0 as NSString).lastPathComponent)" } ?? "Recent")
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            Menu {
-                Picker("Project", selection: $workspace.projectFilter) {
-                    Text("All Projects").tag(String?.none)
-                    Divider()
-                    ForEach(workspace.projects, id: \.path) { project in
-                        Text("\((project.path as NSString).lastPathComponent)  (\(project.count))")
-                            .tag(String?.some(project.path))
-                    }
+    private func handleFolderDrop(_ providers: [NSItemProvider]) -> Bool {
+        var accepted = false
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            accepted = true
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else if let direct = item as? URL {
+                    url = direct
+                } else {
+                    url = nil
                 }
-                .pickerStyle(.inline)
-                .labelsHidden()
-            } label: {
-                Image(systemName: workspace.projectFilter == nil
-                    ? "line.3.horizontal.decrease.circle"
-                    : "line.3.horizontal.decrease.circle.fill")
+                guard let url else { return }
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+                    return
+                }
+                DispatchQueue.main.async {
+                    workspace.addFolder(url.path)
+                }
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("Show one project's sessions")
+        }
+        return accepted
+    }
+
+    @ViewBuilder private func folderMenu(_ group: PCodeProjectGroup) -> some View {
+        Button("New Session") { workspace.newSession(directory: group.path) }
+        Divider()
+        Button("Reveal in Finder") { PCodeWorkspace.reveal(group.path) }
+        Button("Copy Path") { PCodeWorkspace.copy(group.path) }
+        if group.openPanes.isEmpty {
+            Divider()
+            Button("Remove from Sidebar") { workspace.removeFolder(group.path) }
         }
     }
 
@@ -715,6 +1095,62 @@ struct PCodeWorkspaceView: View {
     }
 }
 
+/// A project folder header in the sidebar: disclosure chevron, name, collapsed activity badge, and hover + button.
+private struct PCodeFolderHeader: View {
+    let group: PCodeProjectGroup
+    let isCollapsed: Bool
+    let onToggle: () -> Void
+    let onNewSession: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Button(action: onToggle) {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                        .frame(width: 10)
+                    Image(systemName: isCollapsed ? "folder" : "folder.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(group.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(group.abbreviatedPath)
+
+            Spacer(minLength: 4)
+
+            if isCollapsed, let activity = group.activity {
+                PCodeActivityIndicator(activity: activity)
+                    .frame(width: 12, height: 12)
+            }
+
+            Button(action: onNewSession) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .opacity(hovering ? 1 : 0)
+            .help("New session in \(group.name)")
+        }
+        .textCase(nil)
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+    }
+}
+
 private struct PCodePaneRow<Actions: View>: View {
     @ObservedObject var pane: PCodeSessionPane
     var info: PCodeSessionInfo?
@@ -725,15 +1161,17 @@ private struct PCodePaneRow<Actions: View>: View {
         let placeholder = pane.title.isEmpty || pane.title == "👻"
         let title = info?.label ?? (placeholder ? "New session" : pane.title)
         PCodeSessionRow(
-            title: title, subtitle: (pane.directory as NSString).lastPathComponent,
-            activity: pane.activity, actions: actions)
+            title: title,
+            subtitle: info?.worktreeName ?? pane.worktreeName,
+            activity: pane.activity,
+            actions: actions)
     }
 }
 
 /// A sidebar row; its actions are a right-click menu and, on hover, a … button.
 private struct PCodeSessionRow<Actions: View>: View {
     var title: String
-    var subtitle: String
+    var subtitle: String?
     /// Nil for a session not open here.
     var activity: PCodeSessionPane.Activity?
     @ViewBuilder var actions: () -> Actions
@@ -745,7 +1183,9 @@ private struct PCodeSessionRow<Actions: View>: View {
                 .frame(width: 12, height: 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).lineLimit(1).truncationMode(.tail)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             Spacer(minLength: 0)
             Menu { actions() } label: { Image(systemName: "ellipsis.circle") }
@@ -758,6 +1198,288 @@ private struct PCodeSessionRow<Actions: View>: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+    }
+}
+
+/// ⌘⇧N fuzzy directory picker overlay: filter known folders, type any raw path, or ⌘O to browse.
+private struct PCodeDirectoryPickerOverlay: View {
+    @EnvironmentObject var ghostty: Ghostty.App
+    @ObservedObject var workspace: PCodeWorkspace
+    @State private var query = ""
+    @State private var selectedIndex = 0
+    @State private var keyMonitor: Any?
+    @FocusState private var searchFocused: Bool
+
+    private var filteredCandidates: [PCodeDirectoryCandidate] {
+        let base = workspace.pickerCandidates
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return base }
+
+        let terms = PCodePickMatch.terms(trimmed)
+        var matches = base.filter { candidate in
+            let texts = [
+                PCodePickMatch.casefold(candidate.name),
+                PCodePickMatch.casefold(candidate.abbreviatedPath),
+                PCodePickMatch.casefold(candidate.path),
+            ]
+            return PCodePickMatch.matches(texts, terms: terms, fuzzy: true)
+        }
+
+        // If the user typed a path (e.g. /tmp or ~/p/new-repo) that exists on disk, offer it directly.
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix(".") {
+            let expanded = PCodeWorkspace.normalizePath(trimmed)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue,
+               !matches.contains(where: { $0.path == expanded }) {
+                let name = (expanded as NSString).lastPathComponent
+                let raw = PCodeDirectoryCandidate(
+                    path: expanded,
+                    name: name.isEmpty ? expanded : name,
+                    abbreviatedPath: PCodeWorkspace.abbreviatePath(expanded),
+                    openCount: 0,
+                    recentCount: 0,
+                    isCurrent: false,
+                    isRawPath: true)
+                matches.insert(raw, at: 0)
+            }
+        }
+        return matches
+    }
+
+    private var cardBackground: Color {
+        Color(nsColor: NSColor(ghostty.config.backgroundColor).blended(
+            withFraction: 0.08, of: .white) ?? .windowBackgroundColor)
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(0.32)
+                .ignoresSafeArea()
+                .onTapGesture { workspace.dismissDirectoryPicker() }
+
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Filter folders or type a path…", text: $query)
+                        .textFieldStyle(.plain)
+                        .font(.body)
+                        .focused($searchFocused)
+                        .onSubmit {
+                            let items = filteredCandidates
+                            if items.indices.contains(selectedIndex) {
+                                selectCandidate(items[selectedIndex])
+                            }
+                        }
+                    if !query.isEmpty {
+                        Button { query = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+
+                Divider()
+
+                let items = filteredCandidates
+                if items.isEmpty {
+                    VStack(spacing: 6) {
+                        Text("No matching folders")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Text("Type a full path like ~/p/project or press ⌘O to browse.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                                    candidateRow(item, isSelected: index == selectedIndex)
+                                        .id(item.id)
+                                        .onTapGesture {
+                                            selectCandidate(item)
+                                        }
+                                }
+                            }
+                            .padding(6)
+                        }
+                        .frame(maxHeight: 280)
+                        .onChange(of: selectedIndex) { newIndex in
+                            if items.indices.contains(newIndex) {
+                                proxy.scrollTo(items[newIndex].id, anchor: .center)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                HStack(spacing: 12) {
+                    Text("↩ new session")
+                    Text("↑↓ navigate")
+                    Text("esc close")
+                    Spacer()
+                    Button {
+                        workspace.browseForFolder(startSession: true)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder")
+                            Text("Browse… (⌘O)")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+                    .keyboardShortcut("o", modifiers: .command)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    Button("") { workspace.dismissDirectoryPicker() }
+                        .keyboardShortcut(.cancelAction)
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                )
+            }
+            .frame(width: 480)
+            .background(cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 20, y: 10)
+            .padding(.top, 72)
+        }
+        .onChange(of: query) { _ in
+            selectedIndex = 0
+        }
+        .onAppear {
+            selectedIndex = 0
+            DispatchQueue.main.async { searchFocused = true }
+            installKeyMonitor()
+        }
+        .onDisappear {
+            removeKeyMonitor()
+        }
+    }
+
+    private func candidateRow(_ item: PCodeDirectoryCandidate, isSelected: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: item.isRawPath ? "folder.badge.plus" : "folder.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(item.name)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                    if item.isCurrent {
+                        Text("current")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.primary.opacity(0.08))
+                            .clipShape(Capsule())
+                    }
+                }
+                Text(item.abbreviatedPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 8)
+
+            if item.isRawPath {
+                Text("Open path")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                let parts = [
+                    item.openCount > 0 ? "\(item.openCount) open" : nil,
+                    item.recentCount > 0 ? "\(item.recentCount) saved" : nil,
+                ].compactMap { $0 }
+                if !parts.isEmpty {
+                    Text(parts.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
+        .contentShape(Rectangle())
+    }
+
+    private func selectCandidate(_ item: PCodeDirectoryCandidate) {
+        workspace.addFolder(item.path)
+        workspace.newSession(directory: item.path)
+    }
+
+    private func installKeyMonitor() {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Let modal sheets (like NSOpenPanel) handle their own keys.
+            guard event.window === workspace.window else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Escape
+            if event.keyCode == 53 {
+                workspace.dismissDirectoryPicker()
+                return nil
+            }
+            // ⌘O -> browse via NSOpenPanel
+            if flags == .command, event.charactersIgnoringModifiers?.lowercased() == "o" {
+                workspace.browseForFolder(startSession: true)
+                return nil
+            }
+            let items = filteredCandidates
+            // Up arrow or Ctrl+P
+            if event.keyCode == 126 || (flags == .control && event.charactersIgnoringModifiers?.lowercased() == "p") {
+                if !items.isEmpty {
+                    selectedIndex = (selectedIndex - 1 + items.count) % items.count
+                }
+                return nil
+            }
+            // Down arrow or Ctrl+N
+            if event.keyCode == 125 || (flags == .control && event.charactersIgnoringModifiers?.lowercased() == "n") {
+                if !items.isEmpty {
+                    selectedIndex = (selectedIndex + 1) % items.count
+                }
+                return nil
+            }
+            // Return / Keypad Enter
+            if event.keyCode == 36 || event.keyCode == 76 {
+                if items.indices.contains(selectedIndex) {
+                    selectCandidate(items[selectedIndex])
+                }
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
     }
 }
 
@@ -940,6 +1662,10 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
     /// ⌘W: a picker or popup with the keyboard closes itself; otherwise the
     /// focused shell, or the session (the docked editor stands for its session).
     @IBAction func close(_ sender: Any) {
+        if workspace.showingDirectoryPicker {
+            workspace.dismissDirectoryPicker()
+            return
+        }
         if let picker = PCode.keyboardPicker(in: window) {
             picker.cancel()
             return
