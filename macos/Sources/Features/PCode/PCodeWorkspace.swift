@@ -293,7 +293,7 @@ final class PCodeWorkspace: ObservableObject {
         guard let pane = makePane(args: ["-c", info.id], directory: info.workspace, sessionID: info.id) else { return }
         adopt(pane)
         panes.append(pane)
-        presizeHidden()
+        schedulePresize()
         saveOpen()
         if shouldSelect { select(pane) }
     }
@@ -393,7 +393,19 @@ final class PCodeWorkspace: ObservableObject {
 
     /// The session area's size, measured by the view; hidden panes are sized to it.
     var detailSize: CGSize = .zero {
-        didSet { if detailSize != oldValue { presizeHidden() } }
+        didSet { if detailSize != oldValue { schedulePresize() } }
+    }
+
+    private var presizeWork: DispatchWorkItem?
+
+    /// Presize once things settle: not on every frame of a live window resize
+    /// (each one reflows every hidden terminal and signals every hidden pcode),
+    /// and after a newly shown pane has been laid out, so it can be measured.
+    func schedulePresize() {
+        presizeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.presizeHidden() }
+        presizeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     /// Give every hidden pane's terminals the size they will have when shown.
@@ -406,37 +418,47 @@ final class PCodeWorkspace: ObservableObject {
         guard let window, detailSize.width > 0, detailSize.height > 0 else { return }
         let scale = window.backingScaleFactor
         let shown = selectedPane
-        let transcript = Self.measured(shown?.surface) ?? detailSize
-        let dock = Self.measured(shown?.surface.existingPCodeDock?.surface)
-            ?? CGSize(width: detailSize.width - 16, height: PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: 18))
+        // The shown terminals' own pixel sizes, as their layout gave them
+        // (scrollers and padding included), else estimates from the area.
+        let transcript = Self.pixels(shown?.surface)
+            ?? (UInt32(detailSize.width * scale), UInt32(detailSize.height * scale))
+        let shownDock = Self.pixels(shown?.surface.existingPCodeDock?.surface)
         for pane in panes where pane.id != selected {
             Self.setSize(pane.surface, transcript, scale: scale)
             if let docked = pane.surface.existingPCodeDock?.surface {
+                let cell = docked.cellSize.height > 0 ? docked.cellSize.height : 18
+                let dock = shownDock ?? (
+                    UInt32((detailSize.width - 16) * scale),
+                    UInt32(PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: cell) * scale))
                 Self.setSize(docked, dock, scale: scale)
             }
         }
     }
 
-    private static func measured(_ view: NSView?) -> CGSize? {
-        guard let view, view.window != nil, view.bounds.width > 0, view.bounds.height > 0 else { return nil }
-        return view.bounds.size
+    private static func pixels(_ view: Ghostty.SurfaceView?) -> (UInt32, UInt32)? {
+        guard let view, view.window != nil, let surface = view.surface else { return nil }
+        let size = ghostty_surface_size(surface)
+        guard size.width_px > 0, size.height_px > 0 else { return nil }
+        return (size.width_px, size.height_px)
     }
 
-    private static func setSize(_ view: Ghostty.SurfaceView, _ size: CGSize, scale: CGFloat) {
+    private static func setSize(_ view: Ghostty.SurfaceView, _ pixels: (UInt32, UInt32), scale: CGFloat) {
         guard let surface = view.surface, view.window == nil else { return }
+        let current = ghostty_surface_size(surface)
+        guard current.width_px != pixels.0 || current.height_px != pixels.1 else { return }
         ghostty_surface_set_content_scale(surface, scale, scale)
-        ghostty_surface_set_size(surface, UInt32(size.width * scale), UInt32(size.height * scale))
+        ghostty_surface_set_size(surface, pixels.0, pixels.1)
     }
 
     private func adopt(_ pane: PCodeSessionPane) {
-        pane.onDockChange = { [weak self] in self?.presizeHidden() }
+        pane.onDockChange = { [weak self] in self?.schedulePresize() }
     }
 
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
         syncOcclusion()
         // The pane just hidden keeps its size; the others follow the shown one.
-        DispatchQueue.main.async { [weak self] in self?.presizeHidden() }
+        schedulePresize()
         // After SwiftUI has put the pane's views in the window.
         DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
     }
