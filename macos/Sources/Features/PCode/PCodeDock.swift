@@ -37,14 +37,24 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
     static let bottomMargin: CGFloat = 8
 
     /// The card's own height for `rows` terminal rows of `cell` points.
-    static func cardHeight(rows: Int, cell: CGFloat) -> CGFloat {
-        CGFloat(rows) * cell + cardPadding
+    /// When `surfaceRows` is given and smaller than `gridRows` (e.g. a user
+    /// configured `window-padding-y` > `cardPadding / 2`), expands the clip by
+    /// the surface's actual vertical padding so the top row is never clipped.
+    static func cardHeight(rows: Int, cell: CGFloat, surfaceRows: Int? = nil) -> CGFloat {
+        let surfaceHeight = CGFloat(gridRows) * cell + cardPadding
+        let padding: CGFloat
+        if let surfaceRows, surfaceRows > 0, surfaceRows < gridRows {
+            padding = max(cardPadding, surfaceHeight - CGFloat(surfaceRows) * cell)
+        } else {
+            padding = cardPadding
+        }
+        return CGFloat(rows) * cell + padding
     }
 
     /// Everything the card covers at the bottom of pcode's pane for `rows`
     /// rows of `cell` points, margins included.
-    static func footprint(rows: Int, cell: CGFloat) -> CGFloat {
-        cardHeight(rows: rows, cell: cell) + topMargin + bottomMargin
+    static func footprint(rows: Int, cell: CGFloat, surfaceRows: Int? = nil) -> CGFloat {
+        cardHeight(rows: rows, cell: cell, surfaceRows: surfaceRows) + topMargin + bottomMargin
     }
 
     weak var surfaceView: Ghostty.SurfaceView?
@@ -220,12 +230,13 @@ private struct PCodeDockedDrawerLayer: View {
 
     var body: some View {
         let cell = docked.cellSize.height > 0 ? docked.cellSize.height : fallbackCell
+        let surfaceRows = docked.surfaceSize.map { Int($0.rows) }
         PCodeDrawerSurface(
             surfaceView: surfaceView,
             drawer: drawer,
             isSplit: isSplit,
             drawsSurface: false,
-            dockFootprint: PCodeDock.footprint(rows: dock.rows, cell: cell))
+            dockFootprint: PCodeDock.footprint(rows: dock.rows, cell: cell, surfaceRows: surfaceRows))
     }
 }
 
@@ -245,6 +256,7 @@ private struct PCodeDockCard: View {
 
     var body: some View {
         let cell = docked.cellSize.height > 0 ? docked.cellSize.height : fallbackCell
+        let surfaceRows = docked.surfaceSize.map { Int($0.rows) }
         ZStack(alignment: .bottom) {
             // The card's whole footprint, margins included, takes the clicks
             // the card itself doesn't: the pane rows under it are hidden, and
@@ -252,18 +264,18 @@ private struct PCodeDockCard: View {
             // 4pt clear when inside the drawer so the drawer's 8pt drag handle
             // works alongside the card.
             Color.clear
-                .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell))
+                .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell, surfaceRows: surfaceRows))
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0))
                 .padding(.leading, inDrawer ? 4 : 0)
                 .allowsHitTesting(dock.ready)
-            card(cell: cell)
+            card(cell: cell, surfaceRows: surfaceRows)
         }
         // Only the card's clip animates as `dock.rows` changes, never its width.
         .animation(.easeOut(duration: 0.12), value: dock.rows)
     }
 
-    private func card(cell: CGFloat) -> some View {
+    private func card(cell: CGFloat, surfaceRows: Int?) -> some View {
         // The card is the dock's terminal itself, edge to edge: pcode tints its
         // background (OSC 11) a shade off the pane's, and its own padding takes
         // that tint, so the whole card is one raised surface. The backdrop only
@@ -277,7 +289,7 @@ private struct PCodeDockCard: View {
                 .id(ObjectIdentifier(docked))
                 .frame(height: PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: cell))
         }
-            .frame(height: PCodeDock.cardHeight(rows: dock.rows, cell: cell), alignment: .bottom)
+            .frame(height: PCodeDock.cardHeight(rows: dock.rows, cell: cell, surfaceRows: surfaceRows), alignment: .bottom)
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
             .background(
                 RoundedRectangle(cornerRadius: Self.cornerRadius)
