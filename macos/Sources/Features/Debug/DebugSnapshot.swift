@@ -1,5 +1,6 @@
 import AppKit
 import CoreImage
+import GhosttyKit
 import UniformTypeIdentifiers
 
 /// Window snapshots and frame recordings for the debug socket, made inside the
@@ -170,6 +171,44 @@ enum DebugSnapshot {
         return formatter.string(from: Date())
     }
 
+    /// Runs `body` while `window`'s terminals render as if on screen. Ghostty
+    /// stops updating and drawing a fully covered window, so a snapshot of one
+    /// would show its last frame from before it was covered. `body` calls its
+    /// argument when done, which puts back the window's real visibility.
+    static func rendering(_ window: NSWindow, _ body: @escaping (@escaping () -> Void) -> Void) {
+        let surfaces = DebugCommands.surfaces(in: window).compactMap(\.surface)
+        let onScreen = window.occlusionState.contains(.visible)
+        if onScreen {
+            body {}
+            return
+        }
+        surfaces.forEach { ghostty_surface_set_occlusion($0, true) }
+        surfaces.forEach(ghostty_surface_refresh)
+        // Becoming visible rebuilds and draws on the renderer thread.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            body {
+                let visible = window.occlusionState.contains(.visible)
+                surfaces.forEach { ghostty_surface_set_occlusion($0, visible) }
+            }
+        }
+    }
+
+    static func snapFresh(_ args: [String: Any], _ reply: @escaping Reply) throws {
+        let window = try DebugCommands.window(args)
+        rendering(window) { done in
+            defer { done() }
+            do {
+                var body = try snap(args)
+                body["on_screen"] = window.occlusionState.contains(.visible)
+                reply(body)
+            } catch let failure as Failure {
+                reply(["ok": false, "error": failure.message])
+            } catch {
+                reply(["ok": false, "error": "\(error)"])
+            }
+        }
+    }
+
     static func snap(_ args: [String: Any]) throws -> [String: Any] {
         let path = args["path"] as? String ?? "/tmp/ghostty-snap-\(timestamp()).png"
         if args["raw"] as? Bool == true {
@@ -200,7 +239,11 @@ enum DebugSnapshot {
             scale: scale(args, window, default: 0.5),
             crop: try crop(args),
             reply: reply)
-        try recording.start()
+        try FileManager.default.createDirectory(atPath: recording.dir, withIntermediateDirectories: true)
+        rendering(window) { done in
+            recording.onFinish = done
+            recording.start()
+        }
     }
 
     /// Captures a frame whenever a terminal presents one (its layer's contents
@@ -238,8 +281,9 @@ enum DebugSnapshot {
             self.reply = reply
         }
 
-        func start() throws {
-            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        var onFinish: (() -> Void)?
+
+        func start() {
             Self.retained[ObjectIdentifier(self)] = self
             started = Date()
             var layers: [CALayer] = DebugCommands.surfaces(in: window).compactMap(\.layer)
@@ -289,6 +333,8 @@ enum DebugSnapshot {
             timer = nil
             observers.forEach { $0.invalidate() }
             observers = []
+            onFinish?()
+            onFinish = nil
 
             let diffs = frames.indices.map { $0 == 0 ? 0 : Self.difference(frames[$0 - 1].sample, frames[$0].sample) }
             var flashes: [[String: Any]] = []

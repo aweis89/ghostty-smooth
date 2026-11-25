@@ -159,7 +159,7 @@ enum DebugCommands {
             case "drag": try DebugInput.drag(args, finish)
             case "move": try DebugInput.move(args, finish)
             case "scroll": try DebugInput.scroll(args, finish)
-            case "snap": finish(try DebugSnapshot.snap(args))
+            case "snap": try DebugSnapshot.snapFresh(args, finish)
             case "record": try DebugSnapshot.record(args, finish)
             default: throw Failure("unknown command \(cmd)")
             }
@@ -290,6 +290,8 @@ enum DebugCommands {
             "title": window.title,
             "key": window.isKeyWindow,
             "main": window.isMainWindow,
+            // False when covered: terminals then stop drawing until snap/record wakes them.
+            "on_screen": window.occlusionState.contains(.visible),
             "content_size": [window.contentView?.bounds.width ?? 0, window.contentView?.bounds.height ?? 0],
             "scale": window.backingScaleFactor,
             "surfaces": surfaces(in: window).map(surfaceInfo),
