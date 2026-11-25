@@ -164,8 +164,16 @@ final class PCodeRestart {
     @objc private func restartNow() { relaunch() }
 
     private func relaunch() {
+        // Once: "Restart Now" can race the last pcode exiting.
+        guard !Self.terminating else { return }
+        Self.terminating = true
         timer?.invalidate()
         timer = nil
+        // AppKit refuses to terminate while a sheet is up.
+        if let panel {
+            if let parent = panel.sheetParent { parent.endSheet(panel) }
+            panel.orderOut(nil)
+        }
         let app = PCodeRelaunch.target()
         if !PCodeRelaunch.openWhenGone(app) {
             let alert = NSAlert()
@@ -173,8 +181,9 @@ final class PCodeRestart {
             alert.informativeText = "Pcode quits now; open it yourself and the sessions reopen."
             alert.runModal()
         }
-        Self.terminating = true
-        NSApp.terminate(nil)
+        // On the next turn, after the sheet (or the confirm alert, when
+        // nothing needed waiting for) has fully closed.
+        DispatchQueue.main.async { NSApp.terminate(nil) }
     }
 }
 
