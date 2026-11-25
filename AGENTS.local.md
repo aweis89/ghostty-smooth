@@ -23,5 +23,6 @@ it alone so rebases stay clean, and put fork rules here.
   your own paths: untracked files can be another session's work in progress.
 - **Push from the parent directory.** This repo has upstream's own `.envrc`,
   which is blocked, so direnv doesn't load the credentials from `~/p` here and
-  `git push` fails with "Invalid username or token". Run `cd ~/p && git -C
-  ghostty-smooth push origin <branch>` instead.
+  `git push` fails with "Invalid username or token". Run `direnv exec ~/p git
+  -C ~/p/ghostty-smooth push origin <branch>`. A bare `cd ~/p &&` isn't enough
+  in an agent's shell, because nothing runs direnv's hook there.
