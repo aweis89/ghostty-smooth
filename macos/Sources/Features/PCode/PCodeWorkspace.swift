@@ -86,14 +86,48 @@ struct PCodeSessionInfo: Identifiable, Hashable, Decodable {
 
     var directoryName: String { (workspace as NSString).lastPathComponent }
 
+    /// Sessions a running background host holds (pcode's `hosts/<id>.json`
+    /// entries, as `host_protocol.list_hosts` reads them).
+    static func hosted() -> Set<String> {
+        struct Entry: Decodable {
+            let pid: Int32
+            let session_id: String?
+        }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: hostRoot, includingPropertiesForKeys: nil) else { return [] }
+        let decoder = JSONDecoder()
+        var ids = Set<String>()
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let entry = try? decoder.decode(Entry.self, from: data),
+                  let id = entry.session_id, !id.isEmpty, entry.pid > 0,
+                  kill(entry.pid, 0) == 0 || errno == EPERM
+            else { continue }
+            ids.insert(id)
+        }
+        return ids
+    }
+
+    static var hostRoot: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["PCODE_HOST_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+        }
+        return stateRoot.appendingPathComponent("pcode/hosts")
+    }
+
+    private static var stateRoot: URL {
+        let state = ProcessInfo.processInfo.environment["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".local/state")
+        return URL(fileURLWithPath: state)
+    }
+
     static var root: URL {
         let env = ProcessInfo.processInfo.environment
         if let dir = env["PCODE_SESSION_DIR"], !dir.isEmpty {
             return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         }
-        let state = env["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".local/state")
-        return URL(fileURLWithPath: state).appendingPathComponent("pcode/sessions")
+        return stateRoot.appendingPathComponent("pcode/sessions")
     }
 
     /// Saved sessions with at least one turn, newest first.
@@ -187,6 +221,7 @@ final class PCodeWorkspace: ObservableObject {
     weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private static let openKey = "PCodeWorkspaceOpenSessions"
+    private static let selectedKey = "PCodeWorkspaceSelectedSession"
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
@@ -210,6 +245,7 @@ final class PCodeWorkspace: ObservableObject {
                   let pane = self.panes.first(where: { $0.surface === view }) else { return }
             pane.sessionID = view.pcodeSession
             self.saveOpen()
+            if pane.id == self.selected { self.saveSelected() }
             self.reloadHistory()
         })
     }
@@ -239,21 +275,34 @@ final class PCodeWorkspace: ObservableObject {
 
     /// Reopen the sessions open at last quit, or start a fresh one.
     func restore() {
+        // Not into a window that is quitting to restart (a Dock click while
+        // its panes close): the relaunched app reopens them.
+        guard !restarting else { return }
         let ids = UserDefaults.standard.stringArray(forKey: Self.openKey) ?? []
         guard !ids.isEmpty else {
             newSession()
             reloadHistory()
             return
         }
+        let selectedID = UserDefaults.standard.string(forKey: Self.selectedKey)
         reloadHistory { [weak self] all in
             guard let self, self.panes.isEmpty else { return }
             let infos = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             // Not one open in another process (a terminal, another window):
-            // that would start a copy of it here instead.
+            // that would start a copy of it here instead. One a background
+            // host holds is fine (Restart Pcode leaves every session so):
+            // `pcode -c` attaches to the host.
+            let hosted = PCodeSessionInfo.hosted()
             for id in ids {
-                if let info = infos[id], !PCodeSessionInfo.isOpen(id) { self.open(info, select: false) }
+                if let info = infos[id], hosted.contains(id) || !PCodeSessionInfo.isOpen(id) {
+                    self.open(info, select: false)
+                }
             }
-            if self.panes.isEmpty { self.newSession() } else { self.select(self.panes[0]) }
+            if self.panes.isEmpty {
+                self.newSession()
+            } else {
+                self.select(self.panes.first { $0.sessionID != nil && $0.sessionID == selectedID } ?? self.panes[0])
+            }
         }
     }
 
@@ -481,6 +530,7 @@ final class PCodeWorkspace: ObservableObject {
 
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
+        saveSelected()
         syncOcclusion()
         // The pane just hidden keeps its size; the others follow the shown one.
         schedulePresize()
@@ -559,7 +609,26 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     private func saveOpen() {
+        guard !restarting else { return }
         UserDefaults.standard.set(panes.compactMap(\.sessionID), forKey: Self.openKey)
+    }
+
+    /// Remember the shown session, for `restore` to show again.
+    private func saveSelected() {
+        guard !restarting, let id = selectedPane?.sessionID else { return }
+        UserDefaults.standard.set(id, forKey: Self.selectedKey)
+    }
+
+    /// Whether the app is quitting to restart (`PCodeRestart`): the saved
+    /// open sessions and selection are kept as they were when it began,
+    /// while pcode in each pane exits and the panes close.
+    private(set) var restarting = false
+
+    /// Save what is open and shown, then stop saving until the app quits.
+    func beginRestart() {
+        saveOpen()
+        saveSelected()
+        restarting = true
     }
 }
 
@@ -866,6 +935,9 @@ private struct PCodeSessionPaneView: View {
 final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
     private static var instance: PCodeWorkspaceController?
     let workspace: PCodeWorkspace
+
+    /// The controller, if the window was ever made.
+    static var existing: PCodeWorkspaceController? { instance }
 
     static func shared(_ ghostty: Ghostty.App) -> PCodeWorkspaceController {
         if let instance { return instance }

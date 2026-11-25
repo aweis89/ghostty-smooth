@@ -192,6 +192,8 @@ enum DebugCommands {
             case "scroll": try DebugInput.scroll(args, finish)
             case "snap": try DebugSnapshot.snapFresh(args, finish)
             case "record": try DebugSnapshot.record(args, finish)
+            case "menu": try performMenu(args, finish)
+            case "press": try pressButton(args, finish)
             default: throw Failure("unknown command \(cmd)")
             }
         } catch let failure as Failure {
@@ -199,6 +201,63 @@ enum DebugCommands {
         } catch {
             reply(["ok": false, "error": "\(error)"])
         }
+    }
+
+    // MARK: Menus and dialogs
+
+    /// Titles compared without a trailing ellipsis ("…" or "...").
+    private static func sameTitle(_ a: String, _ b: String) -> Bool {
+        func bare(_ s: String) -> String {
+            var s = s.trimmingCharacters(in: .whitespaces)
+            for suffix in ["…", "..."] where s.hasSuffix(suffix) { s.removeLast(suffix.count) }
+            return s.lowercased()
+        }
+        return bare(a) == bare(b)
+    }
+
+    /// `{"cmd": "menu", "title": "Restart Pcode…"}`: perform a main-menu
+    /// item, as choosing it would. Replies first: the action may open a
+    /// modal dialog (answer it with `press`).
+    static func performMenu(_ args: [String: Any], _ finish: @escaping Reply) throws {
+        guard let title = args["title"] as? String else { throw Failure("menu needs a title") }
+        func find(_ menu: NSMenu) -> NSMenuItem? {
+            for item in menu.items {
+                if !item.isSeparatorItem, sameTitle(item.title, title) { return item }
+                if let sub = item.submenu, let found = find(sub) { return found }
+            }
+            return nil
+        }
+        guard let main = NSApp.mainMenu, let item = find(main), let menu = item.menu else {
+            throw Failure("no menu item \(title)")
+        }
+        menu.update()
+        guard item.isEnabled else { throw Failure("menu item \(item.title) is disabled") }
+        finish(["item": item.title])
+        DispatchQueue.main.async { menu.performActionForItem(at: menu.index(of: item)) }
+    }
+
+    /// `{"cmd": "press", "title": "Cancel"}`: click a button in a visible
+    /// window, sheets and panels first (an alert's buttons included).
+    static func pressButton(_ args: [String: Any], _ finish: @escaping Reply) throws {
+        guard let title = args["title"] as? String else { throw Failure("press needs a title") }
+        let windows = NSApp.windows.filter(\.isVisible)
+        let ordered = windows.filter { $0.sheetParent != nil || $0 is NSPanel }
+            + windows.filter { $0.sheetParent == nil && !($0 is NSPanel) }
+        func find(_ view: NSView) -> NSButton? {
+            if let button = view as? NSButton, sameTitle(button.title, title), button.isEnabled, !button.isHidden {
+                return button
+            }
+            for sub in view.subviews { if let found = find(sub) { return found } }
+            return nil
+        }
+        for window in ordered {
+            guard let root = window.contentView?.superview ?? window.contentView,
+                  let button = find(root) else { continue }
+            finish(["button": button.title, "window": window.title])
+            DispatchQueue.main.async { button.performClick(nil) }
+            return
+        }
+        throw Failure("no button \(title)")
     }
 
     // MARK: Windows, surfaces, coordinates
