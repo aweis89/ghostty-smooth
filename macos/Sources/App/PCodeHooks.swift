@@ -13,7 +13,8 @@ import SwiftUI
 /// Add a hook only when pcode's code needs a new entry point into an upstream
 /// file, and give `UpstreamHooks` the upstream behavior. There are no default
 /// implementations on purpose: a mistyped signature in pcode's implementation
-/// is then a compile error, not a hook that silently never runs.
+/// is then a compile error, not a hook that silently never runs. (Renaming the
+/// implementation's `@objc` name is not caught: see the log in `shared`.)
 protocol PCodeAppHooks: AnyObject {
     // MARK: App
 
@@ -115,6 +116,9 @@ enum PCodeHooks {
            let hooks = type.init() as? PCodeAppHooks {
             return hooks
         }
+        // A fork-only build gets here by design; a Pcode.app build that does
+        // has lost `@objc(PCodeAppHooksImpl)` and quietly runs as Ghostty.
+        Ghostty.logger.notice("pcode hooks: no PCodeAppHooksImpl, using upstream behavior")
         return UpstreamHooks()
     }()
 }

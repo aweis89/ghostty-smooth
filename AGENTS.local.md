@@ -9,7 +9,9 @@ it alone so rebases stay clean, and put fork rules here.
   `macos/Tests/Features/PCode/` here (both gitignored). Files you find there
   are a build's copy: edits to them are overwritten by the next build. Make
   Swift changes in the pcode repo; this repo keeps the Zig core, generic
-  Swift (the debug socket, config helpers) and the seam.
+  Swift (the debug socket, config helpers) and the seam. Xcode compiles those
+  ignored files whenever they're on disk, so delete both directories before
+  checking that the fork builds on its own.
 - **Upstream Swift reaches pcode only through `PCodeAppHooks`**
   (`macos/Sources/App/PCodeHooks.swift`). Without pcode's code every hook is
   upstream behavior, so this repo still builds alone. A new entry point means
