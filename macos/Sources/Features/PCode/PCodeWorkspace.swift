@@ -401,6 +401,7 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         if controller.workspace.panes.isEmpty { controller.workspace.restore() }
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private init(ghostty: Ghostty.App) {
@@ -414,10 +415,20 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         window.toolbarStyle = .unified
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(
-            rootView: PCodeWorkspaceView(workspace: workspace).environmentObject(ghostty))
+        let hosting = NSHostingController(
+            rootView: PCodeWorkspaceView(workspace: workspace)
+                .frame(minWidth: 700, minHeight: 400)
+                .environmentObject(ghostty))
+        // The window keeps its own size; by default the controller shrinks it
+        // to SwiftUI's ideal size, which for a split view is tiny.
+        hosting.sizingOptions = [.minSize]
+        window.contentViewController = hosting
+        window.setContentSize(NSSize(width: 1200, height: 800))
         window.setFrameAutosaveName("PCodeWorkspace")
-        if !window.setFrameUsingName("PCodeWorkspace") { window.center() }
+        if !window.setFrameUsingName("PCodeWorkspace") || window.frame.width < 700 {
+            window.setContentSize(NSSize(width: 1200, height: 800))
+            window.center()
+        }
         super.init(window: window)
         window.delegate = self
     }
