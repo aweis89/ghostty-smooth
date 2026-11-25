@@ -139,49 +139,67 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
 /// above the card, `pcode/dock.py`), so growing the editor scrolls the
 /// transcript like any output, which glides, instead of resizing the pane
 /// (a reflow and a redraw per step of the card's animation).
+///
+/// While the /btw drawer is open, the drawer spans the full height on the right
+/// and reserves the card's live footprint at its bottom; the card narrows into
+/// that slot without leaving the view tree, so it keeps keyboard focus and the
+/// drawer's viewer and hint bar never go underneath it.
 struct PCodeDockedSurface: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var surfaceView: Ghostty.SurfaceView
     @ObservedObject var dock: PCodeDock
+    @ObservedObject var drawer: PCodeDrawer
     var isSplit: Bool
 
     private static let fallbackLineHeight: CGFloat = 18
 
-    /// Rows of card the /btw drawer leaves room for; a taller card draws over its bottom.
-    private static let drawerClearRows = 6
-
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            // pcode's terminal, full height under the card: its size never
-            // follows the card's.
-            PCodeDrawerSurface(
-                surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
-                drawsDrawer: false)
-            // The drawer over the whole area, card included, at a size the
-            // card never changes: resizing its terminal as the card grew with
-            // streamed output scrolled whatever the user was reading in it.
-            PCodeDrawerSurface(
-                surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
-                drawsSurface: false,
-                bottomInset: dock.surface == nil ? nil : drawerInset)
-            // The card over the drawer: a card taller than the drawer leaves
-            // room for keeps its typing row in view. Its terminal is taller
-            // than the card; the clipped-off top lets clicks through to what
-            // is under it (`SurfaceScrollView.hitTest`).
-            if let docked = dock.surface {
-                PCodeDockCard(docked: docked, dock: dock, fallbackCell: paneCell)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
-        // Neither terminal resizes as the card grows (the dock's grid is
-        // fixed, the pane is full height), so only the card's clip animates.
-        .animation(.easeOut(duration: 0.12), value: dock.rows)
+    init(surfaceView: Ghostty.SurfaceView, dock: PCodeDock, isSplit: Bool) {
+        self.surfaceView = surfaceView
+        self.dock = dock
+        self.drawer = surfaceView.pcodeDrawer
+        self.isSplit = isSplit
     }
 
-    /// Space under the drawer: the card at `drawerClearRows` rows, with its margins.
-    private var drawerInset: CGFloat {
-        PCodeDock.footprint(rows: Self.drawerClearRows, cell: cell)
+    var body: some View {
+        let drawerOpen = drawer.visible && drawer.viewer != nil
+        GeometryReader { geometry in
+            let cardWidth = drawerOpen
+                ? max(0, PCodeDrawer.width(
+                    in: geometry.size.width,
+                    fraction: drawer.fraction,
+                    minWidth: PCodeDrawer.dockedMinWidth) - 1)
+                : geometry.size.width
+            ZStack(alignment: .bottomTrailing) {
+                // pcode's terminal, full height under the card and drawer: its size
+                // never follows either one.
+                PCodeDrawerSurface(
+                    surfaceView: surfaceView, drawer: drawer, isSplit: isSplit,
+                    drawsDrawer: false)
+                // The /btw drawer over the right side, full height, reserving the
+                // card's live footprint at its bottom so the viewer and hint bar
+                // always end above the card.
+                PCodeDrawerSurface(
+                    surfaceView: surfaceView, drawer: drawer, isSplit: isSplit,
+                    drawsSurface: false,
+                    dockFootprint: dock.surface == nil ? nil : dockFootprint)
+                // The card: full width at the bottom when no drawer is open, or
+                // docked into the bottom of the drawer when /btw is open. Keeping
+                // it at the same structural spot preserves its surface and focus.
+                if let docked = dock.surface {
+                    PCodeDockCard(docked: docked, dock: dock, fallbackCell: paneCell)
+                        .frame(width: cardWidth)
+                        .animation(.easeOut(duration: 0.18), value: drawerOpen)
+                        .animation(.easeOut(duration: 0.12), value: dock.rows)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
+        }
+    }
+
+    /// Space the card occupies at the bottom of the drawer, margins included.
+    private var dockFootprint: CGFloat {
+        PCodeDock.footprint(rows: dock.rows, cell: cell)
     }
 
     /// The dock's row height, or the pane's until the dock has one.

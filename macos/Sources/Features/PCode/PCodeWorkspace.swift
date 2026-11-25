@@ -807,7 +807,9 @@ final class PCodeWorkspace: ObservableObject {
         // (scrollers and padding included), else estimates from the area.
         let transcript = Self.pixels(shown?.surface)
             ?? (UInt32(detailSize.width * scale), UInt32(detailSize.height * scale))
-        let shownDock = Self.pixels(shown?.surface.existingPCodeDock?.surface)
+        let shownDock = shown?.surface.pcodeDrawer.visible == true
+            ? nil
+            : Self.pixels(shown?.surface.existingPCodeDock?.surface)
         for pane in panes where pane.id != selected {
             Self.setSize(pane.surface, transcript, scale: scale)
             if let docked = pane.surface.existingPCodeDock?.surface {

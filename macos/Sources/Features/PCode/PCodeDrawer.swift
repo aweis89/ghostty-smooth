@@ -27,12 +27,25 @@ import SwiftUI
 /// becomes part of the command but the checked host id and thread.
 final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
     @Published var visible = false
+    /// The drawer's share of the surface's width, set by dragging its left edge.
+    @Published var fraction: CGFloat = 0.70
     /// The drawer's terminal while it is open; dropping it ends the viewer.
     @Published private(set) var viewer: Ghostty.SurfaceView?
     /// The viewer's key hints: empty for none.
     @Published private(set) var hints: [PCodeHint] = []
     /// pcode's terminal font as the viewer started, for the footer.
     private(set) var fonts: PCodePickFonts?
+
+    static let minWidth: CGFloat = 260
+    /// Minimum width when the docked editor card lives inside the drawer.
+    static let dockedMinWidth: CGFloat = 360
+    static let maxFraction: CGFloat = 0.85
+
+    static func width(in total: CGFloat, fraction: CGFloat, minWidth: CGFloat = PCodeDrawer.minWidth) -> CGFloat {
+        let floor = min(total, minWidth)
+        let upper = max(floor, total * maxFraction)
+        return min(upper, max(floor, total * fraction))
+    }
 
     weak var surfaceView: Ghostty.SurfaceView?
     private var shown: (host: String, thread: String)?
@@ -106,6 +119,10 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
 
     func focusTerminal() {
         guard let surfaceView else { return }
+        if let dock = surfaceView.existingPCodeDock, dock.ready, let docked = dock.surface {
+            Ghostty.moveFocus(to: docked)
+            return
+        }
         Ghostty.moveFocus(to: surfaceView)
     }
 
@@ -179,21 +196,19 @@ struct PCodeDrawerSurface: View {
     @ObservedObject var drawer: PCodeDrawer
     var isSplit: Bool
     /// SPIKE: the docked layout draws the terminal and the drawer as separate
-    /// layers (`PCodeDockedSurface`), so the drawer can span the editor card's
-    /// area too and keep one size while the card grows and shrinks.
+    /// layers (`PCodeDockedSurface`), so the drawer spans the full height and
+    /// reserves space at its bottom for the docked editor card.
     var drawsSurface = true
     var drawsDrawer = true
-    /// Space kept clear under the drawer instead of the editor rows the
-    /// undocked layout leaves uncovered.
-    var bottomInset: CGFloat?
+    /// Height reserved at the bottom of the drawer for the docked editor card.
+    /// When set, the drawer spans the full pane height and hosts the card at
+    /// its bottom; when nil, the drawer stops above the undocked inline editor.
+    var dockFootprint: CGFloat?
 
-    /// The drawer's share of the surface's width, set by dragging its left edge.
-    @State private var fraction: CGFloat = 0.70
-    /// `fraction` when the current drag began: drags report distance from their start.
+    /// `drawer.fraction` when the current drag began: drags report distance from their start.
     @State private var dragStart: CGFloat?
-    private static let minWidth: CGFloat = 260
     private static let minHeight: CGFloat = 120
-    /// Terminal rows left uncovered at the bottom so pcode's editor and status bar stay visible.
+    /// Terminal rows left uncovered at the bottom so pcode's inline editor and status bar stay visible.
     private static let bottomLines: CGFloat = 6
     private static let fallbackLineHeight: CGFloat = 18
 
@@ -214,7 +229,8 @@ struct PCodeDrawerSurface: View {
                                 viewer,
                                 width: width(in: geometry.size.width),
                                 height: height(in: geometry.size.height),
-                                total: geometry.size.width
+                                total: geometry.size.width,
+                                totalHeight: geometry.size.height
                             )
                             .allowsHitTesting(drawer.visible)
                             .transition(.move(edge: .trailing))
@@ -227,14 +243,16 @@ struct PCodeDrawerSurface: View {
         }
     }
 
+    private var minDrawerWidth: CGFloat {
+        dockFootprint == nil ? PCodeDrawer.minWidth : PCodeDrawer.dockedMinWidth
+    }
+
     private func width(in total: CGFloat) -> CGFloat {
-        let floor = min(total, Self.minWidth)
-        let upper = max(floor, total * 0.85)
-        return min(upper, max(floor, total * fraction))
+        PCodeDrawer.width(in: total, fraction: drawer.fraction, minWidth: minDrawerWidth)
     }
 
     private func height(in total: CGFloat) -> CGFloat {
-        if let bottomInset { return max(min(total, Self.minHeight), total - bottomInset) }
+        if dockFootprint != nil { return total }
         let lineHeight = surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
         let extraPadding: CGFloat
         if let rows = surfaceView.surfaceSize?.rows, rows > 0, surfaceView.cellSize.height > 0 {
@@ -250,7 +268,8 @@ struct PCodeDrawerSurface: View {
         _ viewer: Ghostty.SurfaceView,
         width: CGFloat,
         height: CGFloat,
-        total: CGFloat
+        total: CGFloat,
+        totalHeight: CGFloat
     ) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -271,12 +290,12 @@ struct PCodeDrawerSurface: View {
                                 DragGesture(coordinateSpace: .global)
                                     .onChanged { gesture in
                                         guard total > 0 else { return }
-                                        let start = dragStart ?? fraction
+                                        let start = dragStart ?? drawer.fraction
                                         dragStart = start
                                         let next = start - gesture.translation.width / total
-                                        let minFraction = min(1, Self.minWidth / total)
-                                        let maxFraction = max(minFraction, 0.85)
-                                        fraction = min(maxFraction, max(minFraction, next))
+                                        let minFraction = min(1, minDrawerWidth / total)
+                                        let maxFraction = max(minFraction, PCodeDrawer.maxFraction)
+                                        drawer.fraction = min(maxFraction, max(minFraction, next))
                                     }
                                     .onEnded { _ in dragStart = nil }
                             )
@@ -293,12 +312,23 @@ struct PCodeDrawerSurface: View {
                         .padding(.bottom, 6)
                         .environment(\.colorScheme, colorScheme)
                     }
+                    if let dockFootprint {
+                        // Reserve the card's exact footprint inside the drawer so the
+                        // viewer and hint bar always end above it, with no overlap.
+                        // Snaps without animating so the viewer resizes once per row change.
+                        Color.clear
+                            .frame(height: min(dockFootprint, max(0, totalHeight - Self.minHeight)))
+                            .allowsHitTesting(false)
+                            .animation(nil, value: dockFootprint)
+                    }
                 }
             }
-            // Bottom edge above the uncovered editor rows.
-            Rectangle()
-                .fill(ghostty.config.splitDividerColor)
-                .frame(height: 1)
+            if dockFootprint == nil {
+                // Bottom edge above the uncovered inline editor rows.
+                Rectangle()
+                    .fill(ghostty.config.splitDividerColor)
+                    .frame(height: 1)
+            }
         }
         .frame(width: width, height: height)
         .background(
