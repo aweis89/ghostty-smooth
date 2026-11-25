@@ -35,6 +35,7 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuAbout: NSMenuItem?
     @IBOutlet private var menuServices: NSMenu?
     @IBOutlet private var menuCheckForUpdates: NSMenuItem?
+    @IBOutlet private var menuRestartPcode: NSMenuItem?
     @IBOutlet private var menuOpenConfig: NSMenuItem?
     @IBOutlet private var menuReloadConfig: NSMenuItem?
     @IBOutlet private var menuSecureInput: NSMenuItem?
@@ -348,6 +349,9 @@ class AppDelegate: NSObject,
 
         // Setup our menu
         setupMenuImages()
+        // Restart Pcode moves the workspace window's sessions; there is none
+        // without it.
+        menuRestartPcode?.isHidden = !PCodeWorkspaceMode.enabled
 
         // Setup signal handlers
         setupSignals()
@@ -409,6 +413,9 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Restart Pcode was confirmed already, and relaunches the app.
+        if PCodeRestart.terminating { return .terminateNow }
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -1071,6 +1078,13 @@ class AppDelegate: NSObject,
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
+    /// Move the workspace's sessions into background hosts and start the
+    /// newest build, which reopens them (`PCodeRestart`).
+    @IBAction func restartPcode(_ sender: Any?) {
+        guard PCodeWorkspaceMode.enabled else { return }
+        PCodeRestart.begin(workspace: PCodeWorkspaceController.existing?.workspace)
+    }
+
     @IBAction func newWindow(_ sender: Any?) {
         if PCodeWorkspaceMode.enabled {
             let controller = PCodeWorkspaceController.shared(ghostty)
@@ -1236,6 +1250,7 @@ extension AppDelegate {
         // modify this stuff as code.
         self.menuAbout?.setImageIfDesired(systemSymbolName: "info.circle")
         self.menuCheckForUpdates?.setImageIfDesired(systemSymbolName: "square.and.arrow.down")
+        self.menuRestartPcode?.setImageIfDesired(systemSymbolName: "arrow.clockwise")
         self.menuOpenConfig?.setImageIfDesired(systemSymbolName: "gear")
         self.menuReloadConfig?.setImageIfDesired(systemSymbolName: "arrow.trianglehead.2.clockwise.rotate.90")
         self.menuSecureInput?.setImageIfDesired(systemSymbolName: "lock.display")
@@ -1409,6 +1424,9 @@ extension AppDelegate: NSMenuItemValidation {
         switch item.action {
         case #selector(setAsDefaultTerminal(_:)):
             return NSWorkspace.shared.defaultTerminal != Bundle.main.bundleURL
+
+        case #selector(restartPcode(_:)):
+            return PCodeWorkspaceMode.enabled
 
         case #selector(floatOnTop(_:)),
             #selector(useAsDefault(_:)):
