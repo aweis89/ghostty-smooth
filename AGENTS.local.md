@@ -24,8 +24,3 @@ it alone so rebases stay clean, and put fork rules here.
   `make app`, and commit the new `app/ghostty.lock`. A seam change needs
   both sides in that one pcode commit. To try unmerged fork work with pcode's
   Swift: `GHOSTTY_SRC=<this checkout> make app` in pcode.
-- **Push from the parent directory.** This repo has upstream's own `.envrc`,
-  which is blocked, so direnv doesn't load the credentials from `~/p` here and
-  `git push` fails with "Invalid username or token". Run `direnv exec ~/p git
-  -C ~/p/ghostty-smooth push origin <branch>`. A bare `cd ~/p &&` isn't enough
-  in an agent's shell, because nothing runs direnv's hook there.
