@@ -165,6 +165,12 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     var onDockChange: (() -> Void)?
     /// Called when the pane's activity state transitions, so collapsed folder headers refresh.
     var onActivityChange: (() -> Void)?
+    /// Called when a turn ends (running to idle or failed), so the workspace
+    /// can mark its response unseen if nobody is looking at it.
+    var onTurnFinished: (() -> Void)?
+    /// A finished turn's response that hasn't been looked at here yet. Kept
+    /// by session ID in the workspace, so it survives restarts.
+    @Published var unseen = false
 
     init(surface: Ghostty.SurfaceView, directory: String, projectPath: String? = nil, sessionID: String?) {
         self.surface = surface
@@ -185,8 +191,11 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] activity in
-                self?.activity = activity
-                self?.onActivityChange?()
+                guard let self else { return }
+                let finished = self.activity == .running && activity != .running
+                self.activity = activity
+                if finished { self.onTurnFinished?() }
+                self.onActivityChange?()
             }
         dockSubscription = surface.pcodeDock.$surface
             .receive(on: DispatchQueue.main)
@@ -239,6 +248,11 @@ struct PCodeProjectGroup: Identifiable {
         if !openPanes.isEmpty { return .idle }
         return nil
     }
+
+    /// Whether any session in the folder, open or saved, has an unseen response.
+    func hasUnseen(_ unseenIDs: Set<String>) -> Bool {
+        openPanes.contains(where: \.unseen) || recentSessions.contains { unseenIDs.contains($0.id) }
+    }
 }
 
 /// One candidate directory in the ⌘⇧N directory picker.
@@ -271,6 +285,14 @@ final class PCodeWorkspace: ObservableObject {
     weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private static let openKey = "PCodeWorkspaceOpenSessions"
+    private static let unseenKey = "PCodeWorkspaceUnseenSessions"
+
+    /// Sessions whose latest response hasn't been looked at in this app.
+    @Published private(set) var unseenIDs: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: PCodeWorkspace.unseenKey) ?? []
+    ) {
+        didSet { if unseenIDs != oldValue { UserDefaults.standard.set(Array(unseenIDs), forKey: Self.unseenKey) } }
+    }
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
@@ -292,7 +314,9 @@ final class PCodeWorkspace: ObservableObject {
         ) { [weak self] note in
             guard let self, let view = note.object as? Ghostty.SurfaceView,
                   let pane = self.panes.first(where: { $0.surface === view }) else { return }
+            let old = pane.sessionID
             pane.sessionID = view.pcodeSession
+            self.sessionIDChanged(pane, from: old)
             self.saveOpen()
             self.reloadHistory()
         })
@@ -350,10 +374,16 @@ final class PCodeWorkspace: ObservableObject {
     func reloadHistory(then done: (([PCodeSessionInfo]) -> Void)? = nil) {
         historyGeneration += 1
         let generation = historyGeneration
+        let unseen = unseenIDs
         DispatchQueue.global(qos: .userInitiated).async {
             let all = PCodeSessionInfo.load(limit: .max)
+            // Sessions deleted outside the app (no directory left at all).
+            let gone = unseen.filter {
+                !FileManager.default.fileExists(atPath: PCodeSessionInfo.root.appendingPathComponent($0).path)
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self, generation == self.historyGeneration else { return }
+                if !gone.isEmpty { self.unseenIDs.subtract(gone) }
                 self.history = Array(all.prefix(200))
                 done?(all)
             }
@@ -716,6 +746,7 @@ final class PCodeWorkspace: ObservableObject {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.delete(id: id, retries: retries - 1) }
                     return
                 }
+                if status == 0 { self.unseenIDs.remove(id) }
                 self.reloadHistory()
                 guard status != 0 else { return }
                 let alert = NSAlert()
@@ -805,6 +836,11 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     private func adopt(_ pane: PCodeSessionPane) {
+        if let id = pane.sessionID, unseenIDs.contains(id) { pane.unseen = true }
+        pane.onTurnFinished = { [weak self, weak pane] in
+            guard let self, let pane else { return }
+            if self.isViewed(pane) { self.markSeen(pane) } else { self.markUnseen(pane) }
+        }
         pane.onDockChange = { [weak self] in self?.schedulePresize() }
         pane.onActivityChange = { [weak self, weak pane] in
             guard let self, let pane else { return }
@@ -814,8 +850,56 @@ final class PCodeWorkspace: ObservableObject {
         }
     }
 
+    // MARK: Unseen responses
+
+    /// Whether the user is looking at `pane`: it is the one shown, in the key
+    /// window (no window is key while the app is in the background), and that
+    /// window is on screen (a locked screen or asleep display leaves it key).
+    private func isViewed(_ pane: PCodeSessionPane) -> Bool {
+        pane.id == selected && (window?.isKeyWindow ?? false) && windowVisible()
+    }
+
+    private func markUnseen(_ pane: PCodeSessionPane) {
+        if !pane.unseen {
+            pane.unseen = true
+            objectWillChange.send()  // collapsed folder headers
+        }
+        if let id = pane.sessionID, !unseenIDs.contains(id) { unseenIDs.insert(id) }
+    }
+
+    private func markSeen(_ pane: PCodeSessionPane) {
+        if pane.unseen {
+            pane.unseen = false
+            objectWillChange.send()
+        }
+        if let id = pane.sessionID, unseenIDs.contains(id) { unseenIDs.remove(id) }
+    }
+
+    /// pcode switched the pane to another session (`/resume`, `/new`, or its
+    /// first report): carry an unseen response over to the new ID.
+    private func sessionIDChanged(_ pane: PCodeSessionPane, from old: String?) {
+        guard old != pane.sessionID else { return }
+        // A response that ended before the new ID arrived belongs to it, not the old one.
+        let carried = pane.unseen && (old.map { unseenIDs.contains($0) } ?? true)
+        if let old, carried { unseenIDs.remove(old) }
+        if isViewed(pane) {
+            markSeen(pane)
+        } else if carried || pane.sessionID.map(unseenIDs.contains) == true {
+            markUnseen(pane)
+        } else if pane.unseen {
+            pane.unseen = false
+            objectWillChange.send()
+        }
+    }
+
+    /// The window became key or came on screen: the session it shows has now been seen.
+    func selectedMaybeSeen() {
+        if let pane = selectedPane, isViewed(pane) { markSeen(pane) }
+    }
+
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
+        if isViewed(pane) { markSeen(pane) }
         syncOcclusion()
         // The pane just hidden keeps its size; the others follow the shown one.
         schedulePresize()
@@ -1074,7 +1158,8 @@ struct PCodeWorkspaceView: View {
                     PCodeSessionRow(
                         title: info.label,
                         subtitle: info.worktreeName ?? PCodeWorkspace.relativeTime(info.updatedDate),
-                        activity: nil
+                        activity: nil,
+                        unseen: workspace.unseenIDs.contains(info.id)
                     ) {
                         recentMenu(info)
                     }
@@ -1114,6 +1199,7 @@ struct PCodeWorkspaceView: View {
             PCodeFolderHeader(
                 group: group,
                 isCollapsed: collapsed,
+                hasUnseen: group.hasUnseen(workspace.unseenIDs),
                 onToggle: { workspace.toggleCollapsed(group.path) },
                 onNewSession: { workspace.newSession(directory: group.path) }
             )
@@ -1189,6 +1275,7 @@ struct PCodeWorkspaceView: View {
 private struct PCodeFolderHeader: View {
     let group: PCodeProjectGroup
     let isCollapsed: Bool
+    let hasUnseen: Bool
     let onToggle: () -> Void
     let onNewSession: () -> Void
     @State private var hovering = false
@@ -1217,8 +1304,8 @@ private struct PCodeFolderHeader: View {
             .buttonStyle(.plain)
             .help(group.abbreviatedPath)
 
-            if isCollapsed, let activity = group.activity {
-                PCodeActivityIndicator(activity: activity)
+            if isCollapsed, group.activity != nil || hasUnseen {
+                PCodeActivityIndicator(activity: group.activity, unseen: hasUnseen)
                     .frame(width: 12, height: 12)
             }
 
@@ -1253,6 +1340,7 @@ private struct PCodePaneRow<Actions: View>: View {
             title: title,
             subtitle: info?.worktreeName ?? pane.worktreeName,
             activity: pane.activity,
+            unseen: pane.unseen,
             actions: actions)
     }
 }
@@ -1263,12 +1351,14 @@ private struct PCodeSessionRow<Actions: View>: View {
     var subtitle: String?
     /// Nil for a session not open here.
     var activity: PCodeSessionPane.Activity?
+    /// A finished response not yet looked at here.
+    var unseen = false
     @ViewBuilder var actions: () -> Actions
     @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 8) {
-            PCodeActivityIndicator(activity: activity)
+            PCodeActivityIndicator(activity: activity, unseen: unseen)
                 .frame(width: 12, height: 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).lineLimit(1).truncationMode(.tail)
@@ -1623,8 +1713,10 @@ private struct PCodeDirectoryPickerOverlay: View {
 
 /// Open and idle: a dot. A turn running: pcode's `dual` spinner (two
 /// counter-rotating crescents, `kitty_spinner._render_dual`). Failed: red.
+/// A response not yet looked at: green, open or not.
 private struct PCodeActivityIndicator: View {
     var activity: PCodeSessionPane.Activity?
+    var unseen = false
 
     var body: some View {
         switch activity {
@@ -1644,6 +1736,9 @@ private struct PCodeActivityIndicator: View {
             }
         case .failed?:
             Circle().fill(Color.red).frame(width: 6, height: 6)
+        case _ where unseen:
+            Circle().fill(Color.green).frame(width: 7, height: 7)
+                .help("New response")
         case .idle?:
             Circle().fill(Color.secondary.opacity(0.7)).frame(width: 6, height: 6)
         case nil:
@@ -1793,6 +1888,11 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
         workspace.syncOcclusion()
+        workspace.selectedMaybeSeen()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        workspace.selectedMaybeSeen()
     }
 
     func windowWillClose(_ notification: Notification) {
