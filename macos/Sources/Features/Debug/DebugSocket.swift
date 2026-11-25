@@ -17,9 +17,6 @@ final class DebugSocket {
     static func startIfRequested() {
         guard let path = ProcessInfo.processInfo.environment["GHOSTTY_DEBUG_SOCKET"],
               !path.isEmpty, shared == nil else { return }
-        // Not for the shells this app starts: an app launched from one would
-        // take the socket over.
-        unsetenv("GHOSTTY_DEBUG_SOCKET")
         let server = DebugSocket(path: path)
         if server.start() {
             shared = server
@@ -36,10 +33,13 @@ final class DebugSocket {
     }
 
     private func start() -> Bool {
-        // Replace a stale socket, but never some other file at that path.
+        // Replace a stale socket, but never some other file at that path, nor
+        // a live app's socket. The variable stays in the environment (the Zig
+        // core holds on to it, so unsetenv breaks startup), so shells in this
+        // app inherit it and an app started from one would otherwise take over.
         var info = stat()
         if lstat(path, &info) == 0 {
-            guard info.st_mode & S_IFMT == S_IFSOCK else { return false }
+            guard info.st_mode & S_IFMT == S_IFSOCK, !Self.isLive(path) else { return false }
             unlink(path)
         }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -70,6 +70,21 @@ final class DebugSocket {
         thread.name = "ghostty.debug-socket"
         thread.start()
         return true
+    }
+
+    /// Whether an app is listening on `path`.
+    private static func isLive(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: Array(path.utf8).prefix($0.count - 1)) }
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+            }
+        }
     }
 
     private func acceptLoop() {
