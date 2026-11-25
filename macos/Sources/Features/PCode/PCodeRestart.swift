@@ -8,6 +8,7 @@ import Darwin
 /// pcode moves its session into a host and exits 0 on SIGUSR2 (mid-turn too).
 /// A pcode without that support dies of the signal, which is fine as well:
 /// its session is saved, and reopens the ordinary way.
+@MainActor
 final class PCodeRestart {
     private static var current: PCodeRestart?
     /// Set once quitting to relaunch, so the quit is not confirmed again.
@@ -85,7 +86,9 @@ final class PCodeRestart {
         guard total > 0 else { return relaunch() }
         started = Date()
         showProgress()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.poll() }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
+        }
     }
 
     private func poll() {
@@ -184,6 +187,7 @@ enum PCodeProcess {
     /// parent and holds the foreground group, and a `$PCODE_COMMAND` such as
     /// `uv run … pcode` adds a layer of its own. So: of the processes on the
     /// pane's tty, the outermost that is pcode.
+    @MainActor
     static func pid(in view: Ghostty.SurfaceView) -> pid_t? {
         guard let tty = view.surfaceModel?.ttyName else { return nil }
         return pid(onTTY: tty)
