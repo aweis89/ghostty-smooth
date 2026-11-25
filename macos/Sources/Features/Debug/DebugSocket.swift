@@ -154,7 +154,7 @@ enum DebugCommands {
             case "activate": try activate(args, finish)
             case "focus": try focus(args, finish)
             case "key": try DebugInput.keys(args, finish)
-            case "type": try DebugInput.type(args, finish)
+            case "type": try DebugInput.typeText(args, finish)
             case "click": try DebugInput.click(args, finish)
             case "drag": try DebugInput.drag(args, finish)
             case "move": try DebugInput.move(args, finish)
@@ -259,11 +259,12 @@ enum DebugCommands {
             // Cells start after the terminal's padding, which is centred.
             let size = view.surfaceSize
             let cols = Double(size?.columns ?? 0), rows = Double(size?.rows ?? 0)
-            let padX = (frame.width - cols * view.cellSize.width) / 2
-            let padY = (frame.height - rows * view.cellSize.height) / 2
-            return (window,
-                    frame.minX + padX + (col + 0.5) * view.cellSize.width,
-                    frame.minY + padY + (row + 0.5) * view.cellSize.height)
+            let cellW = Double(view.cellSize.width), cellH = Double(view.cellSize.height)
+            let padX = (Double(frame.width) - cols * cellW) / 2
+            let padY = (Double(frame.height) - rows * cellH) / 2
+            let x: Double = Double(frame.minX) + padX + (col + 0.5) * cellW
+            let y: Double = Double(frame.minY) + padY + (row + 0.5) * cellH
+            return (window, x, y)
         }
         if let at = args[key] {
             let (x, y) = try point(at)
@@ -278,7 +279,7 @@ enum DebugCommands {
 
     static func rectJSON(_ rect: CGRect?) -> [Double]? {
         guard let rect else { return nil }
-        return [rect.minX, rect.minY, rect.width, rect.height].map { ($0 * 10).rounded() / 10 }
+        return [rect.minX, rect.minY, rect.width, rect.height].map { (Double($0) * 10).rounded() / 10 }
     }
 
     static func windowInfo(_ window: NSWindow, index: Int) -> [String: Any] {

@@ -190,7 +190,7 @@ enum DebugInput {
     }
 
     /// `text`: typed one key at a time; characters with no key are inserted as text.
-    static func type(_ args: [String: Any], _ reply: @escaping Reply) throws {
+    static func typeText(_ args: [String: Any], _ reply: @escaping Reply) throws {
         guard let text = args["text"] as? String else { throw Failure("type needs text") }
         let window = try keyTarget(args)
         let gap = (args["gap"] as? NSNumber)?.doubleValue ?? 0.01
