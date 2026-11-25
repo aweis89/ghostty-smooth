@@ -113,14 +113,78 @@ struct PCodeSessionInfo: Identifiable, Hashable, Decodable {
 
     var directoryName: String { (workspace as NSString).lastPathComponent }
 
+    /// Sessions a running background host holds (pcode's `hosts/<id>.json`
+    /// entries, as `host_protocol.list_hosts` reads them).
+    static func hosted() -> Set<String> {
+        struct Entry: Decodable {
+            let pid: Int32
+            let session_id: String?
+        }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: hostRoot, includingPropertiesForKeys: nil) else { return [] }
+        let decoder = JSONDecoder()
+        var ids = Set<String>()
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let entry = try? decoder.decode(Entry.self, from: data),
+                  let id = entry.session_id, !id.isEmpty, entry.pid > 0,
+                  // Alive and still a host, not a reused pid.
+                  kill(entry.pid, 0) == 0, PCodeProcess.isPCodeOrHost(entry.pid)
+            else { continue }
+            ids.insert(id)
+        }
+        return ids
+    }
+
+    /// Of `ids`, sessions a Restart Pcode moved, those ready to reopen: held
+    /// by a host, or unlocked on two checks half a second apart (not in the
+    /// gap between the old pcode letting go and its host taking over).
+    /// Waits up to `timeout` for the rest; one still locked then, with no
+    /// host, is held by some other process and left out. Blocks: call it
+    /// off the main thread.
+    static func awaitRestarted(_ ids: [String], timeout: TimeInterval = 5) -> Set<String> {
+        guard !ids.isEmpty else { return [] }
+        let deadline = Date().addingTimeInterval(timeout)
+        var ready = Set<String>()
+        var unlocked = Set<String>()
+        while true {
+            let hosted = hosted()
+            for id in ids where !ready.contains(id) {
+                if hosted.contains(id) {
+                    ready.insert(id)
+                } else if isOpen(id) {
+                    unlocked.remove(id)
+                } else if !unlocked.insert(id).inserted {
+                    ready.insert(id)
+                }
+            }
+            if ready.count == Set(ids).count || Date() >= deadline { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        // Unlocked at the last check, with no time left for a second.
+        return ready.union(unlocked)
+    }
+
+    static var hostRoot: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["PCODE_HOST_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+        }
+        return stateRoot.appendingPathComponent("pcode/hosts")
+    }
+
+    private static var stateRoot: URL {
+        let state = ProcessInfo.processInfo.environment["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".local/state")
+        return URL(fileURLWithPath: state)
+    }
+
     static var root: URL {
         let env = ProcessInfo.processInfo.environment
         if let dir = env["PCODE_SESSION_DIR"], !dir.isEmpty {
             return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         }
-        let state = env["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".local/state")
-        return URL(fileURLWithPath: state).appendingPathComponent("pcode/sessions")
+        return stateRoot.appendingPathComponent("pcode/sessions")
     }
 
     /// Saved sessions with at least one turn, newest first.
@@ -285,6 +349,7 @@ final class PCodeWorkspace: ObservableObject {
     weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private static let openKey = "PCodeWorkspaceOpenSessions"
+    private static let selectedKey = "PCodeWorkspaceSelectedSession"
     private static let unseenKey = "PCodeWorkspaceUnseenSessions"
 
     /// Sessions whose latest response hasn't been looked at in this app.
@@ -318,6 +383,7 @@ final class PCodeWorkspace: ObservableObject {
             pane.sessionID = view.pcodeSession
             self.sessionIDChanged(pane, from: old)
             self.saveOpen()
+            if pane.id == self.selected { self.saveSelected() }
             self.reloadHistory()
         })
     }
@@ -345,28 +411,59 @@ final class PCodeWorkspace: ObservableObject {
 
     var selectedPane: PCodeSessionPane? { panes.first { $0.id == selected } }
 
-    /// Reopen the sessions open at last quit, or start a fresh one.
+    /// Reopen the sessions open at last quit, and every session a background
+    /// host holds, or start a fresh one.
     func restore() {
-        let ids = UserDefaults.standard.stringArray(forKey: Self.openKey) ?? []
-        guard !ids.isEmpty else {
-            newSession(directory: pinnedFolders.first ?? NSHomeDirectory())
-            reloadHistory()
-            return
+        // Not into a window that is quitting to restart (a Dock click while
+        // its panes close): the relaunched app reopens them. Nor twice.
+        guard !restarting, !restoring else { return }
+        restoring = true
+        let saved = UserDefaults.standard.stringArray(forKey: Self.openKey) ?? []
+        let marked = Self.restartMarker()
+        let selectedID = UserDefaults.standard.string(forKey: Self.selectedKey)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Sessions a Restart Pcode just moved may still be on their way
+            // into their hosts.
+            let ready = PCodeSessionInfo.awaitRestarted(marked)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.restoring = false
+                Self.clearRestartMarker()
+                self.reloadHistory { [weak self] all in
+                    guard let self, self.panes.isEmpty else { return }
+                    self.reopen(saved: saved, marked: Set(marked), ready: ready, all: all, selectedID: selectedID)
+                }
+            }
         }
-        reloadHistory { [weak self] all in
-            guard let self, self.panes.isEmpty else { return }
-            let infos = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-            // Not one open in another process (a terminal, another window):
-            // that would start a copy of it here instead.
-            for id in ids {
-                if let info = infos[id], !PCodeSessionInfo.isOpen(id) { self.open(info, select: false) }
-            }
-            if self.panes.isEmpty {
-                let firstVisible = all.first { !self.hiddenFolders.contains($0.normalizedProjectPath) }?.normalizedProjectPath
-                self.newSession(directory: firstVisible ?? self.pinnedFolders.first ?? NSHomeDirectory())
-            } else {
-                self.select(self.panes[0])
-            }
+    }
+
+    private var restoring = false
+
+    private func reopen(
+        saved: [String], marked: Set<String>, ready: Set<String>,
+        all: [PCodeSessionInfo], selectedID: String?
+    ) {
+        let infos = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        // Any session a host holds, even one a terminal is attached to as
+        // well: `pcode -c` attaches to the host, and the window shows them all.
+        let hosted = PCodeSessionInfo.hosted()
+        let extra = all.map(\.id).filter { hosted.contains($0) && !saved.contains($0) }
+        for id in saved + extra {
+            guard let info = infos[id] else { continue }
+            // Not one open in another process (a terminal, another window)
+            // without a host: that would start a copy of it here instead.
+            // A restarted one may have been seen ready before its host
+            // registered.
+            let openable = hosted.contains(id) || (marked.contains(id) ? ready.contains(id) : !PCodeSessionInfo.isOpen(id))
+            if openable { open(info, select: false) }
+        }
+        if panes.isEmpty {
+            // Nothing reopened: start in the newest visible folder, else
+            // the first pinned one, else home.
+            let firstVisible = saved.isEmpty ? nil : all.first { !hiddenFolders.contains($0.normalizedProjectPath) }?.normalizedProjectPath
+            newSession(directory: firstVisible ?? pinnedFolders.first ?? NSHomeDirectory())
+        } else {
+            select(panes.first { $0.sessionID != nil && $0.sessionID == selectedID } ?? panes[0])
         }
     }
 
@@ -909,6 +1006,7 @@ final class PCodeWorkspace: ObservableObject {
 
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
+        saveSelected()
         if isViewed(pane) { markSeen(pane) }
         syncOcclusion()
         // The pane just hidden keeps its size; the others follow the shown one.
@@ -1015,7 +1113,49 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     private func saveOpen() {
+        guard !restarting else { return }
         UserDefaults.standard.set(panes.compactMap(\.sessionID), forKey: Self.openKey)
+    }
+
+    /// Remember the shown session, for `restore` to show again.
+    private func saveSelected() {
+        guard !restarting, let id = selectedPane?.sessionID else { return }
+        UserDefaults.standard.set(id, forKey: Self.selectedKey)
+    }
+
+    /// Whether the app is quitting to restart (`PCodeRestart`): the saved
+    /// open sessions and selection are kept as they were when it began,
+    /// while pcode in each pane exits and the panes close.
+    private(set) var restarting = false
+
+    /// Save what is open and shown, then stop saving until the app quits.
+    /// The sessions are marked as restarting, for the relaunched app to
+    /// wait for their hosts (`PCodeSessionInfo.awaitRestarted`).
+    func beginRestart() {
+        saveOpen()
+        saveSelected()
+        let defaults = UserDefaults.standard
+        defaults.set(panes.compactMap(\.sessionID), forKey: Self.restartIDsKey)
+        defaults.set(Date(), forKey: Self.restartTimeKey)
+        restarting = true
+    }
+
+    private static let restartIDsKey = "PCodeWorkspaceRestartIDs"
+    private static let restartTimeKey = "PCodeWorkspaceRestartTime"
+
+    /// The sessions a recent Restart Pcode moved to hosts. A marker older
+    /// than the restart could take (the relaunch failed, and Pcode was
+    /// opened by hand much later) is ignored.
+    private static func restartMarker() -> [String] {
+        let defaults = UserDefaults.standard
+        guard let time = defaults.object(forKey: restartTimeKey) as? Date,
+              abs(time.timeIntervalSinceNow) < 600 else { return [] }
+        return defaults.stringArray(forKey: restartIDsKey) ?? []
+    }
+
+    private static func clearRestartMarker() {
+        UserDefaults.standard.removeObject(forKey: restartIDsKey)
+        UserDefaults.standard.removeObject(forKey: restartTimeKey)
     }
 }
 
@@ -1831,6 +1971,9 @@ private struct PCodeSessionPaneView: View {
 final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
     private static var instance: PCodeWorkspaceController?
     let workspace: PCodeWorkspace
+
+    /// The controller, if the window was ever made.
+    static var existing: PCodeWorkspaceController? { instance }
 
     static func shared(_ ghostty: Ghostty.App) -> PCodeWorkspaceController {
         if let instance { return instance }
