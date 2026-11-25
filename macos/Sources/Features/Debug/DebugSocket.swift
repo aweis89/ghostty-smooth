@@ -33,7 +33,15 @@ final class DebugSocket {
     }
 
     private func start() -> Bool {
-        unlink(path)
+        // Replace a stale socket, but never some other file at that path, nor
+        // a live app's socket. The variable stays in the environment (the Zig
+        // core holds on to it, so unsetenv breaks startup), so shells in this
+        // app inherit it and an app started from one would otherwise take over.
+        var info = stat()
+        if lstat(path, &info) == 0 {
+            guard info.st_mode & S_IFMT == S_IFSOCK, !Self.isLive(path) else { return false }
+            unlink(path)
+        }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         var addr = sockaddr_un()
@@ -44,11 +52,14 @@ final class DebugSocket {
             return false
         }
         withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
+        // Owner-only from the moment it exists.
+        let oldMask = umask(0o077)
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
+        umask(oldMask)
         guard bound == 0, listen(fd, 8) == 0 else {
             close(fd)
             return false
@@ -61,6 +72,21 @@ final class DebugSocket {
         return true
     }
 
+    /// Whether an app is listening on `path`.
+    private static func isLive(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: Array(path.utf8).prefix($0.count - 1)) }
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+            }
+        }
+    }
+
     private func acceptLoop() {
         while true {
             let client = accept(listenFD, nil, nil)
@@ -68,6 +94,8 @@ final class DebugSocket {
                 if errno == EINTR { continue }
                 return
             }
+            var on: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
             DispatchQueue.global(qos: .userInitiated).async { Self.serve(client) }
         }
     }
@@ -118,8 +146,11 @@ final class DebugSocket {
         } else {
             result = ["ok": false, "error": "expected a JSON object with a \"cmd\" string"]
         }
-        let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-        return data ?? Data(#"{"ok":false,"error":"reply was not JSON-serializable"}"#.utf8)
+        // NaN or infinity raises an Objective-C exception that `try?` can't catch.
+        guard JSONSerialization.isValidJSONObject(result),
+              let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        else { return Data(#"{"ok":false,"error":"reply was not JSON-serializable"}"#.utf8) }
+        return data
     }
 }
 
@@ -256,14 +287,10 @@ enum DebugCommands {
             let (col, row) = try point(cell)
             guard let window = view.window, let frame = topLeftRect(view.bounds, of: view),
                   view.cellSize.width > 0 else { throw Failure("surface is not on screen") }
-            // Cells start after the terminal's padding, which is centred.
-            let size = view.surfaceSize
-            let cols = Double(size?.columns ?? 0), rows = Double(size?.rows ?? 0)
             let cellW = Double(view.cellSize.width), cellH = Double(view.cellSize.height)
-            let padX = (Double(frame.width) - cols * cellW) / 2
-            let padY = (Double(frame.height) - rows * cellH) / 2
-            let x: Double = Double(frame.minX) + padX + (col + 0.5) * cellW
-            let y: Double = Double(frame.minY) + padY + (row + 0.5) * cellH
+            let corner = cellCorner(view, col: Int(col), row: Int(row))
+            let x: Double = Double(frame.minX) + corner.x + 0.5 * cellW
+            let y: Double = Double(frame.minY) + corner.y + 0.5 * cellH
             return (window, x, y)
         }
         if let at = args[key] {
@@ -277,8 +304,31 @@ enum DebugCommands {
         return (window, frame.midX, frame.midY)
     }
 
+    /// A cell's top-left corner in the surface's top-left points, as Ghostty
+    /// places it (padding can be balanced or not), from a one-cell selection.
+    static func cellCorner(_ view: Ghostty.SurfaceView, col: Int, row: Int) -> (x: Double, y: Double) {
+        let cellW = Double(view.cellSize.width), cellH = Double(view.cellSize.height)
+        if let surface = view.surface, col >= 0, row >= 0 {
+            let point = ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_EXACT,
+                                        x: UInt32(col), y: UInt32(row))
+            var text = ghostty_text_s()
+            if ghostty_surface_read_text(surface, ghostty_selection_s(top_left: point, bottom_right: point,
+                                                                      rectangle: false), &text) {
+                defer { ghostty_surface_free_text(surface, &text) }
+                // `tl_px_y` is the cell's bottom edge (quick look treats it as a baseline).
+                if text.tl_px_x.isFinite, text.tl_px_y.isFinite {
+                    return (text.tl_px_x, text.tl_px_y - cellH)
+                }
+            }
+        }
+        // Fall back to balanced padding.
+        let cols = Double(view.surfaceSize?.columns ?? 0), rows = Double(view.surfaceSize?.rows ?? 0)
+        return ((Double(view.bounds.width) - cols * cellW) / 2 + Double(col) * cellW,
+                (Double(view.bounds.height) - rows * cellH) / 2 + Double(row) * cellH)
+    }
+
     static func rectJSON(_ rect: CGRect?) -> [Double]? {
-        guard let rect else { return nil }
+        guard let rect, [rect.minX, rect.minY, rect.width, rect.height].allSatisfy(\.isFinite) else { return nil }
         return [rect.minX, rect.minY, rect.width, rect.height].map { (Double($0) * 10).rounded() / 10 }
     }
 
@@ -405,8 +455,8 @@ enum DebugCommands {
         }
         func frame(_ layer: CALayer) -> CGRect {
             let local = rootLayer.convert(layer.bounds, from: layer)
-            let flipped = content.isFlipped != rootLayer.isGeometryFlipped
-            let y = flipped ? local.minY : rootLayer.bounds.height - local.maxY
+            // Sublayer coordinates are y-down exactly when the root layer flips its geometry.
+            let y = rootLayer.isGeometryFlipped ? local.minY : rootLayer.bounds.height - local.maxY
             return CGRect(x: local.minX, y: y, width: local.width, height: local.height)
         }
         func node(_ layer: CALayer, _ depth: Int) -> [String: Any] {

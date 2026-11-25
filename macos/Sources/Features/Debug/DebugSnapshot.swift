@@ -176,22 +176,38 @@ enum DebugSnapshot {
     /// stops updating and drawing a fully covered window, so a snapshot of one
     /// would show its last frame from before it was covered. `body` calls its
     /// argument when done, which puts back the window's real visibility.
+    /// Requests keeping each window's terminals awake; only the last to
+    /// finish puts back the window's real visibility.
+    private static var wakes: [ObjectIdentifier: Int] = [:]
+
     static func rendering(_ window: NSWindow, _ body: @escaping (@escaping () -> Void) -> Void) {
-        let surfaces = DebugCommands.surfaces(in: window).compactMap(\.surface)
-        let onScreen = window.occlusionState.contains(.visible)
-        if onScreen {
+        let key = ObjectIdentifier(window)
+        if window.occlusionState.contains(.visible), wakes[key] == nil {
             body {}
             return
         }
-        surfaces.forEach { ghostty_surface_set_occlusion($0, true) }
-        surfaces.forEach(ghostty_surface_refresh)
-        // Becoming visible rebuilds and draws on the renderer thread.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            body {
-                let visible = window.occlusionState.contains(.visible)
-                surfaces.forEach { ghostty_surface_set_occlusion($0, visible) }
-            }
+        // Views, not their terminals: a pane closed meanwhile frees its
+        // terminal, and the view then has none to restore.
+        let views = DebugCommands.surfaces(in: window)
+        let first = wakes[key] == nil
+        wakes[key, default: 0] += 1
+        let finish = {
+            wakes[key, default: 1] -= 1
+            guard wakes[key] == 0 else { return }
+            wakes[key] = nil
+            let visible = window.occlusionState.contains(.visible)
+            views.compactMap(\.surface).forEach { ghostty_surface_set_occlusion($0, visible) }
         }
+        guard first else {
+            body(finish)
+            return
+        }
+        views.compactMap(\.surface).forEach {
+            ghostty_surface_set_occlusion($0, true)
+            ghostty_surface_refresh($0)
+        }
+        // Becoming visible rebuilds and draws on the renderer thread.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { body(finish) }
     }
 
     static func snapFresh(_ args: [String: Any], _ reply: @escaping Reply) throws {
@@ -287,24 +303,31 @@ enum DebugSnapshot {
         func start() {
             Self.retained[ObjectIdentifier(self)] = self
             started = Date()
-            var layers: [CALayer] = DebugCommands.surfaces(in: window).compactMap(\.layer)
-            func collect(_ layer: CALayer) {
-                if DebugSnapshot.isIOSurface(layer.contents), !layers.contains(where: { $0 === layer }) {
-                    layers.append(layer)
-                }
-                layer.sublayers?.forEach(collect)
-            }
-            if let root = window.contentView?.layer { collect(root) }
-            observers = layers.map { layer in
-                layer.observe(\.contents) { [weak self] _, _ in
-                    DispatchQueue.main.async { self?.schedule("present") }
-                }
-            }
+            observeNewLayers()
             timer = Timer.scheduledTimer(withTimeInterval: 1 / fps, repeats: true) { [weak self] _ in
+                // Terminals that appeared since (a popup, the dock) get watched too.
+                self?.observeNewLayers()
                 self?.schedule("timer")
             }
             capture("start")
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.finish() }
+        }
+
+        private var observed: [CALayer] = []
+
+        private func observeNewLayers() {
+            var layers: [CALayer] = DebugCommands.surfaces(in: window).compactMap(\.layer)
+            func collect(_ layer: CALayer) {
+                if DebugSnapshot.isIOSurface(layer.contents) { layers.append(layer) }
+                layer.sublayers?.forEach(collect)
+            }
+            if let root = window.contentView?.layer { collect(root) }
+            for layer in layers where !observed.contains(where: { $0 === layer }) {
+                observed.append(layer)
+                observers.append(layer.observe(\.contents) { [weak self] _, _ in
+                    DispatchQueue.main.async { self?.schedule("present") }
+                })
+            }
         }
 
         /// Captures at most once per run-loop pass however many layers changed.
@@ -334,6 +357,7 @@ enum DebugSnapshot {
             timer = nil
             observers.forEach { $0.invalidate() }
             observers = []
+            observed = []
             onFinish?()
             onFinish = nil
 
@@ -356,6 +380,7 @@ enum DebugSnapshot {
             }
             let result: [String: Any] = [
                 "dir": dir, "frames": frames.count, "seconds": seconds, "failures": failures,
+                "hit_frame_cap": frames.count >= Self.maxFrames,
                 "flashes": Array(flashes.prefix(20)),
                 "biggest_changes": index.sorted { ($0["diff"] as? Double ?? 0) > ($1["diff"] as? Double ?? 0) }
                     .prefix(10).map { $0["frame"] ?? 0 },
@@ -364,7 +389,8 @@ enum DebugSnapshot {
             writer.async {
                 var file = result
                 file["index"] = index
-                if let data = try? JSONSerialization.data(withJSONObject: file, options: [.prettyPrinted, .sortedKeys]) {
+                if JSONSerialization.isValidJSONObject(file),
+                   let data = try? JSONSerialization.data(withJSONObject: file, options: [.prettyPrinted, .sortedKeys]) {
                     try? data.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("index.json")))
                 }
                 DispatchQueue.main.async {
