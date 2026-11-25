@@ -1309,13 +1309,10 @@ class BaseTerminalController: NSWindowController,
 
     @IBAction func close(_ sender: Any) {
         // A native pcode picker with the keyboard closes, not pcode's terminal under it.
-        if let picker = PCode.keyboardPicker(in: window) {
-            picker.cancel()
-            return
-        }
+        if PCodeHooks.shared.cancelKeyboardPicker(in: window) { return }
         // A pcode overlay with the keyboard closes itself (its owner observes
         // the close), not the terminal it stands for as the focused surface.
-        guard let surface = (PCode.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
+        guard let surface = (PCodeHooks.shared.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
         ghostty.requestClose(surface: surface)
     }
 
@@ -1478,8 +1475,8 @@ class BaseTerminalController: NSWindowController,
 
     @objc func resetTerminal(_ sender: Any) {
         // As `close`: never reset pcode's terminal from inside its overlay or picker.
-        guard PCode.keyboardPicker(in: window) == nil else { return }
-        guard let surface = (PCode.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
+        guard !PCodeHooks.shared.hasKeyboardPicker(in: window) else { return }
+        guard let surface = (PCodeHooks.shared.keyboardOverlay(in: window) ?? focusedSurface)?.surface else { return }
         ghostty.resetTerminal(surface: surface)
     }
 

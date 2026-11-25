@@ -718,9 +718,10 @@ extension Ghostty {
 
             // If our window/app is already focused, then this click is only
             // being used to transfer split focus.
-            // SPIKE: not under a shown pcode dock, which takes the keyboard back
+            // Not under a shown pcode dock, which takes the keyboard back
             // after every click: the transcript would never get a click through.
-            suppressLeftMouseUntilRelease = NSApp.isActive && window.isKeyWindow && !pcodeHasShownDock
+            suppressLeftMouseUntilRelease = NSApp.isActive && window.isKeyWindow
+                && !PCodeHooks.shared.clicksThroughOnFocus(self)
 
             // Make ourselves the first responder
             window.makeFirstResponder(self)
@@ -858,7 +859,7 @@ extension Ghostty {
             if result {
                 focusDidChange(true)
                 // An open pcode popup over this surface takes the keyboard back.
-                pcodeDidFocus()
+                PCodeHooks.shared.didBecomeFirstResponder(self)
             }
             return result
         }
@@ -942,8 +943,8 @@ extension Ghostty {
         }
 
         override func mouseUp(with event: NSEvent) {
-            // SPIKE: after the release (and its selection) is handled.
-            defer { pcodeDidMouseUp() }
+            // pcode: after the release (and its selection) is handled.
+            defer { PCodeHooks.shared.didMouseUp(self) }
             // If this mouse-up corresponds to a focus-only click transfer,
             // suppress it so we don't emit a release without a press.
             if suppressLeftMouseUntilRelease {
@@ -1021,7 +1022,7 @@ extension Ghostty {
             mouseLocationInSurface = pos
 
             // An unseen pcode popup: no cursor shape or mouse report from it.
-            guard let surfaceModel, !pcodeIgnoresMouse else { return }
+            guard let surfaceModel, !PCodeHooks.shared.ignoresMouse(self) else { return }
 
             // On mouse enter we need to reset our cursor position. This is
             // super important because we set it to -1/-1 on mouseExit and
@@ -1060,7 +1061,7 @@ extension Ghostty {
             let pos = self.convert(event.locationInWindow, from: nil)
             mouseLocationInSurface = pos
 
-            guard let surfaceModel, !pcodeIgnoresMouse else { return }
+            guard let surfaceModel, !PCodeHooks.shared.ignoresMouse(self) else { return }
 
             // Convert window position to view position. Note (0, 0) is bottom left.
             let mouseEvent = Ghostty.Input.MousePosEvent(
@@ -1077,7 +1078,7 @@ extension Ghostty {
                window.isKeyWindow &&
                     !self.focused &&
                     controller.focusFollowsMouse &&
-                    pcodeAllowsMouseFocus {
+                    PCodeHooks.shared.allowsMouseFocus(self) {
                 Ghostty.moveFocus(to: self)
             }
         }
@@ -1138,7 +1139,7 @@ extension Ghostty {
         }
 
         override func keyDown(with event: NSEvent) {
-            pcodeWillKeyDown(event)
+            PCodeHooks.shared.willKeyDown(self, event)
             guard let surface = self.surface else {
                 self.interpretKeyEvents([event])
                 return
@@ -1934,7 +1935,7 @@ extension Ghostty {
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
             // The pcode session this terminal showed: its shell reopens it.
             let pcodeSession = try container.decodeIfPresent(String.self, forKey: .pcodeSession)
-            config.initialInput = Self.pcodeResumeInput(pcodeSession)
+            config.initialInput = PCodeHooks.shared.resumeInput(session: pcodeSession)
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -1954,7 +1955,7 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
-            try container.encodeIfPresent(pcodeSession, forKey: .pcodeSession)
+            try container.encodeIfPresent(PCodeHooks.shared.restorableSession(self), forKey: .pcodeSession)
         }
     }
 }

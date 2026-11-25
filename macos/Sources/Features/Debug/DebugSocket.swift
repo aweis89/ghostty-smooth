@@ -192,10 +192,13 @@ enum DebugCommands {
             case "scroll": try DebugInput.scroll(args, finish)
             case "snap": try DebugSnapshot.snapFresh(args, finish)
             case "record": try DebugSnapshot.record(args, finish)
-            case "peek": try peekSession(args, finish)
             case "menu": try performMenu(args, finish)
             case "press": try pressButton(args, finish)
-            default: throw Failure("unknown command \(cmd)")
+            default:
+                // pcode's own commands (`peek`), when its code is built in.
+                guard try PCodeHooks.shared.debugCommand(cmd, args, finish) else {
+                    throw Failure("unknown command \(cmd)")
+                }
             }
         } catch let failure as Failure {
             reply(["ok": false, "error": failure.message])
@@ -267,37 +270,6 @@ enum DebugCommands {
     static func terminalWindows() -> [NSWindow] {
         let visible = NSApp.orderedWindows.filter { $0.isVisible }
         return visible.filter { !surfaces(in: $0).isEmpty } + visible.filter { surfaces(in: $0).isEmpty }
-    }
-
-    private static func peekSession(_ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void) throws {
-        guard let controller = terminalWindows().compactMap({ $0.windowController as? PCodeWorkspaceController }).first else {
-            throw Failure("no workspace window")
-        }
-        let workspace = controller.workspace
-        if (args["dismiss"] as? Bool) == true {
-            workspace.peek.dismiss()
-            finish(["showing": false])
-            return
-        }
-        if (args["open"] as? Bool) == true {
-            guard let pane = workspace.panes.first(where: { $0.id != workspace.selected }) else {
-                throw Failure("no non-selected open pane")
-            }
-            let target = workspace.peekTarget(for: pane)
-            workspace.peek.peekFromMenu(target)
-            finish(["showing": true, "live": true, "title": target.title])
-            return
-        }
-        let info: PCodeSessionInfo?
-        if let id = args["session"] as? String {
-            info = workspace.history.first { $0.id == id || $0.id.hasPrefix(id) }
-        } else {
-            let openIDs = Set(workspace.panes.compactMap(\.sessionID))
-            info = workspace.history.first { !openIDs.contains($0.id) } ?? workspace.history.first
-        }
-        guard let info else { throw Failure("no session to peek") }
-        workspace.peek.peekFromMenu(workspace.peekTarget(for: info))
-        finish(["showing": true, "live": false, "session": info.id, "title": info.label])
     }
 
     static func window(_ args: [String: Any]) throws -> NSWindow {
@@ -461,10 +433,7 @@ enum DebugCommands {
         // layers, not views, so `layers` is the truth for SwiftUI clip shapes.
         info["visible"] = rectJSON(topLeftRect(view.visibleRect, of: view))
         if let pwd = view.pwd { info["pwd"] = pwd }
-        if view.isPCodeOverlay {
-            info["overlay"] = view.pcodeOwner.map { String(describing: type(of: $0)) } ?? "orphaned"
-            if let pane = view.pcodeOwner?.surfaceView { info["overlay_of"] = shortID(pane) }
-        }
+        info.merge(PCodeHooks.shared.debugInfo(view)) { _, pcode in pcode }
         return info
     }
 

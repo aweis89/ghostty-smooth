@@ -351,7 +351,7 @@ class AppDelegate: NSObject,
         setupMenuImages()
         // Restart Pcode moves the workspace window's sessions; there is none
         // without it.
-        menuRestartPcode?.isHidden = !PCodeWorkspaceMode.enabled
+        menuRestartPcode?.isHidden = !PCodeHooks.shared.replacesTerminalWindows
 
         // Setup signal handlers
         setupSignals()
@@ -397,9 +397,9 @@ class AppDelegate: NSObject,
             // is possible to have other windows in a few scenarios:
             //   - if we're opening a URL since `application(_:openFile:)` is called before this.
             //   - if we're restoring from persisted state
-            // SPIKE: pcode's workspace window replaces Ghostty's terminal windows.
-            if PCodeWorkspaceMode.enabled {
-                PCodeWorkspaceController.show(ghostty)
+            // pcode's workspace window replaces Ghostty's terminal windows.
+            if PCodeHooks.shared.replacesTerminalWindows {
+                PCodeHooks.shared.showWorkspace(ghostty)
             } else if TerminalController.all.isEmpty && derivedConfig.initialWindow {
                 undoManager.disableUndoRegistration()
                 _ = TerminalController.newWindow(ghostty)
@@ -414,7 +414,7 @@ class AppDelegate: NSObject,
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Restart Pcode was confirmed already, and relaunches the app.
-        if PCodeRestart.terminating { return .terminateNow }
+        if PCodeHooks.shared.terminatesImmediately { return .terminateNow }
 
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
@@ -498,8 +498,8 @@ class AppDelegate: NSObject,
         }
 
         // No visible windows, open a new one.
-        if PCodeWorkspaceMode.enabled {
-            PCodeWorkspaceController.show(ghostty)
+        if PCodeHooks.shared.replacesTerminalWindows {
+            PCodeHooks.shared.showWorkspace(ghostty)
             return false
         }
         _ = TerminalController.newWindow(ghostty)
@@ -815,16 +815,16 @@ class AppDelegate: NSObject,
     @objc private func ghosttyNewWindow(_ notification: Notification) {
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
-        if PCodeWorkspaceMode.enabled {
-            PCodeWorkspaceController.shared(ghostty).workspace.newSession()
+        if PCodeHooks.shared.replacesTerminalWindows {
+            PCodeHooks.shared.newSession(ghostty)
             return
         }
         _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
     }
 
     @objc private func ghosttyNewTab(_ notification: Notification) {
-        if PCodeWorkspaceMode.enabled {
-            PCodeWorkspaceController.shared(ghostty).workspace.newSession()
+        if PCodeHooks.shared.replacesTerminalWindows {
+            PCodeHooks.shared.newSession(ghostty)
             return
         }
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
@@ -1079,28 +1079,23 @@ class AppDelegate: NSObject,
     }
 
     /// Move the workspace's sessions into background hosts and start the
-    /// newest build, which reopens them (`PCodeRestart`).
+    /// newest build, which reopens them.
     @IBAction func restartPcode(_ sender: Any?) {
-        guard PCodeWorkspaceMode.enabled else { return }
-        PCodeRestart.begin(workspace: PCodeWorkspaceController.existing?.workspace)
+        guard PCodeHooks.shared.replacesTerminalWindows else { return }
+        PCodeHooks.shared.restart()
     }
 
     @IBAction func newWindow(_ sender: Any?) {
-        if PCodeWorkspaceMode.enabled {
-            let controller = PCodeWorkspaceController.shared(ghostty)
-            let wasVisible = controller.window?.isVisible == true
-            if wasVisible || !controller.workspace.panes.isEmpty {
-                controller.workspace.newSession()
-            }
-            PCodeWorkspaceController.show(ghostty)
+        if PCodeHooks.shared.replacesTerminalWindows {
+            PCodeHooks.shared.newWindow(ghostty)
             return
         }
         _ = TerminalController.newWindow(ghostty)
     }
 
     @IBAction func newTab(_ sender: Any?) {
-        if PCodeWorkspaceMode.enabled {
-            PCodeWorkspaceController.shared(ghostty).workspace.newSession()
+        if PCodeHooks.shared.replacesTerminalWindows {
+            PCodeHooks.shared.newSession(ghostty)
             return
         }
         _ = TerminalController.newTab(
@@ -1426,7 +1421,7 @@ extension AppDelegate: NSMenuItemValidation {
             return NSWorkspace.shared.defaultTerminal != Bundle.main.bundleURL
 
         case #selector(restartPcode(_:)):
-            return PCodeWorkspaceMode.enabled
+            return PCodeHooks.shared.replacesTerminalWindows
 
         case #selector(floatOnTop(_:)),
             #selector(useAsDefault(_:)):
