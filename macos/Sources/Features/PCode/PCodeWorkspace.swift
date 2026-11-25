@@ -109,7 +109,13 @@ final class PCodeWorkspace: ObservableObject {
             forName: Ghostty.Notification.ghosttyCloseSurface, object: nil, queue: .main
         ) { [weak self] note in
             guard let view = note.object as? Ghostty.SurfaceView else { return }
-            self?.surfaceClosed(view, processAlive: note.userInfo?["process_alive"] as? Bool ?? false)
+            let processAlive = note.userInfo?["process_alive"] as? Bool ?? false
+            // Posted from inside the surface's own close callback, which is
+            // still using it: free it (or ask about it) on the next turn.
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self, let view else { return }
+                self.surfaceClosed(view, processAlive: processAlive)
+            }
         })
         observers.append(center.addObserver(
             forName: PCodeWorkspace.sessionChanged, object: nil, queue: .main
@@ -131,19 +137,35 @@ final class PCodeWorkspace: ObservableObject {
 
     /// Reopen the sessions open at last quit, or start a fresh one.
     func restore() {
-        reloadHistory()
         let ids = UserDefaults.standard.stringArray(forKey: Self.openKey) ?? []
-        let infos = Dictionary(PCodeSessionInfo.load(limit: 10_000).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        for id in ids { if let info = infos[id] { open(info, select: false) } }
-        if panes.isEmpty { newSession() } else { select(panes[0]) }
-    }
-
-    func reloadHistory() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let loaded = PCodeSessionInfo.load()
-            DispatchQueue.main.async { self.history = loaded }
+        guard !ids.isEmpty else {
+            newSession()
+            reloadHistory()
+            return
+        }
+        reloadHistory { [weak self] all in
+            guard let self, self.panes.isEmpty else { return }
+            let infos = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            for id in ids { if let info = infos[id] { self.open(info, select: false) } }
+            if self.panes.isEmpty { self.newSession() } else { self.select(self.panes[0]) }
         }
     }
+
+    /// Reload the saved sessions off the main thread; only the newest load lands.
+    func reloadHistory(then done: (([PCodeSessionInfo]) -> Void)? = nil) {
+        historyGeneration += 1
+        let generation = historyGeneration
+        DispatchQueue.global(qos: .userInitiated).async {
+            let all = PCodeSessionInfo.load(limit: .max)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.historyGeneration else { return }
+                self.history = Array(all.prefix(200))
+                done?(all)
+            }
+        }
+    }
+
+    private var historyGeneration = 0
 
     /// Recent sessions not already open here.
     var recent: [PCodeSessionInfo] {
@@ -181,11 +203,19 @@ final class PCodeWorkspace: ObservableObject {
         DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
     }
 
+    /// Ask to close `pane`: pcode's terminal reports back through the close
+    /// notification, which confirms first if pcode is still running.
+    func requestClose(_ pane: PCodeSessionPane) {
+        guard let surface = pane.surface.surface else { return close(pane) }
+        ghostty.requestClose(surface: surface)
+    }
+
+    /// Remove `pane` and end its terminals. Not from inside one of their callbacks.
     func close(_ pane: PCodeSessionPane) {
         guard let index = panes.firstIndex(where: { $0 === pane }) else { return }
         panes.remove(at: index)
-        if let shell = pane.shell { shell.freeSurface() }
-        pane.surface.freeSurface()
+        if let shell = pane.shell { PCode.retire(shell) }
+        PCode.retire(pane.surface)
         saveOpen()
         reloadHistory()
         if selected == pane.id {
@@ -223,21 +253,20 @@ final class PCodeWorkspace: ObservableObject {
             pane.shellVisible = false
             pane.setShell(nil)
             view.freeSurface()
-            DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
+            Ghostty.moveFocus(to: pane.keyboardSurface)
             return
         }
         guard let pane = panes.first(where: { $0.surface === view }) else { return }
-        if processAlive && !confirmClose() { return }
-        close(pane)
-    }
-
-    private func confirmClose() -> Bool {
+        guard processAlive, let window = view.window ?? NSApp.keyWindow else { return close(pane) }
         let alert = NSAlert()
         alert.messageText = "Close this session?"
         alert.informativeText = "pcode is still running in it. The session is saved and can be reopened from the sidebar."
         alert.addButton(withTitle: "Close")
         alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
+        alert.beginSheetModal(for: window) { [weak self, weak pane] response in
+            guard response == .alertFirstButtonReturn, let self, let pane else { return }
+            self.close(pane)
+        }
     }
 
     private func saveOpen() {
@@ -303,7 +332,7 @@ struct PCodeWorkspaceView: View {
                     PCodePaneRow(pane: pane, info: workspace.info(for: pane))
                         .tag(PCodeSidebarItem.pane(pane.id))
                         .contextMenu {
-                            Button("Close Session") { workspace.close(pane) }
+                            Button("Close Session") { workspace.requestClose(pane) }
                         }
                 }
             }
@@ -434,4 +463,31 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
     }
 
     required init?(coder: NSCoder) { fatalError("not restorable from a coder") }
+
+    // MARK: First Responder
+
+    /// ⌘W: a picker or popup with the keyboard closes itself; otherwise the
+    /// focused shell, or the session (the docked editor stands for its session).
+    @IBAction func close(_ sender: Any) {
+        if let picker = PCode.keyboardPicker(in: window) {
+            picker.cancel()
+            return
+        }
+        if let overlay = PCode.keyboardOverlay(in: window)?.surface {
+            workspace.ghostty.requestClose(surface: overlay)
+            return
+        }
+        guard let pane = workspace.selectedPane else { return }
+        if pane.shellVisible, let shell = pane.shell, let surface = shell.surface,
+           let responder = window?.firstResponder as? NSView,
+           responder === shell || responder.isDescendant(of: shell) {
+            workspace.ghostty.requestClose(surface: surface)
+            return
+        }
+        workspace.requestClose(pane)
+    }
+
+    @IBAction func closeWindow(_ sender: Any) {
+        window?.performClose(sender)
+    }
 }
