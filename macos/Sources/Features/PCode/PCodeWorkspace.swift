@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import GhosttyKit
 import SwiftUI
 
@@ -77,11 +78,23 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     @Published var sessionID: String?
     @Published private(set) var shell: Ghostty.SurfaceView?
     @Published var shellVisible = false
+    /// The terminal's title, for the sidebar. Copied out so the sidebar does
+    /// not observe the whole surface, which publishes on every resize and focus change.
+    @Published private(set) var title = ""
+    private var titleSubscription: AnyCancellable?
 
     init(surface: Ghostty.SurfaceView, directory: String, sessionID: String?) {
         self.surface = surface
         self.directory = directory
         self.sessionID = sessionID
+        titleSubscription = surface.$title.removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.title = $0 }
+    }
+
+    /// Every terminal this pane shows: pcode's, its docked editor's, and the shell.
+    var surfaces: [Ghostty.SurfaceView] {
+        [surface, surface.existingPCodeDock?.surface, shell].compactMap { $0 }
     }
 
     /// The surface keys should go to: pcode's docked editor once shown, else its terminal.
@@ -99,6 +112,8 @@ final class PCodeWorkspace: ObservableObject {
     @Published private(set) var history: [PCodeSessionInfo] = []
 
     let ghostty: Ghostty.App
+    /// Whether the workspace window is on screen; set by its controller.
+    var windowVisible: () -> Bool = { false }
     private var observers: [NSObjectProtocol] = []
     private static let openKey = "PCodeWorkspaceOpenSessions"
 
@@ -197,8 +212,26 @@ final class PCodeWorkspace: ObservableObject {
         if shouldSelect { select(pane) }
     }
 
+    /// Tell each terminal's renderer whether it is on screen, as Ghostty's own
+    /// windows do: a hidden session must not keep drawing frames that
+    /// compete with the one being watched.
+    func syncOcclusion() {
+        let windowVisible = windowVisible()
+        for pane in panes {
+            let visible = windowVisible && pane.id == selected
+            for view in pane.surfaces {
+                // Always sent: a new surface's flag starts false while its
+                // renderer starts visible, so comparing would skip hiding it.
+                guard let surface = view.surface else { continue }
+                ghostty_surface_set_occlusion(surface, visible)
+                view.isWindowVisible = visible
+            }
+        }
+    }
+
     func select(_ pane: PCodeSessionPane) {
         selected = pane.id
+        syncOcclusion()
         // After SwiftUI has put the pane's views in the window.
         DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
     }
@@ -232,6 +265,7 @@ final class PCodeWorkspace: ObservableObject {
             pane.setShell(Ghostty.SurfaceView(app, baseConfig: config))
         }
         pane.shellVisible.toggle()
+        syncOcclusion()
         let target = pane.shellVisible ? pane.shell! : pane.keyboardSurface
         DispatchQueue.main.async { Ghostty.moveFocus(to: target) }
     }
@@ -284,11 +318,16 @@ struct PCodeWorkspaceView: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var workspace: PCodeWorkspace
 
+    private static let sidebarWidth: CGFloat = 250
+
+    // A plain stack, not NavigationSplitView, and no toolbar: on macOS 26+
+    // those lay glass (blur sampled every frame) over the terminal, which is
+    // a scroll view, and make the window composite translucent layers.
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 400)
-        } detail: {
+                .frame(width: Self.sidebarWidth)
+            Divider()
             ZStack {
                 if let pane = workspace.selectedPane {
                     PCodeSessionPaneView(pane: pane)
@@ -297,17 +336,24 @@ struct PCodeWorkspaceView: View {
                     Text("No session open").foregroundStyle(.secondary)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(ghostty.config.backgroundColor)
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button { workspace.toggleShell() } label: {
-                        Label("Shell", systemImage: "terminal")
-                    }
-                    .keyboardShortcut("j", modifiers: .command)
-                    .help("Toggle the shell under this session (⌘J)")
-                }
-            }
         }
+    }
+
+    private var sidebarHeader: some View {
+        HStack(spacing: 4) {
+            Text("Sessions").font(.headline)
+            Spacer()
+            Button { workspace.toggleShell() } label: { Image(systemName: "terminal") }
+                .keyboardShortcut("j", modifiers: .command)
+                .help("Toggle the shell under this session (⌘J)")
+            Button { workspace.newSession() } label: { Image(systemName: "square.and.pencil") }
+                .help("New session (⌘N)")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 
     private var selection: Binding<PCodeSidebarItem?> {
@@ -326,6 +372,16 @@ struct PCodeWorkspaceView: View {
     }
 
     private var sidebar: some View {
+        VStack(spacing: 0) {
+            sidebarHeader
+            sessionList
+        }
+        // Solid, a shade off the terminal's background: no vibrancy behind it.
+        .background(Color(nsColor: NSColor(ghostty.config.backgroundColor).blended(
+            withFraction: 0.06, of: .white) ?? .windowBackgroundColor))
+    }
+
+    private var sessionList: some View {
         List(selection: selection) {
             Section("Open") {
                 ForEach(workspace.panes) { pane in
@@ -344,14 +400,7 @@ struct PCodeWorkspaceView: View {
             }
         }
         .listStyle(.sidebar)
-        .toolbar {
-            ToolbarItem {
-                Button { workspace.newSession() } label: {
-                    Label("New Session", systemImage: "square.and.pencil")
-                }
-                .help("New session (⌘N)")
-            }
-        }
+        .scrollContentBackground(.hidden)
     }
 }
 
@@ -360,18 +409,8 @@ private struct PCodePaneRow: View {
     var info: PCodeSessionInfo?
 
     var body: some View {
-        PCodePaneTitle(surface: pane.surface, info: info, directory: pane.directory)
-    }
-}
-
-private struct PCodePaneTitle: View {
-    @ObservedObject var surface: Ghostty.SurfaceView
-    var info: PCodeSessionInfo?
-    var directory: String
-
-    var body: some View {
-        let title = info?.label ?? (surface.title.isEmpty ? "New session" : surface.title)
-        PCodeSessionRow(title: title, subtitle: (directory as NSString).lastPathComponent, running: true)
+        let title = info?.label ?? (pane.title.isEmpty ? "New session" : pane.title)
+        PCodeSessionRow(title: title, subtitle: (pane.directory as NSString).lastPathComponent, running: true)
     }
 }
 
@@ -437,11 +476,14 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         workspace = PCodeWorkspace(ghostty: ghostty)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "pcode"
+        // Opaque, in the terminal's own color, as Ghostty's windows are: the
+        // window server then never blends anything under the terminal.
         window.titlebarAppearsTransparent = true
-        window.toolbarStyle = .unified
+        window.isOpaque = true
+        window.backgroundColor = NSColor(ghostty.config.backgroundColor).withAlphaComponent(1)
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
         let hosting = NSHostingController(
@@ -460,6 +502,13 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         }
         super.init(window: window)
         window.delegate = self
+        workspace.windowVisible = { [weak window] in
+            window?.occlusionState.contains(.visible) ?? false
+        }
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        workspace.syncOcclusion()
     }
 
     required init?(coder: NSCoder) { fatalError("not restorable from a coder") }
