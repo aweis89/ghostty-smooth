@@ -17,6 +17,8 @@ enum DebugSnapshot {
 
     static let ciContext = CIContext(options: [.cacheIntermediates: false])
     static let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+    /// How many terminal frames the last render drew, for the reply.
+    static var lastSwapped = 0
 
     static func isIOSurface(_ contents: Any?) -> Bool {
         guard let contents else { return false }
@@ -63,6 +65,7 @@ enum DebugSnapshot {
         root.render(in: ctx)
         for (layer, contents) in swapped { layer.contents = contents }
         CATransaction.commit()
+        lastSwapped = swapped.count
 
         guard let image = ctx.makeImage() else { throw Failure("render made no image") }
         guard let crop else { return image }
@@ -106,12 +109,21 @@ enum DebugSnapshot {
     }
 
     static func snap(_ args: [String: Any]) throws -> [String: Any] {
-        let window = try DebugCommands.window(args)
         let path = args["path"] as? String ?? "/tmp/ghostty-snap-\(timestamp()).png"
+        if args["raw"] as? Bool == true {
+            // A terminal's own last frame, its whole grid, before any clipping.
+            let view = try DebugCommands.surface(args["surface"] as? String)
+            guard let contents = view.layer?.contents, isIOSurface(contents), let image = image(of: contents) else {
+                throw Failure("surface has no frame")
+            }
+            try writePNG(image, to: path)
+            return ["path": path, "size": [image.width, image.height]]
+        }
+        let window = try DebugCommands.window(args)
         // One pixel per point by default: sharp enough to read, cheap to look at.
         let image = try render(window, scale: scale(args, window, default: 1), crop: crop(args))
         try writePNG(image, to: path)
-        return ["path": path, "size": [image.width, image.height]]
+        return ["path": path, "size": [image.width, image.height], "terminals": lastSwapped]
     }
 
     // MARK: Recording
