@@ -70,6 +70,11 @@ pub fn init(
             "-configuration",
             xc_config,
         });
+        // pcode: with -target, each Swift package builds into its own
+        // checkout's build/ dir, so a package can't find the modules of the
+        // packages it depends on (Textual -> SwiftUIMath). One shared SYMROOT
+        // puts them all where the app already builds.
+        step.addArg(b.fmt("SYMROOT={s}", .{try b.root.joinString(b.allocator, "macos/build")}));
 
         // If we have a specific architecture, we need to pass it
         // to xcodebuild.
