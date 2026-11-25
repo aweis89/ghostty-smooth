@@ -807,16 +807,24 @@ final class PCodeWorkspace: ObservableObject {
         // (scrollers and padding included), else estimates from the area.
         let transcript = Self.pixels(shown?.surface)
             ?? (UInt32(detailSize.width * scale), UInt32(detailSize.height * scale))
-        let shownDock = shown?.surface.pcodeDrawer.visible == true
+        let shownDock = shown?.surface.existingPCodeDrawer?.isOpen == true
             ? nil
             : Self.pixels(shown?.surface.existingPCodeDock?.surface)
         for pane in panes where pane.id != selected {
             Self.setSize(pane.surface, transcript, scale: scale)
             if let docked = pane.surface.existingPCodeDock?.surface {
                 let cell = docked.cellSize.height > 0 ? docked.cellSize.height : 18
-                let dock = shownDock ?? (
-                    UInt32((detailSize.width - 16) * scale),
-                    UInt32(PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: cell) * scale))
+                let heightPx = UInt32(max(1, PCodeDock.cardHeight(rows: PCodeDock.gridRows, cell: cell) * scale))
+                let dock: (UInt32, UInt32)
+                if let drawer = pane.surface.existingPCodeDrawer, drawer.isOpen {
+                    let drawerWidth = PCodeDrawer.width(
+                        in: detailSize.width,
+                        fraction: drawer.fraction,
+                        minWidth: PCodeDrawer.dockedMinWidth) - 1
+                    dock = (UInt32(max(1, (drawerWidth - 16) * scale)), heightPx)
+                } else {
+                    dock = shownDock ?? (UInt32(max(1, (detailSize.width - 16) * scale)), heightPx)
+                }
                 Self.setSize(docked, dock, scale: scale)
             }
         }

@@ -164,12 +164,16 @@ private final class WeakOwner: NSObject {
 extension Ghostty.SurfaceView {
     /// This surface's pcode drawer, made the first time it is asked for.
     var pcodeDrawer: PCodeDrawer {
-        if let drawer = objc_getAssociatedObject(self, &pcodeDrawerKey) as? PCodeDrawer {
+        if let drawer = existingPCodeDrawer {
             return drawer
         }
         let drawer = PCodeDrawer(surfaceView: self)
         objc_setAssociatedObject(self, &pcodeDrawerKey, drawer, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return drawer
+    }
+
+    var existingPCodeDrawer: PCodeDrawer? {
+        objc_getAssociatedObject(self, &pcodeDrawerKey) as? PCodeDrawer
     }
 
     /// This surface's pcode popup slot, made the first time it is asked for.

@@ -41,6 +41,9 @@ final class PCodeDrawer: NSObject, ObservableObject, PCodeOverlayOwner {
     static let dockedMinWidth: CGFloat = 360
     static let maxFraction: CGFloat = 0.85
 
+    /// True while the drawer is actually shown on screen with a live viewer.
+    var isOpen: Bool { visible && viewer != nil }
+
     static func width(in total: CGFloat, fraction: CGFloat, minWidth: CGFloat = PCodeDrawer.minWidth) -> CGFloat {
         let floor = min(total, minWidth)
         let upper = max(floor, total * maxFraction)
@@ -290,7 +293,7 @@ struct PCodeDrawerSurface: View {
                                 DragGesture(coordinateSpace: .global)
                                     .onChanged { gesture in
                                         guard total > 0 else { return }
-                                        let start = dragStart ?? drawer.fraction
+                                        let start = dragStart ?? (width / total)
                                         dragStart = start
                                         let next = start - gesture.translation.width / total
                                         let minFraction = min(1, minDrawerWidth / total)
@@ -315,13 +318,14 @@ struct PCodeDrawerSurface: View {
                     if let dockFootprint {
                         // Reserve the card's exact footprint inside the drawer so the
                         // viewer and hint bar always end above it, with no overlap.
-                        // Snaps without animating so the viewer resizes once per row change.
                         Color.clear
                             .frame(height: min(dockFootprint, max(0, totalHeight - Self.minHeight)))
                             .allowsHitTesting(false)
-                            .animation(nil, value: dockFootprint)
                     }
                 }
+                // Snap viewer/hint-bar height without animating so the viewer resizes
+                // once per row change rather than on every animation frame.
+                .animation(nil, value: dockFootprint)
             }
             if dockFootprint == nil {
                 // Bottom edge above the uncovered inline editor rows.

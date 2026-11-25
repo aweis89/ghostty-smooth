@@ -157,7 +157,7 @@ struct PCodeDockedSurface: View {
     }
 
     var body: some View {
-        let drawerOpen = drawer.visible && drawer.viewer != nil
+        let drawerOpen = drawer.isOpen
         GeometryReader { geometry in
             let cardWidth = drawerOpen
                 ? max(0, PCodeDrawer.width(
@@ -173,19 +173,29 @@ struct PCodeDockedSurface: View {
                     drawsDrawer: false)
                 // The /btw drawer over the right side, full height, reserving the
                 // card's live footprint at its bottom so the viewer and hint bar
-                // always end above the card.
-                PCodeDrawerSurface(
-                    surfaceView: surfaceView, drawer: drawer, isSplit: isSplit,
-                    drawsSurface: false,
-                    dockFootprint: dock.surface == nil ? nil : dockFootprint)
+                // always end above the card (observing the dock's surface so font
+                // zoom updates the footprint immediately).
+                if let docked = dock.surface {
+                    PCodeDockedDrawerLayer(
+                        surfaceView: surfaceView,
+                        drawer: drawer,
+                        dock: dock,
+                        docked: docked,
+                        fallbackCell: paneCell,
+                        isSplit: isSplit)
+                } else {
+                    PCodeDrawerSurface(
+                        surfaceView: surfaceView, drawer: drawer, isSplit: isSplit,
+                        drawsSurface: false)
+                }
                 // The card: full width at the bottom when no drawer is open, or
                 // docked into the bottom of the drawer when /btw is open. Keeping
-                // it at the same structural spot preserves its surface and focus.
+                // it at the same structural spot preserves its surface and focus;
+                // width snaps once instead of animating so the PTY doesn't reflow
+                // on every frame.
                 if let docked = dock.surface {
-                    PCodeDockCard(docked: docked, dock: dock, fallbackCell: paneCell)
+                    PCodeDockCard(docked: docked, dock: dock, fallbackCell: paneCell, inDrawer: drawerOpen)
                         .frame(width: cardWidth)
-                        .animation(.easeOut(duration: 0.18), value: drawerOpen)
-                        .animation(.easeOut(duration: 0.12), value: dock.rows)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
@@ -193,19 +203,29 @@ struct PCodeDockedSurface: View {
         }
     }
 
-    /// Space the card occupies at the bottom of the drawer, margins included.
-    private var dockFootprint: CGFloat {
-        PCodeDock.footprint(rows: dock.rows, cell: cell)
-    }
-
-    /// The dock's row height, or the pane's until the dock has one.
-    private var cell: CGFloat {
-        if let docked = dock.surface, docked.cellSize.height > 0 { return docked.cellSize.height }
-        return paneCell
-    }
-
     private var paneCell: CGFloat {
         surfaceView.cellSize.height > 0 ? surfaceView.cellSize.height : Self.fallbackLineHeight
+    }
+}
+
+/// Observes the dock's surface so font-size changes update the drawer's reserved
+/// bottom footprint immediately in lockstep with `PCodeDockCard`.
+private struct PCodeDockedDrawerLayer: View {
+    @ObservedObject var surfaceView: Ghostty.SurfaceView
+    @ObservedObject var drawer: PCodeDrawer
+    @ObservedObject var dock: PCodeDock
+    @ObservedObject var docked: Ghostty.SurfaceView
+    var fallbackCell: CGFloat
+    var isSplit: Bool
+
+    var body: some View {
+        let cell = docked.cellSize.height > 0 ? docked.cellSize.height : fallbackCell
+        PCodeDrawerSurface(
+            surfaceView: surfaceView,
+            drawer: drawer,
+            isSplit: isSplit,
+            drawsSurface: false,
+            dockFootprint: PCodeDock.footprint(rows: dock.rows, cell: cell))
     }
 }
 
@@ -219,6 +239,7 @@ private struct PCodeDockCard: View {
     @ObservedObject var docked: Ghostty.SurfaceView
     @ObservedObject var dock: PCodeDock
     var fallbackCell: CGFloat
+    var inDrawer: Bool
 
     private static let cornerRadius: CGFloat = 12
 
@@ -227,14 +248,19 @@ private struct PCodeDockCard: View {
         ZStack(alignment: .bottom) {
             // The card's whole footprint, margins included, takes the clicks
             // the card itself doesn't: the pane rows under it are hidden, and
-            // a click there would start a selection in them.
+            // a click there would start a selection in them. Leave the leading
+            // 4pt clear when inside the drawer so the drawer's 8pt drag handle
+            // works alongside the card.
             Color.clear
                 .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell))
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0))
+                .padding(.leading, inDrawer ? 4 : 0)
                 .allowsHitTesting(dock.ready)
             card(cell: cell)
         }
+        // Only the card's clip animates as `dock.rows` changes, never its width.
+        .animation(.easeOut(duration: 0.12), value: dock.rows)
     }
 
     private func card(cell: CGFloat) -> some View {
