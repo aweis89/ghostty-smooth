@@ -349,6 +349,9 @@ class AppDelegate: NSObject,
 
         // Setup our menu
         setupMenuImages()
+        // Restart Pcode moves the workspace window's sessions; there is none
+        // without it.
+        menuRestartPcode?.isHidden = !PCodeWorkspaceMode.enabled
 
         // Setup signal handlers
         setupSignals()
@@ -1078,6 +1081,7 @@ class AppDelegate: NSObject,
     /// Move the workspace's sessions into background hosts and start the
     /// newest build, which reopens them (`PCodeRestart`).
     @IBAction func restartPcode(_ sender: Any?) {
+        guard PCodeWorkspaceMode.enabled else { return }
         PCodeRestart.begin(workspace: PCodeWorkspaceController.existing?.workspace)
     }
 
@@ -1417,6 +1421,9 @@ extension AppDelegate: NSMenuItemValidation {
         switch item.action {
         case #selector(setAsDefaultTerminal(_:)):
             return NSWorkspace.shared.defaultTerminal != Bundle.main.bundleURL
+
+        case #selector(restartPcode(_:)):
+            return PCodeWorkspaceMode.enabled
 
         case #selector(floatOnTop(_:)),
             #selector(useAsDefault(_:)):
