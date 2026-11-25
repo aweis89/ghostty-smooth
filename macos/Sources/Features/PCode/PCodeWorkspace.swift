@@ -50,6 +50,89 @@ enum PCodeWorkspaceMode {
         let inner = "exec " + ([command] + args.map(PCode.shellQuoted)).joined(separator: " ")
         return "\(PCode.shellQuoted(loginShell)) -l -c \(PCode.shellQuoted(inner))"
     }
+
+    /// Cached login-shell environment and resolved `pcode` executable so
+    /// subsequent panes skip spawning `zsh -l` (~450ms per pane).
+    private struct CachedShellEnv {
+        let commandPath: String
+        let env: [String: String]
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cachedEnv: CachedShellEnv?
+    private static var cacheStarted = false
+
+    private static let skipCachedEnvKeys: Set<String> = [
+        "PWD", "OLDPWD", "SHLVL", "_", "TERM", "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION", "COLORTERM", "TERM_SESSION_ID",
+        "PCODE_DOCK", "PCODE_HUSH_LOGIN",
+    ]
+
+    /// Warm the login-shell cache once in the background. Safe to call repeatedly.
+    static func warmLoginShellCache() {
+        cacheLock.lock()
+        if cacheStarted {
+            cacheLock.unlock()
+            return
+        }
+        cacheStarted = true
+        cacheLock.unlock()
+
+        let shell = loginShell
+        let cmd = command
+        DispatchQueue.global(qos: .userInitiated).async {
+            let probe = "p=$(command -v \(PCode.shellQuoted(cmd)) 2>/dev/null) || exit 1; printf '%s\\0' \"$p\"; /usr/bin/env -0"
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: shell)
+            proc.arguments = ["-l", "-c", probe]
+            let out = Pipe()
+            proc.standardOutput = out
+            proc.standardError = FileHandle.nullDevice
+            proc.standardInput = FileHandle.nullDevice
+            do {
+                try proc.run()
+            } catch {
+                return
+            }
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return }
+
+            let chunks = data.split(separator: 0, omittingEmptySubsequences: false)
+            guard let first = chunks.first,
+                  let resolvedPath = String(data: first, encoding: .utf8),
+                  resolvedPath.hasPrefix("/"),
+                  FileManager.default.isExecutableFile(atPath: resolvedPath) else { return }
+
+            var env: [String: String] = [:]
+            for chunk in chunks.dropFirst() where !chunk.isEmpty {
+                guard let entry = String(data: chunk, encoding: .utf8),
+                      let eq = entry.firstIndex(of: "=") else { continue }
+                let key = String(entry[..<eq])
+                if skipCachedEnvKeys.contains(key) || key.hasPrefix("GHOSTTY_") { continue }
+                env[key] = String(entry[entry.index(after: eq)...])
+            }
+
+            cacheLock.lock()
+            cachedEnv = CachedShellEnv(commandPath: resolvedPath, env: env)
+            cacheLock.unlock()
+        }
+    }
+
+    /// Direct command + cached login-shell env once ready, else the login-shell fallback.
+    static func launchConfig(_ args: [String]) -> (command: String, env: [String: String]) {
+        warmLoginShellCache()
+        cacheLock.lock()
+        let cached = cachedEnv
+        cacheLock.unlock()
+        guard let cached else {
+            return (shellCommand(args), [:])
+        }
+        // Pass through `env` so `exec -l` doesn't prepend `-` to argv[0] of a
+        // venv-backed Python entry point.
+        let parts = ["/usr/bin/env", PCode.shellQuoted(cached.commandPath)] + args.map(PCode.shellQuoted)
+        return (parts.joined(separator: " "), cached.env)
+    }
 }
 
 /// A saved session, read from pcode's `sessions/<id>/session.json`.
@@ -210,8 +293,12 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     let directory: String
     /// The project folder this pane is grouped under (main checkout for worktrees).
     let projectPath: String
+    /// Whether this pane was opened to resume an existing saved session.
+    let resuming: Bool
     /// The session pcode reports (`pcode;session;<id>`), once it has.
     @Published var sessionID: String?
+    /// True once pcode has painted its ready UI (dock ready, or fallback timeout).
+    @Published private(set) var isReady = false
     @Published private(set) var shell: Ghostty.SurfaceView?
     @Published var shellVisible = false
     /// The terminal's title, for the sidebar. Copied out so the sidebar does
@@ -219,7 +306,10 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
     @Published private(set) var title = ""
     private var titleSubscription: AnyCancellable?
     private var dockSubscription: AnyCancellable?
+    private var dockReadySubscription: AnyCancellable?
     private var progressSubscription: AnyCancellable?
+    private var readyFallbackWork: DispatchWorkItem?
+    private var readySafetyWork: DispatchWorkItem?
 
     /// What the session is doing, from the progress pcode reports to its
     /// terminal (OSC 9;4): a turn running, a failed one not yet seen, or idle.
@@ -240,6 +330,7 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
         self.surface = surface
         self.directory = directory
         self.projectPath = PCodeWorkspace.normalizePath(projectPath ?? directory)
+        self.resuming = sessionID != nil
         self.sessionID = sessionID
         titleSubscription = surface.$title.removeDuplicates()
             .receive(on: DispatchQueue.main)
@@ -267,6 +358,46 @@ final class PCodeSessionPane: ObservableObject, Identifiable {
                 // After the publish: the new surface is in place by then.
                 DispatchQueue.main.async { self?.onDockChange?() }
             }
+        dockReadySubscription = surface.pcodeDock.$ready
+            .filter { $0 }
+            .first()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.markReady() }
+
+        // Safety escape hatch: if pcode errors out or never enables the dock,
+        // drop the boot overlay so the terminal output is always visible.
+        let safety = DispatchWorkItem { [weak self] in self?.markReady() }
+        readySafetyWork = safety
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5, execute: safety)
+    }
+
+    deinit {
+        readyFallbackWork?.cancel()
+        readySafetyWork?.cancel()
+    }
+
+    /// Dismiss the startup overlay once pcode is live.
+    func markReady() {
+        guard !isReady else { return }
+        readyFallbackWork?.cancel()
+        readyFallbackWork = nil
+        readySafetyWork?.cancel()
+        readySafetyWork = nil
+        isReady = true
+    }
+
+    /// Called when pcode reports its session ID: if no dock opens shortly after
+    /// (e.g. dock disabled or older pcode), dismiss the boot overlay anyway.
+    func noteSessionReported() {
+        guard !isReady, readyFallbackWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isReady else { return }
+            if self.surface.existingPCodeDock?.surface == nil {
+                self.markReady()
+            }
+        }
+        readyFallbackWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
 
     /// Every terminal this pane shows: pcode's, its docked editor's, and the shell.
@@ -391,6 +522,7 @@ final class PCodeWorkspace: ObservableObject {
                   let pane = self.panes.first(where: { $0.surface === view }) else { return }
             let old = pane.sessionID
             pane.sessionID = view.pcodeSession
+            pane.noteSessionReported()
             self.sessionIDChanged(pane, from: old)
             self.saveOpen()
             if pane.id == self.selected { self.saveSelected() }
@@ -1117,7 +1249,11 @@ final class PCodeWorkspace: ObservableObject {
     ) -> PCodeSessionPane? {
         guard let app = ghostty.app else { return nil }
         var config = Ghostty.SurfaceConfiguration()
-        config.command = PCodeWorkspaceMode.shellCommand(args)
+        let launch = PCodeWorkspaceMode.launchConfig(args)
+        config.command = launch.command
+        for (key, value) in launch.env {
+            config.environmentVariables[key] = value
+        }
         let fm = FileManager.default
         let isDir: (String) -> Bool = { path in
             var flag: ObjCBool = false
@@ -1139,6 +1275,8 @@ final class PCodeWorkspace: ObservableObject {
         config.workingDirectory = resolvedDir
         // The docked editor (PCodeDock) is what the workspace shows under each session.
         config.environmentVariables["PCODE_DOCK"] = "1"
+        // Suppress macOS `login(1)` "Last login:" banner in pcode session panes.
+        config.environmentVariables["PCODE_HUSH_LOGIN"] = "1"
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
         PCode.applyColorScheme(to: view)
@@ -2027,7 +2165,14 @@ struct PCodeSessionPaneView: View {
         GeometryReader { geometry in
             let maxShell = max(Self.minShell, geometry.size.height - Self.minSession)
             VStack(spacing: 0) {
-                Ghostty.InspectableSurface(surfaceView: pane.surface, isSplit: false)
+                ZStack {
+                    Ghostty.InspectableSurface(surfaceView: pane.surface, isSplit: false)
+                    PCodeStartupOverlay(
+                        isReady: pane.isReady,
+                        label: (pane.projectPath as NSString).lastPathComponent,
+                        resuming: pane.resuming
+                    )
+                }
                 if pane.shellVisible, let shell = pane.shell {
                     handle(maxShell: maxShell)
                     Ghostty.SurfaceWrapper(surfaceView: shell, isSplit: false)

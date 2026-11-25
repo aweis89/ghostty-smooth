@@ -818,19 +818,27 @@ const Subprocess = struct {
         };
 
         // Add the environment variables that override any others.
+        var hush_login_override = false;
         {
             var it = cfg.env_override.iterator();
-            while (it.next()) |entry| try env.put(
-                entry.key_ptr.*,
-                entry.value_ptr.*,
-            );
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "PCODE_HUSH_LOGIN")) {
+                    hush_login_override = true;
+                    continue;
+                }
+                try env.put(
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                );
+            }
         }
 
         // Build our args list
-        const args: []const [:0]const u8 = execCommand(
+        const args: []const [:0]const u8 = execCommandWithHush(
             alloc,
             shell_command,
             internal_os.passwd,
+            hush_login_override,
         ) catch |err| switch (err) {
             // If we fail to allocate space for the command we want to
             // execute, we'd still like to try to run something so
@@ -1846,6 +1854,15 @@ fn execCommand(
     command: configpkg.Command,
     comptime passwdpkg: type,
 ) (Allocator.Error || error{SystemError})![]const [:0]const u8 {
+    return execCommandWithHush(alloc, command, passwdpkg, false);
+}
+
+fn execCommandWithHush(
+    alloc: Allocator,
+    command: configpkg.Command,
+    comptime passwdpkg: type,
+    hush_override: bool,
+) (Allocator.Error || error{SystemError})![]const [:0]const u8 {
     // If we're on macOS, we have to use `login(1)` to get all of
     // the proper environment variables set, a login shell, and proper
     // hushlogin behavior.
@@ -1860,7 +1877,7 @@ fn execCommand(
             break :darwin;
         };
 
-        const hush = if (passwd.home) |home| hush: {
+        const hush = hush_override or if (passwd.home) |home| hush: {
             var dir = std.Io.Dir.openDirAbsolute(global.io(), home, .{}) catch |err| {
                 log.warn(
                     "failed to open home dir, not checking for hushlogin err={}",
@@ -2115,6 +2132,29 @@ test "execCommand darwin: direct command" {
     try testing.expectEqualStrings(result[2], "testuser");
     try testing.expectEqualStrings(result[3], "foo");
     try testing.expectEqualStrings(result[4], "bar baz");
+}
+
+test "execCommand darwin: hush_override passes -q" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommandWithHush(alloc, .{ .shell = "foo" }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{
+                .name = "testuser",
+            };
+        }
+    }, true);
+
+    try testing.expectEqual(9, result.len);
+    try testing.expectEqualStrings(result[0], "/usr/bin/login");
+    try testing.expectEqualStrings(result[1], "-q");
+    try testing.expectEqualStrings(result[2], "-flp");
+    try testing.expectEqualStrings(result[3], "testuser");
 }
 
 test "execCommand: shell command, empty passwd" {
