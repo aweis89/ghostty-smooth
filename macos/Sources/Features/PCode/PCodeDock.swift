@@ -28,10 +28,25 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
     /// shows only its bottom `rows`, so growing is a clip, not a grid resize.
     static let gridRows = maxRows
 
-    /// The card's height for `rows` terminal rows of `cell` points: the rows,
-    /// the terminal's own padding, and a part row of slack.
+    /// Rows of slack the card takes on top of the rows it shows: the margins
+    /// around it, the terminal's own padding and a part row of headroom.
+    /// pcode reckons the pane rows the card hides from it, so keep this in
+    /// step with `CARD_SLACK_ROWS` in pcode's `pcode/dock.py`.
+    static let slackRows: CGFloat = 1.75
+    /// The card's top and bottom margins, inside `footprint`.
+    static let topMargin: CGFloat = 2
+    static let bottomMargin: CGFloat = 8
+
+    /// Everything the card covers at the bottom of pcode's pane for `rows`
+    /// rows of `cell` points, margins included: whole cells, so pcode can
+    /// work it out from its own cell size.
+    static func footprint(rows: Int, cell: CGFloat) -> CGFloat {
+        (CGFloat(rows) + slackRows) * cell
+    }
+
+    /// The card's own height for `rows` terminal rows of `cell` points.
     static func cardHeight(rows: Int, cell: CGFloat) -> CGFloat {
-        CGFloat(rows) * cell + cell * 0.5 + 12
+        footprint(rows: rows, cell: cell) - topMargin - bottomMargin
     }
 
     weak var surfaceView: Ghostty.SurfaceView?
@@ -117,16 +132,17 @@ final class PCodeDock: NSObject, ObservableObject, PCodeOverlayOwner {
 
 /// The terminal (with its /btw drawer) above pcode's docked editor card.
 ///
-/// A stack, not an overlay: pcode's terminal gives up the card's rows, so no
-/// scrollback hides under it. The card's shadow falls on the terminal's
-/// bottom edge.
+/// An overlay, not a stack: pcode's terminal keeps its full height, and the
+/// card covers its bottom rows. pcode keeps those rows clear (a scroll region
+/// above the card, `pcode/dock.py`), so growing the editor scrolls the
+/// transcript like any output, which glides, instead of resizing the pane
+/// (a reflow and a redraw per step of the card's animation).
 struct PCodeDockedSurface: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var surfaceView: Ghostty.SurfaceView
     @ObservedObject var dock: PCodeDock
     var isSplit: Bool
 
-    private static let margin: CGFloat = 8
     private static let cornerRadius: CGFloat = 12
     private static let fallbackLineHeight: CGFloat = 18
 
@@ -135,17 +151,11 @@ struct PCodeDockedSurface: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            // pcode's terminal above the room the card takes.
-            VStack(spacing: 0) {
-                PCodeDrawerSurface(
-                    surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
-                    drawsDrawer: false)
-                if dock.surface != nil {
-                    Color.clear
-                        .frame(height: PCodeDock.cardHeight(rows: dock.rows, cell: cell) + 2 + Self.margin)
-                        .allowsHitTesting(false)
-                }
-            }
+            // pcode's terminal, full height under the card: its size never
+            // follows the card's.
+            PCodeDrawerSurface(
+                surfaceView: surfaceView, drawer: surfaceView.pcodeDrawer, isSplit: isSplit,
+                drawsDrawer: false)
             // The drawer over the whole area, card included, at a size the
             // card never changes: resizing its terminal as the card grew with
             // streamed output scrolled whatever the user was reading in it.
@@ -163,14 +173,14 @@ struct PCodeDockedSurface: View {
             }
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.86), value: dock.ready)
-        // The dock's grid never resizes, so its height can animate: only the
-        // transcript pane above resizes along the way.
+        // Neither terminal resizes as the card grows (the dock's grid is
+        // fixed, the pane is full height), so only the card's clip animates.
         .animation(.easeOut(duration: 0.12), value: dock.rows)
     }
 
     /// Space under the drawer: the card at `drawerClearRows` rows, with its margins.
     private var drawerInset: CGFloat {
-        PCodeDock.cardHeight(rows: Self.drawerClearRows, cell: cell) + 2 + Self.margin
+        PCodeDock.footprint(rows: Self.drawerClearRows, cell: cell)
     }
 
     /// The dock's row height, or the pane's until the dock has one.
@@ -202,9 +212,9 @@ struct PCodeDockedSurface: View {
                 RoundedRectangle(cornerRadius: Self.cornerRadius)
                     .fill(ghostty.config.backgroundColor)
                     .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: -2))
-            .padding(.horizontal, Self.margin)
-            .padding(.top, 2)
-            .padding(.bottom, Self.margin)
+            .padding(.horizontal, PCodeDock.bottomMargin)
+            .padding(.top, PCodeDock.topMargin)
+            .padding(.bottom, PCodeDock.bottomMargin)
             .opacity(dock.ready ? 1 : 0)
             .allowsHitTesting(dock.ready)
     }
