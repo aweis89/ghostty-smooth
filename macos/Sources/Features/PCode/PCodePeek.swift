@@ -14,9 +14,10 @@ struct PCodePeekTarget: Equatable {
     let info: PCodeSessionInfo?
 
     static func == (lhs: PCodePeekTarget, rhs: PCodePeekTarget) -> Bool {
-        lhs.sessionID == rhs.sessionID
-            && lhs.isOpen == rhs.isOpen
-            && lhs.paneID == rhs.paneID
+        if lhs.isOpen || rhs.isOpen {
+            return lhs.isOpen == rhs.isOpen && lhs.paneID == rhs.paneID
+        }
+        return lhs.sessionID == rhs.sessionID
     }
 }
 
@@ -289,7 +290,7 @@ final class PCodeTranscriptLoader {
         var codeLines: [String] = []
         var inCode = false
         var codeLang: String?
-        var fencePrefix = "```"
+        var openTickCount = 3
 
         func flushProse() {
             let text = proseLines.joined(separator: "\n")
@@ -309,22 +310,33 @@ final class PCodeTranscriptLoader {
             codeLang = nil
         }
 
-        for rawLine in markdown.split(separator: "\n", omittingEmptySubsequences: false) {
+        let normalized = markdown
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        for rawLine in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine)
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if !inCode {
-                if trimmed.hasPrefix("```") {
-                    flushProse()
-                    let tickCount = trimmed.prefix { $0 == "`" }.count
-                    fencePrefix = String(repeating: "`", count: tickCount)
-                    let lang = trimmed.dropFirst(tickCount).trimmingCharacters(in: .whitespaces)
-                    codeLang = lang.isEmpty ? nil : lang
-                    inCode = true
-                } else {
-                    proseLines.append(line)
+                let tickCount = trimmed.prefix { $0 == "`" }.count
+                if tickCount >= 3 {
+                    let info = trimmed.dropFirst(tickCount)
+                    // CommonMark: backtick fence info strings cannot contain backticks
+                    // (which distinguishes inline ```code``` from an opening fence).
+                    if !info.contains("`") {
+                        flushProse()
+                        openTickCount = tickCount
+                        let lang = info.trimmingCharacters(in: .whitespaces)
+                        codeLang = lang.isEmpty ? nil : lang
+                        inCode = true
+                        continue
+                    }
                 }
+                proseLines.append(line)
             } else {
-                if trimmed.hasPrefix(fencePrefix) && trimmed.dropFirst(fencePrefix.count).trimmingCharacters(in: .whitespaces).isEmpty {
+                let tickCount = trimmed.prefix { $0 == "`" }.count
+                if tickCount >= openTickCount
+                    && trimmed.dropFirst(tickCount).trimmingCharacters(in: .whitespaces).isEmpty {
                     flushCode()
                     inCode = false
                 } else {
@@ -357,6 +369,10 @@ final class PCodePeekController: ObservableObject {
 
     /// Called whenever `target` changes so the workspace can wake/occlude a live-peeked pane.
     var onTargetChange: (() -> Void)?
+    /// Called after Peek dismisses (or mounts a live pane) so keyboard focus stays on the selected session.
+    var onRestoreFocus: (() -> Void)?
+    /// The workspace window, used to scope local event monitors away from sheets and other windows.
+    var windowProvider: (() -> NSWindow?)?
 
     private var hoveredRow: PCodePeekTarget?
     private var hoveringOverlay = false
@@ -376,13 +392,23 @@ final class PCodePeekController: ObservableObject {
         stopMonitoring()
         optionPressed = Self.isOptionOnly(NSEvent.modifierFlags)
         flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            self?.handleFlagsChanged(event.modifierFlags)
+            guard let self else { return event }
+            if let window = self.windowProvider?() {
+                guard window.isKeyWindow, window.attachedSheet == nil,
+                      event.window == nil || event.window === window
+                else { return event }
+            }
+            self.handleFlagsChanged(event.modifierFlags)
             return event
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.target != nil else { return event }
-            // Escape dismisses Peek without reaching the underlying terminal.
-            if event.keyCode == 53 && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+            if let window = self.windowProvider?() {
+                guard event.window === window, window.attachedSheet == nil else { return event }
+            }
+            // Escape dismisses Peek without reaching the underlying terminal (ignoring Caps Lock).
+            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if event.keyCode == 53 && mods.isEmpty {
                 self.dismiss()
                 return nil
             }
@@ -467,7 +493,7 @@ final class PCodePeekController: ObservableObject {
         show(menuTarget, pinned: true)
     }
 
-    func dismiss() {
+    func dismiss(restoreFocus: Bool = true) {
         openWork?.cancel()
         openWork = nil
         closeWork?.cancel()
@@ -479,7 +505,51 @@ final class PCodePeekController: ObservableObject {
         pinned = false
         hoveredRow = nil
         hoveringOverlay = false
-        if hadTarget { onTargetChange?() }
+        if hadTarget {
+            onTargetChange?()
+            if restoreFocus { onRestoreFocus?() }
+        }
+    }
+
+    func windowDidResignKey() {
+        optionPressed = false
+        hoveredRow = nil
+        openWork?.cancel()
+        openWork = nil
+        if !pinned {
+            dismiss(restoreFocus: false)
+        }
+    }
+
+    func clearHover(paneID: UUID) {
+        if hoveredRow?.paneID == paneID {
+            hoveredRow = nil
+            openWork?.cancel()
+            openWork = nil
+        }
+        if target?.paneID == paneID {
+            dismiss()
+        }
+    }
+
+    func clearHover(sessionID: String) {
+        if hoveredRow?.sessionID == sessionID {
+            hoveredRow = nil
+            openWork?.cancel()
+            openWork = nil
+        }
+        if target?.sessionID == sessionID {
+            dismiss()
+        }
+    }
+
+    func clearHoverAndUnpinned() {
+        hoveredRow = nil
+        openWork?.cancel()
+        openWork = nil
+        if !pinned {
+            dismiss()
+        }
     }
 
     private func scheduleOpen(for rowTarget: PCodePeekTarget, delay: TimeInterval) {
@@ -519,6 +589,8 @@ final class PCodePeekController: ObservableObject {
         if newTarget.isOpen {
             state = .idle
             onTargetChange?()
+            // Keep keyboard focus on the selected session if any subview in the peeked pane grabbed it.
+            DispatchQueue.main.async { [weak self] in self?.onRestoreFocus?() }
             return
         }
 
@@ -544,6 +616,35 @@ final class PCodePeekController: ObservableObject {
     }
 }
 
+/// Transparent overlay that forwards scroll-wheel events to a live-peeked terminal
+/// while blocking mouse clicks from stealing focus or sending input into it.
+private struct PCodePeekScrollShield: NSViewRepresentable {
+    let targetSurface: Ghostty.SurfaceView
+
+    func makeNSView(context: Context) -> ShieldView {
+        let view = ShieldView()
+        view.targetSurface = targetSurface
+        return view
+    }
+
+    func updateNSView(_ nsView: ShieldView, context: Context) {
+        nsView.targetSurface = targetSurface
+    }
+
+    final class ShieldView: NSView {
+        weak var targetSurface: Ghostty.SurfaceView?
+
+        override func scrollWheel(with event: NSEvent) {
+            targetSurface?.scrollWheel(with: event)
+        }
+
+        override func mouseDown(with event: NSEvent) {}
+        override func mouseUp(with event: NSEvent) {}
+        override func rightMouseDown(with event: NSEvent) {}
+        override func otherMouseDown(with event: NSEvent) {}
+    }
+}
+
 /// Large, scrollable floating preview of a session:
 /// - For open (non-selected) sessions: mounts the live terminal at full detail size (zero reflow,
 ///   does not switch selection, steal focus, or mark unseen responses as read).
@@ -551,7 +652,7 @@ final class PCodePeekController: ObservableObject {
 struct PCodePeekOverlay: View {
     @EnvironmentObject var ghostty: Ghostty.App
     @ObservedObject var peek: PCodePeekController
-    let livePane: PCodeSessionPane?
+    let resolveLivePane: (UUID) -> PCodeSessionPane?
     let onOpen: (PCodePeekTarget) -> Void
 
     private var cardBackground: Color {
@@ -571,9 +672,9 @@ struct PCodePeekOverlay: View {
 
     var body: some View {
         if let target = peek.target {
-            if target.isOpen, let livePane {
+            if target.isOpen, let paneID = target.paneID, let livePane = resolveLivePane(paneID) {
                 livePeekView(target: target, pane: livePane)
-            } else {
+            } else if !target.isOpen {
                 transcriptPeekView(target: target)
             }
         }
@@ -585,6 +686,10 @@ struct PCodePeekOverlay: View {
                 .id(pane.id)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(ghostty.config.backgroundColor)
+
+            // Allow scrolling the live terminal without letting clicks steal focus or type into it.
+            PCodePeekScrollShield(targetSurface: pane.surface)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // Crisp border + compact floating pill so it's unmistakably a live peek, not a switch.
             RoundedRectangle(cornerRadius: 4, style: .continuous)

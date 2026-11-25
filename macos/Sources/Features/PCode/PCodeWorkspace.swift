@@ -363,6 +363,14 @@ final class PCodeWorkspace: ObservableObject {
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
         peek.onTargetChange = { [weak self] in self?.syncOcclusion() }
+        peek.windowProvider = { [weak self] in self?.window }
+        peek.onRestoreFocus = { [weak self] in
+            guard let self, !self.showingDirectoryPicker,
+                  self.window?.isKeyWindow == true,
+                  let pane = self.selectedPane
+            else { return }
+            DispatchQueue.main.async { Ghostty.moveFocus(to: pane.keyboardSurface) }
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(
             forName: Ghostty.Notification.ghosttyCloseSurface, object: nil, queue: .main
@@ -640,7 +648,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func openDirectoryPicker() {
-        peek.dismiss()
+        peek.dismiss(restoreFocus: false)
         showingDirectoryPicker = true
     }
 
@@ -674,7 +682,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func openPeekTarget(_ target: PCodePeekTarget) {
-        peek.dismiss()
+        peek.dismiss(restoreFocus: false)
         if let paneID = target.paneID, let pane = panes.first(where: { $0.id == paneID }) {
             select(pane)
         } else if let info = target.info ?? target.sessionID.flatMap({ historyByID[$0] }) {
@@ -690,6 +698,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func toggleCollapsed(_ path: String) {
+        peek.clearHoverAndUnpinned()
         let normalized = Self.normalizePath(path)
         if collapsedFolders.contains(normalized) {
             collapsedFolders.remove(normalized)
@@ -710,6 +719,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func removeFolder(_ path: String) {
+        peek.clearHoverAndUnpinned()
         let normalized = Self.normalizePath(path)
         pinnedFolders.removeAll { $0 == normalized }
         hiddenFolders.insert(normalized)
@@ -753,7 +763,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func open(_ info: PCodeSessionInfo, select shouldSelect: Bool = true) {
-        if shouldSelect { peek.dismiss() }
+        if shouldSelect { peek.dismiss(restoreFocus: false) }
         if let pane = panes.first(where: { $0.sessionID == info.id }) {
             if shouldSelect { select(pane) }
             return
@@ -885,7 +895,10 @@ final class PCodeWorkspace: ObservableObject {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.delete(id: id, retries: retries - 1) }
                     return
                 }
-                if status == 0 { self.unseenIDs.remove(id) }
+                if status == 0 {
+                    self.unseenIDs.remove(id)
+                    self.peek.clearHover(sessionID: id)
+                }
                 self.reloadHistory()
                 guard status != 0 else { return }
                 let alert = NSAlert()
@@ -1048,7 +1061,7 @@ final class PCodeWorkspace: ObservableObject {
     }
 
     func select(_ pane: PCodeSessionPane) {
-        peek.dismiss()
+        peek.dismiss(restoreFocus: false)
         selected = pane.id
         saveSelected()
         if isViewed(pane) { markSeen(pane) }
@@ -1068,7 +1081,7 @@ final class PCodeWorkspace: ObservableObject {
 
     /// Remove `pane` and end its terminals. Not from inside one of their callbacks.
     func close(_ pane: PCodeSessionPane) {
-        if peek.target?.paneID == pane.id { peek.dismiss() }
+        peek.clearHover(paneID: pane.id)
         guard let index = panes.firstIndex(where: { $0 === pane }) else { return }
         panes.remove(at: index)
         if let shell = pane.shell { PCode.retire(shell) }
@@ -1237,8 +1250,9 @@ struct PCodeWorkspaceView: View {
 
                     PCodePeekOverlay(
                         peek: workspace.peek,
-                        livePane: workspace.peek.target?.paneID.flatMap { id in
-                            workspace.panes.first { $0.id == id }
+                        resolveLivePane: { paneID in
+                            guard paneID != workspace.selected else { return nil }
+                            return workspace.panes.first { $0.id == paneID }
                         }
                     ) { target in
                         workspace.openPeekTarget(target)
@@ -2133,11 +2147,15 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         workspace.selectedMaybeSeen()
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        workspace.peek.windowDidResignKey()
+    }
+
     func windowWillClose(_ notification: Notification) {
         if workspace.showingDirectoryPicker {
             workspace.showingDirectoryPicker = false
         }
-        workspace.peek.dismiss()
+        workspace.peek.dismiss(restoreFocus: false)
     }
 
     required init?(coder: NSCoder) { fatalError("not restorable from a coder") }
