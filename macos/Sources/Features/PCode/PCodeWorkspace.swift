@@ -65,8 +65,18 @@ enum PCodeWorkspaceMode {
     private static let skipCachedEnvKeys: Set<String> = [
         "PWD", "OLDPWD", "SHLVL", "_", "TERM", "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION", "COLORTERM", "TERM_SESSION_ID",
+        "TERMINFO", "XDG_DATA_DIRS", "MANPATH", "VTE_VERSION", "LANGUAGE",
         "PCODE_DOCK", "PCODE_HUSH_LOGIN",
     ]
+
+    private static let envSentinel = "__PCODE_ENV_START__"
+
+    private static func isSkippedEnvKey(_ key: String) -> Bool {
+        skipCachedEnvKeys.contains(key)
+            || key.hasPrefix("GHOSTTY_")
+            || key.hasPrefix("DYLD_")
+            || key.hasPrefix("__XCODE_")
+    }
 
     /// Warm the login-shell cache once in the background. Safe to call repeatedly.
     static func warmLoginShellCache() {
@@ -80,37 +90,64 @@ enum PCodeWorkspaceMode {
 
         let shell = loginShell
         let cmd = command
+        let baseEnv = ProcessInfo.processInfo.environment.filter { !isSkippedEnvKey($0.key) }
+
         DispatchQueue.global(qos: .userInitiated).async {
-            let probe = "p=$(command -v \(PCode.shellQuoted(cmd)) 2>/dev/null) || exit 1; printf '%s\\0' \"$p\"; /usr/bin/env -0"
+            let probe = "p=$(command -v \(PCode.shellQuoted(cmd)) 2>/dev/null) || exit 1; printf '\\0%s\\0%s\\0' \(PCode.shellQuoted(envSentinel)) \"$p\"; /usr/bin/env -0"
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: shell)
             proc.arguments = ["-l", "-c", probe]
+            proc.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+            proc.environment = baseEnv
             let out = Pipe()
             proc.standardOutput = out
             proc.standardError = FileHandle.nullDevice
             proc.standardInput = FileHandle.nullDevice
+
+            let timeout = DispatchWorkItem {
+                if proc.isRunning { proc.terminate() }
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0, execute: timeout)
+            defer { timeout.cancel() }
+
             do {
                 try proc.run()
             } catch {
                 return
             }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
+
+            let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
             proc.waitUntilExit()
             guard proc.terminationStatus == 0 else { return }
 
+            let sentinelData = Data(envSentinel.utf8)
             let chunks = data.split(separator: 0, omittingEmptySubsequences: false)
-            guard let first = chunks.first,
-                  let resolvedPath = String(data: first, encoding: .utf8),
+            guard let sentinelIndex = chunks.firstIndex(where: { $0 == sentinelData }),
+                  sentinelIndex + 1 < chunks.count,
+                  let resolvedPath = String(data: chunks[sentinelIndex + 1], encoding: .utf8),
                   resolvedPath.hasPrefix("/"),
                   FileManager.default.isExecutableFile(atPath: resolvedPath) else { return }
 
+            // Only record vars the login shell added or modified relative to
+            // baseEnv so Ghostty's own env setup and stripped vars stay intact.
             var env: [String: String] = [:]
-            for chunk in chunks.dropFirst() where !chunk.isEmpty {
+            for chunk in chunks[(sentinelIndex + 2)...] where !chunk.isEmpty {
                 guard let entry = String(data: chunk, encoding: .utf8),
                       let eq = entry.firstIndex(of: "=") else { continue }
                 let key = String(entry[..<eq])
-                if skipCachedEnvKeys.contains(key) || key.hasPrefix("GHOSTTY_") { continue }
-                env[key] = String(entry[entry.index(after: eq)...])
+                if isSkippedEnvKey(key) { continue }
+                let value = String(entry[entry.index(after: eq)...])
+                if baseEnv[key] != value {
+                    env[key] = value
+                }
+            }
+
+            // Preserve Ghostty's bundle binary dir on PATH since env_override
+            // applies after Exec.zig appends exe_dir.
+            if let path = env["PATH"],
+               let exeDir = Bundle.main.executableURL?.deletingLastPathComponent().path,
+               !path.split(separator: ":").contains(Substring(exeDir)) {
+                env["PATH"] = "\(path):\(exeDir)"
             }
 
             cacheLock.lock()
@@ -125,12 +162,14 @@ enum PCodeWorkspaceMode {
         cacheLock.lock()
         let cached = cachedEnv
         cacheLock.unlock()
-        guard let cached else {
+        guard let cached,
+              FileManager.default.isExecutableFile(atPath: cached.commandPath) else {
             return (shellCommand(args), [:])
         }
-        // Pass through `env` so `exec -l` doesn't prepend `-` to argv[0] of a
-        // venv-backed Python entry point.
-        let parts = ["/usr/bin/env", PCode.shellQuoted(cached.commandPath)] + args.map(PCode.shellQuoted)
+        // Pass through `env --` so `exec -l` doesn't prepend `-` to argv[0] of
+        // a venv-backed Python entry point, and paths with `=` aren't parsed as
+        // variable assignments.
+        let parts = ["/usr/bin/env", "--", PCode.shellQuoted(cached.commandPath)] + args.map(PCode.shellQuoted)
         return (parts.joined(separator: " "), cached.env)
     }
 }
@@ -493,6 +532,7 @@ final class PCodeWorkspace: ObservableObject {
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
+        PCodeWorkspaceMode.warmLoginShellCache()
         peek.onTargetChange = { [weak self] in self?.syncOcclusion() }
         peek.windowProvider = { [weak self] in self?.window }
         peek.onRestoreFocus = { [weak self] in

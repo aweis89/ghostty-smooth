@@ -18,10 +18,19 @@ struct PCodeStartupOverlay: View {
 
     @State private var appeared = false
     @State private var hiding = false
-    @State private var dismissed = false
+    @State private var dismissed: Bool
 
     private static let fadeInDuration: Double = 0.16
     private static let fadeOutDuration: Double = 0.20
+
+    init(isReady: Bool, label: String?, resuming: Bool) {
+        self.isReady = isReady
+        self.label = label
+        self.resuming = resuming
+        // Start already dismissed for panes that are live when mounted (e.g.
+        // pane switches and Live Peek) so there is zero 1-frame flash.
+        _dismissed = State(initialValue: isReady)
+    }
 
     var body: some View {
         if !dismissed {
@@ -108,11 +117,25 @@ private struct PCodeGyroSpinner: View {
         let g: Double
         let b: Double
 
-        init(_ color: Color) {
-            let ns = NSColor(color).usingColorSpace(.sRGB) ?? NSColor.controlAccentColor.usingColorSpace(.sRGB)!
-            self.r = Double(ns.redComponent)
-            self.g = Double(ns.greenComponent)
-            self.b = Double(ns.blueComponent)
+        init(_ color: Color, isLight: Bool) {
+            let appearance = NSAppearance(named: isLight ? .aqua : .darkAqua)
+            var resolved: NSColor?
+            if let appearance {
+                appearance.performAsCurrentDrawingAppearance {
+                    resolved = NSColor(color).usingColorSpace(.sRGB)
+                }
+            } else {
+                resolved = NSColor(color).usingColorSpace(.sRGB)
+            }
+            if let srgb = resolved ?? NSColor.controlAccentColor.usingColorSpace(.sRGB) {
+                self.r = Double(srgb.redComponent)
+                self.g = Double(srgb.greenComponent)
+                self.b = Double(srgb.blueComponent)
+            } else {
+                self.r = 0.35
+                self.g = 0.65
+                self.b = 0.95
+            }
         }
 
         init(r: Double, g: Double, b: Double) {
@@ -146,8 +169,8 @@ private struct PCodeGyroSpinner: View {
     }
 
     var body: some View {
-        let c1 = RGB(primary)
-        let c2 = RGB(secondary)
+        let c1 = RGB(primary, isLight: isLight)
+        let c2 = RGB(secondary, isLight: isLight)
 
         TimelineView(.animation) { context in
             let t = context.date.timeIntervalSinceReferenceDate

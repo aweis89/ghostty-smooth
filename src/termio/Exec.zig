@@ -819,11 +819,13 @@ const Subprocess = struct {
 
         // Add the environment variables that override any others.
         var hush_login_override = false;
+        _ = env.orderedRemove("PCODE_HUSH_LOGIN");
         {
             var it = cfg.env_override.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "PCODE_HUSH_LOGIN")) {
-                    hush_login_override = true;
+                    hush_login_override = entry.value_ptr.*.len > 0 and
+                        !std.mem.eql(u8, entry.value_ptr.*, "0");
                     continue;
                 }
                 try env.put(
