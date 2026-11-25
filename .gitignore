@@ -33,3 +33,7 @@ vgcore.*
 
 /sprite_face_test*
 /builds/
+
+# pcode fork: pcode's Swift, copied in by the pcode repo's app/scripts/build.sh
+/macos/Sources/Features/PCode/
+/macos/Tests/Features/PCode/

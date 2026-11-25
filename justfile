@@ -1,28 +1,20 @@
 # pcode fork helpers. Upstream's Makefile is left alone so rebases stay clean.
+#
+# Pcode.app is built from the pcode repo now: its Swift lives in app/macos
+# there, and app/scripts/build.sh copies it into this fork at the commit in
+# app/ghostty.lock. These recipes only point there.
 
-# List recipes.
 default:
     @just --list
 
-# Build the macOS app (ReleaseFast) and install it as builds/current.
+# Moved: build and install Pcode.app from the pcode repo.
 install:
-    scripts/install-macos.sh --build
+    @echo "Pcode.app is built from the pcode repo now: run 'make app' in its main checkout." >&2
+    @echo "To try this checkout's Zig changes with it: GHOSTTY_SRC=$(pwd) make app" >&2
+    @exit 1
 
-# Install the last build again without rebuilding.
-reinstall:
-    scripts/install-macos.sh
+# Moved: make app-status in the pcode repo.
+status: install
 
-# Show whether this terminal and running instances are on the latest build.
-status:
-    @scripts/status.sh
-
-# Quit running instances and reopen builds/current with the same windows and pcode sessions.
-restart:
-    scripts/restart.sh
-
-# Trash old builds/pcode-*.app bundles, keeping current and any running one.
-prune *args:
-    scripts/prune-builds.sh {{args}}
-
-# Build, install, then prune the old bundles.
-refresh: install prune
+# Moved: make app-restart in the pcode repo.
+restart: install
