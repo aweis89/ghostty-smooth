@@ -80,7 +80,18 @@ enum PCode {
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
         view.becomePCodeOverlay(of: owner)
+        // Overlays are in no window's surface tree, so nothing else tells them
+        // the light/dark scheme a `theme = light:…,dark:…` config switches on.
+        applyColorScheme(to: view)
         return view
+    }
+
+    /// Give `view` the app's current light/dark scheme (a no-op if it has it).
+    static func applyColorScheme(to view: Ghostty.SurfaceView) {
+        guard let surface = view.surface else { return }
+        ghostty_surface_set_color_scheme(
+            surface,
+            NSApplication.shared.effectiveAppearance.isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
     }
 
     /// End an overlay terminal its owner has dropped: free its core surface,

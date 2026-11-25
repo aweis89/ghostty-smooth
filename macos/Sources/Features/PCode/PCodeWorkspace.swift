@@ -147,6 +147,22 @@ final class PCodeWorkspace: ObservableObject {
 
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
+    private var appearanceObserver: NSKeyValueObservation?
+
+    /// Follow macOS light/dark: each surface needs the scheme set on it, as
+    /// Ghostty's own windows do for their surface trees, for a
+    /// `theme = light:…,dark:…` config to switch it (and for pcode in it to
+    /// hear the change, as a mode 2031 report).
+    func followAppearance() {
+        appearanceObserver = NSApplication.shared.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.syncColorScheme() }
+        }
+    }
+
+    func syncColorScheme() {
+        for pane in panes { pane.surfaces.forEach(PCode.applyColorScheme) }
+    }
+
     /// Posted by a surface whose `pcodeSession` changed.
     static let sessionChanged = Notification.Name("com.pcode.workspace.sessionChanged")
 
@@ -338,7 +354,9 @@ final class PCodeWorkspace: ObservableObject {
             var config = Ghostty.SurfaceConfiguration()
             config.workingDirectory = pane.directory
             guard let app = ghostty.app else { return }
-            pane.setShell(Ghostty.SurfaceView(app, baseConfig: config))
+            let shell = Ghostty.SurfaceView(app, baseConfig: config)
+            PCode.applyColorScheme(to: shell)
+            pane.setShell(shell)
         }
         pane.shellVisible.toggle()
         syncOcclusion()
@@ -355,6 +373,7 @@ final class PCodeWorkspace: ObservableObject {
         config.environmentVariables["PCODE_DOCK"] = "1"
         config.waitAfterCommand = false
         let view = Ghostty.SurfaceView(app, baseConfig: config)
+        PCode.applyColorScheme(to: view)
         return PCodeSessionPane(surface: view, directory: config.workingDirectory ?? directory, sessionID: sessionID)
     }
 
@@ -615,6 +634,7 @@ final class PCodeWorkspaceController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         workspace.window = window
+        workspace.followAppearance()
         workspace.windowVisible = { [weak window] in
             window?.occlusionState.contains(.visible) ?? false
         }
