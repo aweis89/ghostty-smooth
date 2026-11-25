@@ -238,6 +238,29 @@ enum DebugInput {
         view.mouseMoved(with: event)
     }
 
+    /// Sends a button or drag event. In the key window of the active app it
+    /// goes through the window, as a real click does. Otherwise AppKit would
+    /// spend the first click on activating the window (terminals don't accept
+    /// first mouse), and activating would take focus from the user, so the
+    /// press goes straight to the view under it, and the drags and release to
+    /// that same view, as AppKit routes them after a press.
+    static func sendMouse(_ event: NSEvent?, in window: NSWindow, pressed target: inout NSView?) {
+        guard let event else { return }
+        if NSApp.isActive, window.isKeyWindow {
+            window.sendEvent(event)
+            return
+        }
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown:
+            target = hitView(event.locationInWindow, in: window)
+            if event.type == .leftMouseDown { target?.mouseDown(with: event) } else { target?.rightMouseDown(with: event) }
+        case .leftMouseDragged: target?.mouseDragged(with: event)
+        case .leftMouseUp: target?.mouseUp(with: event)
+        case .rightMouseUp: target?.rightMouseUp(with: event)
+        default: window.sendEvent(event)
+        }
+    }
+
     static func mods(_ args: [String: Any]) throws -> NSEvent.ModifierFlags {
         guard let spec = args["mods"] as? String, !spec.isEmpty else { return [] }
         return try modifiers(spec.split(separator: "+").map(String.init))
@@ -265,11 +288,13 @@ enum DebugInput {
         let count = max(1, min(3, args["count"] as? Int ?? 1))
         let (down, up): (NSEvent.EventType, NSEvent.EventType) =
             right ? (.rightMouseDown, .rightMouseUp) : (.leftMouseDown, .leftMouseUp)
+        var pressed: NSView?
         var steps: [() -> Void] = [{ hover(point, in: window, mods: mods) }]
         for clicks in 1...count {
             steps.append {
                 for type in [down, up] {
-                    mouseEvent(type, at: point, in: window, mods: mods, clicks: clicks).map(window.sendEvent)
+                    sendMouse(mouseEvent(type, at: point, in: window, mods: mods, clicks: clicks),
+                              in: window, pressed: &pressed)
                 }
             }
         }
@@ -284,16 +309,20 @@ enum DebugInput {
         let end = try DebugCommands.windowPoint(x2, y2, in: window)
         let mods = try self.mods(args)
         let count = max(1, args["steps"] as? Int ?? 12)
+        var pressed: NSView?
+        func send(_ type: NSEvent.EventType, _ point: NSPoint) {
+            sendMouse(mouseEvent(type, at: point, in: window, mods: mods), in: window, pressed: &pressed)
+        }
         var steps: [() -> Void] = [
             { hover(start, in: window, mods: mods) },
-            { mouseEvent(.leftMouseDown, at: start, in: window, mods: mods).map(window.sendEvent) },
+            { send(.leftMouseDown, start) },
         ]
         for step in 1...count {
             let t = CGFloat(step) / CGFloat(count)
             let point = NSPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
-            steps.append { mouseEvent(.leftMouseDragged, at: point, in: window, mods: mods).map(window.sendEvent) }
+            steps.append { send(.leftMouseDragged, point) }
         }
-        steps.append { mouseEvent(.leftMouseUp, at: end, in: window, mods: mods).map(window.sendEvent) }
+        steps.append { send(.leftMouseUp, end) }
         play(steps, gap: (args["gap"] as? NSNumber)?.doubleValue ?? 0.016) {
             reply(mouseReply(start, in: window))
         }

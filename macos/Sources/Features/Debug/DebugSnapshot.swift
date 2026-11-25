@@ -1,16 +1,18 @@
 import AppKit
 import CoreImage
+import GhosttyKit
 import UniformTypeIdentifiers
 
 /// Window snapshots and frame recordings for the debug socket, made inside the
 /// app so they need no Screen Recording permission.
 ///
-/// `CALayer.render(in:)` draws a window's whole layer tree (SwiftUI chrome,
-/// clips, corner radii) but not IOSurface contents, which is how terminals
-/// draw. For the render, each such layer's contents are swapped for an image
-/// of its IOSurface and then put back, inside one transaction so the screen
-/// never sees the swap. Effects the window server adds (blurs, vibrancy, the
-/// window's own shadow) are not in the picture.
+/// `CALayer.render(in:)` neither draws IOSurface contents (how terminals
+/// draw) nor takes swapped-in images for them, so this walks the layer tree
+/// itself: each layer is rendered alone (its sublayers hidden for the
+/// moment), terminals are drawn from their IOSurface, and clips, opacity,
+/// transforms and flipped geometry are applied on the way down. Effects the
+/// window server adds (blurs, vibrancy, backdrops, the window's own shadow)
+/// and mask shapes other than rounded rects are not in the picture.
 enum DebugSnapshot {
     typealias Reply = DebugCommands.Reply
     typealias Failure = DebugCommands.Failure
@@ -46,26 +48,12 @@ enum DebugSnapshot {
         ctx.setFillColor(window.backgroundColor.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         ctx.scaleBy(x: scale, y: scale)
-        if root.isGeometryFlipped {
-            ctx.translateBy(x: 0, y: bounds.height)
-            ctx.scaleBy(x: 1, y: -1)
-        }
-
-        var swapped: [(CALayer, Any)] = []
-        func swap(_ layer: CALayer) {
-            if let contents = layer.contents, isIOSurface(contents), let image = image(of: contents) {
-                swapped.append((layer, contents))
-                layer.contents = image
-            }
-            layer.sublayers?.forEach(swap)
-        }
+        var drawn = 0
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        swap(root)
-        root.render(in: ctx)
-        for (layer, contents) in swapped { layer.contents = contents }
+        draw(root, in: ctx, flipped: false, terminals: &drawn)
         CATransaction.commit()
-        lastSwapped = swapped.count
+        lastSwapped = drawn
 
         guard let image = ctx.makeImage() else { throw Failure("render made no image") }
         guard let crop else { return image }
@@ -73,6 +61,82 @@ enum DebugSnapshot {
                             width: crop.width * scale, height: crop.height * scale).integral
         guard let cropped = image.cropping(to: pixels) else { throw Failure("crop is outside the window") }
         return cropped
+    }
+
+    /// Draws `layer` and its sublayers into `ctx`, whose origin is at the
+    /// layer's bounds origin. `flipped` is whether the coordinates are y-down.
+    static func draw(_ layer: CALayer, in ctx: CGContext, flipped: Bool, terminals: inout Int) {
+        guard !layer.isHidden, layer.opacity > 0 else { return }
+        let bounds = layer.bounds
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        if layer.opacity < 1 {
+            ctx.setAlpha(CGFloat(layer.opacity))
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        }
+        defer { if layer.opacity < 1 { ctx.endTransparencyLayer() } }
+
+        // The layer's own content. `render(in:)` draws it right way up in
+        // flipped coordinates by itself; a terminal's image needs the flip undone.
+        ctx.saveGState()
+        if let contents = layer.contents, isIOSurface(contents) {
+            if flipped {
+                ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+                ctx.scaleBy(x: 1, y: -1)
+            }
+            if let image = image(of: contents) {
+                // Terminals use top-left gravity: pixels at contentsScale from the top.
+                let scale = max(layer.contentsScale, 1)
+                let size = CGSize(width: CGFloat(image.width) / scale, height: CGFloat(image.height) / scale)
+                ctx.clip(to: bounds)
+                ctx.draw(image, in: CGRect(x: bounds.minX, y: bounds.maxY - size.height,
+                                           width: size.width, height: size.height))
+                terminals += 1
+            }
+        } else {
+            let sublayers = layer.sublayers ?? []
+            let wasHidden = sublayers.map(\.isHidden)
+            sublayers.forEach { $0.isHidden = true }
+            layer.render(in: ctx)
+            zip(sublayers, wasHidden).forEach { $0.isHidden = $1 }
+        }
+        ctx.restoreGState()
+
+        guard let sublayers = layer.sublayers, !sublayers.isEmpty else { return }
+        if layer.masksToBounds {
+            ctx.addPath(CGPath(roundedRect: bounds, cornerWidth: layer.cornerRadius,
+                               cornerHeight: layer.cornerRadius, transform: nil))
+            ctx.clip()
+        }
+        if let mask = layer.mask {
+            let radius = mask.cornerRadius
+            ctx.addPath(CGPath(roundedRect: mask.frame, cornerWidth: radius, cornerHeight: radius, transform: nil))
+            ctx.clip()
+        }
+        var childFlipped = flipped
+        if layer.isGeometryFlipped {
+            ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            childFlipped.toggle()
+        }
+        if !CATransform3DIsIdentity(layer.sublayerTransform),
+           CATransform3DIsAffine(layer.sublayerTransform) {
+            ctx.translateBy(x: bounds.midX, y: bounds.midY)
+            ctx.concatenate(CATransform3DGetAffineTransform(layer.sublayerTransform))
+            ctx.translateBy(x: -bounds.midX, y: -bounds.midY)
+        }
+        for sub in sublayers.sorted(by: { $0.zPosition < $1.zPosition }) {
+            ctx.saveGState()
+            ctx.translateBy(x: sub.position.x, y: sub.position.y)
+            if !CATransform3DIsIdentity(sub.transform), CATransform3DIsAffine(sub.transform) {
+                ctx.concatenate(CATransform3DGetAffineTransform(sub.transform))
+            }
+            let anchor = sub.anchorPoint
+            ctx.translateBy(x: -anchor.x * sub.bounds.width - sub.bounds.minX,
+                            y: -anchor.y * sub.bounds.height - sub.bounds.minY)
+            draw(sub, in: ctx, flipped: childFlipped, terminals: &terminals)
+            ctx.restoreGState()
+        }
     }
 
     static func writePNG(_ image: CGImage, to path: String) throws {
@@ -108,6 +172,44 @@ enum DebugSnapshot {
         return formatter.string(from: Date())
     }
 
+    /// Runs `body` while `window`'s terminals render as if on screen. Ghostty
+    /// stops updating and drawing a fully covered window, so a snapshot of one
+    /// would show its last frame from before it was covered. `body` calls its
+    /// argument when done, which puts back the window's real visibility.
+    static func rendering(_ window: NSWindow, _ body: @escaping (@escaping () -> Void) -> Void) {
+        let surfaces = DebugCommands.surfaces(in: window).compactMap(\.surface)
+        let onScreen = window.occlusionState.contains(.visible)
+        if onScreen {
+            body {}
+            return
+        }
+        surfaces.forEach { ghostty_surface_set_occlusion($0, true) }
+        surfaces.forEach(ghostty_surface_refresh)
+        // Becoming visible rebuilds and draws on the renderer thread.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            body {
+                let visible = window.occlusionState.contains(.visible)
+                surfaces.forEach { ghostty_surface_set_occlusion($0, visible) }
+            }
+        }
+    }
+
+    static func snapFresh(_ args: [String: Any], _ reply: @escaping Reply) throws {
+        let window = try DebugCommands.window(args)
+        rendering(window) { done in
+            defer { done() }
+            do {
+                var body = try snap(args)
+                body["on_screen"] = window.occlusionState.contains(.visible)
+                reply(body)
+            } catch let failure as Failure {
+                reply(["ok": false, "error": failure.message])
+            } catch {
+                reply(["ok": false, "error": "\(error)"])
+            }
+        }
+    }
+
     static func snap(_ args: [String: Any]) throws -> [String: Any] {
         let path = args["path"] as? String ?? "/tmp/ghostty-snap-\(timestamp()).png"
         if args["raw"] as? Bool == true {
@@ -138,7 +240,11 @@ enum DebugSnapshot {
             scale: scale(args, window, default: 0.5),
             crop: try crop(args),
             reply: reply)
-        try recording.start()
+        try FileManager.default.createDirectory(atPath: recording.dir, withIntermediateDirectories: true)
+        rendering(window) { done in
+            recording.onFinish = done
+            recording.start()
+        }
     }
 
     /// Captures a frame whenever a terminal presents one (its layer's contents
@@ -176,8 +282,9 @@ enum DebugSnapshot {
             self.reply = reply
         }
 
-        func start() throws {
-            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        var onFinish: (() -> Void)?
+
+        func start() {
             Self.retained[ObjectIdentifier(self)] = self
             started = Date()
             var layers: [CALayer] = DebugCommands.surfaces(in: window).compactMap(\.layer)
@@ -227,6 +334,8 @@ enum DebugSnapshot {
             timer = nil
             observers.forEach { $0.invalidate() }
             observers = []
+            onFinish?()
+            onFinish = nil
 
             let diffs = frames.indices.map { $0 == 0 ? 0 : Self.difference(frames[$0 - 1].sample, frames[$0].sample) }
             var flashes: [[String: Any]] = []
