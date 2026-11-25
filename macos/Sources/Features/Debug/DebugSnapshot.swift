@@ -76,13 +76,14 @@ enum DebugSnapshot {
         }
         defer { if layer.opacity < 1 { ctx.endTransparencyLayer() } }
 
-        // The layer's own content, drawn upright.
+        // The layer's own content. `render(in:)` draws it right way up in
+        // flipped coordinates by itself; a terminal's image needs the flip undone.
         ctx.saveGState()
-        if flipped {
-            ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
-            ctx.scaleBy(x: 1, y: -1)
-        }
         if let contents = layer.contents, isIOSurface(contents) {
+            if flipped {
+                ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+                ctx.scaleBy(x: 1, y: -1)
+            }
             if let image = image(of: contents) {
                 // Terminals use top-left gravity: pixels at contentsScale from the top.
                 let scale = max(layer.contentsScale, 1)
