@@ -168,6 +168,14 @@ struct PCodeDockedSurface: View {
             // than the card; the clipped-off top lets clicks through to what
             // is under it (`SurfaceScrollView.hitTest`).
             if let docked = dock.surface {
+                // The card's whole footprint, margins included, takes the
+                // clicks the card itself doesn't: the pane rows under it are
+                // hidden, and a click there would start a selection in them.
+                Color.clear
+                    .frame(height: PCodeDock.footprint(rows: dock.rows, cell: cell))
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0))
+                    .allowsHitTesting(dock.ready)
                 card(docked)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
