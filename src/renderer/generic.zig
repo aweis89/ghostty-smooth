@@ -1644,17 +1644,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (s.top == 0 and s.overscan) {
                             top_region = true;
                             // Rows are rebuilt whole, so only a full-width
-                            // region; and not over a visible cursor (or IME
-                            // preedit), which is drawn at its own row, not the
-                            // one rebuilt into it. A hidden cursor draws
+                            // region; and not over a cursor that may be drawn
+                            // (visible, IME preedit, or a password lock), which
+                            // is drawn at its own row, not the one rebuilt into
+                            // it. A hidden cursor draws
                             // nothing, so it doesn't count: pcode's docked
                             // editor leaves it hidden inside the region, and
                             // without the mapping each batch's top rows blank
                             // at once instead of gliding out.
                             const screen = state.terminal.screens.active;
                             const full = s.left == 0 and s.right + 1 >= state.terminal.cols;
-                            const cursor_drawn = state.terminal.modes.get(.cursor_visible) or
-                                state.preedit != null;
+                            const cursor_drawn = renderer.cursorMayDraw(state.terminal, state.preedit != null);
                             const cursor_in = cursor_drawn and screen.cursor.y <= s.bottom;
                             if (self.glide_map == null and s.glide.rows > 0 and full and !cursor_in) {
                                 k = @intFromFloat(@min(@ceil(s.glide.rows), renderer.State.Smooth.max_batch_glide));

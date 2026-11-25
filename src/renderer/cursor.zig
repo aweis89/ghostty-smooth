@@ -67,6 +67,28 @@ pub fn style(
     return .fromTerminal(state.cursor.visual_style);
 }
 
+/// Whether `style` could draw any cursor for this terminal, read straight
+/// from the terminal (before the render state is updated from it). Keep in
+/// step with the conditions in `style` that override visibility.
+pub fn mayDraw(t: *const terminal.Terminal, preedit: bool) bool {
+    return preedit or t.flags.password_input or t.modes.get(.cursor_visible);
+}
+
+test "cursor: mayDraw" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var term: terminal.Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+
+    try testing.expect(mayDraw(&term, false));
+    term.modes.set(.cursor_visible, false);
+    try testing.expect(!mayDraw(&term, false));
+    try testing.expect(mayDraw(&term, true));
+    term.flags.password_input = true;
+    try testing.expect(mayDraw(&term, false));
+}
+
 test "cursor: default uses configured style" {
     const testing = std.testing;
     const alloc = testing.allocator;
