@@ -37,6 +37,24 @@ protocol PCodeAppHooks: AnyObject {
     /// App menu > Restart.
     func restart()
 
+    /// User-facing application name for alerts and help text (upstream: `"Ghostty"`).
+    var appDisplayName: String { get }
+
+    /// Rebrand or prune the main menu bar once at launch.
+    func configureMainMenu(_ menu: NSMenu)
+
+    /// Rebrand or prune the Dock right-click menu when it is rebuilt.
+    func configureDockMenu(_ menu: NSMenu)
+
+    /// Rebrand or prune a terminal surface's right-click context menu.
+    func configureSurfaceContextMenu(_ menu: NSMenu)
+
+    /// App menu > About; return true if handled instead of upstream's panel.
+    func showAbout() -> Bool
+
+    /// Help menu > Help; return true if handled instead of upstream's docs URL.
+    func showHelp() -> Bool
+
     // MARK: Window actions
 
     /// Cancel a native picker with the keyboard in `window`; false if none has it.
@@ -131,6 +149,12 @@ private final class UpstreamHooks: PCodeAppHooks {
     func newWindow(_ ghostty: Ghostty.App) {}
     var terminatesImmediately: Bool { false }
     func restart() {}
+    var appDisplayName: String { "Ghostty" }
+    func configureMainMenu(_ menu: NSMenu) {}
+    func configureDockMenu(_ menu: NSMenu) {}
+    func configureSurfaceContextMenu(_ menu: NSMenu) {}
+    func showAbout() -> Bool { false }
+    func showHelp() -> Bool { false }
 
     func cancelKeyboardPicker(in window: NSWindow?) -> Bool { false }
     func hasKeyboardPicker(in window: NSWindow?) -> Bool { false }

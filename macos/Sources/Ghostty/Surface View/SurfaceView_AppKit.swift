@@ -1672,6 +1672,7 @@ extension Ghostty {
             item.setImageIfDesired(systemSymbolName: "pencil.line")
             item = menu.addItem(withTitle: "Change Terminal Title...", action: #selector(changeTitle(_:)), keyEquivalent: "")
 
+            PCodeHooks.shared.configureSurfaceContextMenu(menu)
             return menu
         }
 
