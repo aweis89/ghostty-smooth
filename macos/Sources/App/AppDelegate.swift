@@ -354,6 +354,7 @@ class AppDelegate: NSObject,
         menuRestartPcode?.isHidden = !PCodeHooks.shared.replacesTerminalWindows
         if let mainMenu = NSApp.mainMenu {
             PCodeHooks.shared.configureMainMenu(mainMenu)
+            syncMenuShortcuts(ghostty.config)
         }
 
         // Setup signal handlers
@@ -1363,6 +1364,7 @@ extension AppDelegate {
     }
 
     @MainActor private func syncMenuShortcut(_ config: Ghostty.Config, action: String, menuItem: NSMenuItem?) {
+        guard let menuItem, menuItem.menu != nil else { return }
         menuShortcutManager.syncMenuShortcut(config, action: action, menuItem: menuItem)
     }
 
@@ -1407,7 +1409,7 @@ extension AppDelegate {
                 let alert = NSAlert()
                 alert.messageText = "Failed to Set Default Terminal"
                 alert.informativeText = """
-                Ghostty could not be set as the default terminal application.
+                \(PCodeHooks.shared.appDisplayName) could not be set as the default terminal application.
 
                 Error: \(error.localizedDescription)
                 """
