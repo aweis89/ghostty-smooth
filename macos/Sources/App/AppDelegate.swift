@@ -1060,6 +1060,7 @@ class AppDelegate: NSObject,
     // MARK: - IB Actions
 
     @IBAction func openConfig(_ sender: Any?) {
+        if PCodeHooks.shared.showSettings() { return }
         ghostty.openConfig()
     }
 

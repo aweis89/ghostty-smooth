@@ -79,6 +79,10 @@ extension Ghostty {
 
             ghostty_config_load_recursive_files(cfg)
 
+            if let overridePath = PCodeHooks.shared.configOverrideFilePath {
+                ghostty_config_load_file(cfg, overridePath)
+            }
+
             // TODO: we'd probably do some config loading here... for now we'd
             // have to do this synchronously. When we support config updating we can do
             // this async and update later.

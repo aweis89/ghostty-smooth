@@ -52,8 +52,15 @@ protocol PCodeAppHooks: AnyObject {
     /// App menu > About; return true if handled instead of upstream's panel.
     func showAbout() -> Bool
 
+    /// App menu > Settings / open_config; return true if handled instead of opening Ghostty's config file.
+    func showSettings() -> Bool
+
     /// Help menu > Help; return true if handled instead of upstream's docs URL.
     func showHelp() -> Bool
+
+    /// Optional Ghostty config file loaded after user config and before finalization
+    /// so Pcode.app can keep terminal typography aligned with its own settings.
+    var configOverrideFilePath: String? { get }
 
     // MARK: Window actions
 
@@ -154,7 +161,9 @@ private final class UpstreamHooks: PCodeAppHooks {
     func configureDockMenu(_ menu: NSMenu) {}
     func configureSurfaceContextMenu(_ menu: NSMenu) {}
     func showAbout() -> Bool { false }
+    func showSettings() -> Bool { false }
     func showHelp() -> Bool { false }
+    var configOverrideFilePath: String? { nil }
 
     func cancelKeyboardPicker(in window: NSWindow?) -> Bool { false }
     func hasKeyboardPicker(in window: NSWindow?) -> Bool { false }
