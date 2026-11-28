@@ -17,6 +17,7 @@
 		A51BFC272B30F1B800E92F16 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A51BFC262B30F1B800E92F16 /* Sparkle */; };
 		A51BFC2D2F00000000E92F16 /* Textual in Frameworks */ = {isa = PBXBuildFile; productRef = A51BFC2C2F00000000E92F16 /* Textual */; };
 		A51BFC302F00000000E92F16 /* Markdown in Frameworks */ = {isa = PBXBuildFile; productRef = A51BFC2F2F00000000E92F16 /* Markdown */; };
+		A51BFC332F00000000E92F16 /* CodeEditSourceEditor in Frameworks */ = {isa = PBXBuildFile; productRef = A51BFC322F00000000E92F16 /* CodeEditSourceEditor */; };
 		A546F1142D7B68D7003B11A0 /* locale in Resources */ = {isa = PBXBuildFile; fileRef = A546F1132D7B68D7003B11A0 /* locale */; };
 		A553F4142E06EB1600257779 /* Ghostty.icon in Resources */ = {isa = PBXBuildFile; fileRef = A553F4122E06EB1600257779 /* Ghostty.icon */; };
 		A56B880B2A840447007A0E29 /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A56B880A2A840447007A0E29 /* Carbon.framework */; };
@@ -154,6 +155,7 @@
 				A51BFC272B30F1B800E92F16 /* Sparkle in Frameworks */,
 				A51BFC2D2F00000000E92F16 /* Textual in Frameworks */,
 				A51BFC302F00000000E92F16 /* Markdown in Frameworks */,
+				A51BFC332F00000000E92F16 /* CodeEditSourceEditor in Frameworks */,
 				A56B880B2A840447007A0E29 /* Carbon.framework in Frameworks */,
 				A571AB1D2A206FCF00248498 /* GhosttyKit.xcframework in Frameworks */,
 			);
@@ -309,6 +311,7 @@
 				A51BFC262B30F1B800E92F16 /* Sparkle */,
 				A51BFC2C2F00000000E92F16 /* Textual */,
 				A51BFC2F2F00000000E92F16 /* Markdown */,
+				A51BFC322F00000000E92F16 /* CodeEditSourceEditor */,
 			);
 			productName = Ghostty;
 			productReference = A5B30531299BEAAA0047F10C /* Ghostty.app */;
@@ -354,6 +357,7 @@
 				A51BFC252B30F1B700E92F16 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				A51BFC2B2F00000000E92F16 /* XCRemoteSwiftPackageReference "textual" */,
 				A51BFC2E2F00000000E92F16 /* XCRemoteSwiftPackageReference "swift-markdown" */,
+				A51BFC312F00000000E92F16 /* XCRemoteSwiftPackageReference "CodeEditSourceEditor" */,
 			);
 			productRefGroup = A5B30532299BEAAA0047F10C /* Products */;
 			projectDirPath = "";
@@ -1127,6 +1131,14 @@
 				version = 0.9.0;
 			};
 		};
+		A51BFC312F00000000E92F16 /* XCRemoteSwiftPackageReference "CodeEditSourceEditor" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/CodeEditApp/CodeEditSourceEditor";
+			requirement = {
+				kind = exactVersion;
+				version = 0.15.2;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1144,6 +1156,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A51BFC2E2F00000000E92F16 /* XCRemoteSwiftPackageReference "swift-markdown" */;
 			productName = Markdown;
+		};
+		A51BFC322F00000000E92F16 /* CodeEditSourceEditor */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A51BFC312F00000000E92F16 /* XCRemoteSwiftPackageReference "CodeEditSourceEditor" */;
+			productName = CodeEditSourceEditor;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

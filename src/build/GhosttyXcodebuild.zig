@@ -69,6 +69,7 @@ pub fn init(
             "Ghostty",
             "-configuration",
             xc_config,
+            "-skipPackagePluginValidation",
         });
         // pcode: with -target, each Swift package builds into its own
         // checkout's build/ dir, so a package can't find the modules of the
@@ -111,6 +112,7 @@ pub fn init(
             "Ghostty",
             "-skip-testing",
             "GhosttyUITests",
+            "-skipPackagePluginValidation",
         });
         if (xc_arch) |arch| step.addArgs(&.{ "-arch", arch });
 
